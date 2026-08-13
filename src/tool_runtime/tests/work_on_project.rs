@@ -664,6 +664,15 @@ async fn work_on_project_creates_a_new_normal_session_without_binding() {
         result.output["workflow"],
         crate::tool_runtime::startup_brief::builtin_coding_workflow_projection()
     );
+    assert!(
+        result.output["workflow"]["roles"]["implementation_owner"]["guidance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.contains("reuse the same assertion_name")))
+    );
     assert!(result.output["instructions"].is_object());
     for hidden in [
         "runtime_status",

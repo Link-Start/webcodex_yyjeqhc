@@ -62,6 +62,7 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
                     "Close the existing architecture end to end before local hardening.",
                     "Minimize new concepts rather than touched-file count.",
                     "Use compiler, type, schema, and exhaustiveness failures to close missing adapters, registries, and projections.",
+                    "When assertion_name is used for a logical validation, reuse the same assertion_name when rerunning it after a fix so the ledger can resolve that validation identity.",
                     "After focused validation, review completeness and trust, bounds, privacy, and replay.",
                     "Fix correctness issues discovered during the pass; do not fragment the implementation around undemonstrated speculative concerns."
                 ]

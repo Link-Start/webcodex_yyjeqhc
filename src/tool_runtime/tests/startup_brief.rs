@@ -105,6 +105,14 @@ fn assert_builtin_workflow(output: &Value) {
                 <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS
         );
     }
+    assert!(workflow["roles"]["implementation_owner"]["guidance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str().is_some_and(|value| {
+            value.contains("reuse the same assertion_name")
+                && value.contains("resolve that validation identity")
+        })));
     let serialized = workflow.to_string();
     for forbidden in ["ChatGPT", "browser", "another window", "online", "offline"] {
         assert!(

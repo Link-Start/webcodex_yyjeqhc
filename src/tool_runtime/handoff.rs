@@ -38,6 +38,15 @@ const MAX_OPEN_ITEMS: usize = 20;
 const MAX_RECENT_CHECKPOINTS: usize = 10;
 const HANDOFF_MESSAGE_CHARS: usize = 240;
 
+/// Actionable guidance for an unresolved validation identity, accurate for
+/// both identity forms: `assertion:<name>` identities resolve by reusing the
+/// original assertion_name, while command-derived identities (which never had
+/// an assertion_name) resolve by rerunning the same logical validation
+/// consistently. The conditional phrasing never claims an original
+/// assertion_name exists for command-derived validations.
+pub(crate) const VALIDATION_IDENTITY_REUSE_ACTION: &str =
+    "rerun the same logical validation using the same validation identity; if assertion_name was supplied, reuse the original assertion_name";
+
 impl ToolRuntime {
     pub(crate) async fn session_handoff_summary(
         &self,
@@ -976,10 +985,14 @@ fn compact_workflow_outcomes(
                 );
             } else {
                 push_unique(&mut blocking_reasons, "validation_mixed");
-                push_unique_action(
-                    &mut actions,
-                    "review mixed validation results before closeout",
-                );
+                if validation_historical_failures_unresolved(validation) {
+                    push_unique_action(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
+                } else {
+                    push_unique_action(
+                        &mut actions,
+                        "review mixed validation results before closeout",
+                    );
+                }
             }
         }
         Some("unknown") | None => {
@@ -993,10 +1006,7 @@ fn compact_workflow_outcomes(
             &mut blocking_reasons,
             "validation_historical_failures_unresolved",
         );
-        push_unique_action(
-            &mut actions,
-            "review unresolved historical validation failures before closeout",
-        );
+        push_unique_action(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
     }
     if validation_has_cargo_test_zero_tests(validation) {
         push_unique(&mut integrity_warnings, "cargo_test_zero_tests");
@@ -1323,7 +1333,11 @@ fn handoff_suggested_next_actions(
             );
         }
     }
-    if validation_has_cargo_test_zero_tests(output.get("validation").unwrap_or(&Value::Null)) {
+    let validation = output.get("validation").unwrap_or(&Value::Null);
+    if validation_historical_failures_unresolved(validation) {
+        push(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
+    }
+    if validation_has_cargo_test_zero_tests(validation) {
         push(
             &mut actions,
             "cargo_test ran zero tests; verify the test filter or command",
