@@ -54,7 +54,11 @@ pub(crate) fn resolve_requested_path(
 pub(crate) fn is_basic_file_request_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "file_read" | "file_write" | "file_list" | "file_project_overview"
+        "file_read"
+            | "file_write"
+            | "file_list"
+            | "file_project_overview"
+            | "file_delete_project_files"
     )
 }
 
@@ -69,6 +73,9 @@ pub(crate) fn handle_basic_file_request(
         "file_write" => handle_file_write_request(policy, request, resolved, start),
         "file_list" => handle_file_list_request(resolved, start),
         "file_project_overview" => handle_project_overview_request(request, start),
+        "file_delete_project_files" => {
+            handle_delete_project_files_request(request, resolved, start)
+        }
         _ => CommandResult {
             exit_code: None,
             stdout: None,
@@ -76,6 +83,151 @@ pub(crate) fn handle_basic_file_request(
             duration_ms: Some(start.elapsed().as_millis() as u64),
             error: Some(format!("unknown file request kind: {}", request.kind)),
         },
+    }
+}
+
+const MAX_DELETE_PROJECT_FILES_PATHS: usize = 64;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteProjectFilesPayload {
+    paths: Vec<String>,
+}
+
+fn validate_delete_project_file_path(path: &str) -> bool {
+    if path.is_empty() || path == "." || path.contains('\0') {
+        return false;
+    }
+    let raw = Path::new(path);
+    if raw.is_absolute() || crate::apply_edits_shared::is_sensitive_edit_path(path) {
+        return false;
+    }
+    raw.components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(path);
+    while let Some(candidate) = cursor {
+        match candidate.canonicalize() {
+            Ok(canonical) => return Some(canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                cursor = candidate.parent();
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn delete_project_files_error(start: Instant, message: &'static str) -> CommandResult {
+    CommandResult {
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        duration_ms: Some(start.elapsed().as_millis() as u64),
+        error: Some(message.to_string()),
+    }
+}
+
+fn handle_delete_project_files_request(
+    request: &ShellAgentShellRequest,
+    resolved_project_root: &Path,
+    start: Instant,
+) -> CommandResult {
+    let Some(payload) = request
+        .content
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<DeleteProjectFilesPayload>(raw).ok())
+    else {
+        return delete_project_files_error(start, "invalid delete_project_files payload");
+    };
+    if payload.paths.is_empty()
+        || payload.paths.len() > MAX_DELETE_PROJECT_FILES_PATHS
+        || payload
+            .paths
+            .iter()
+            .any(|path| !validate_delete_project_file_path(path))
+    {
+        return delete_project_files_error(
+            start,
+            "delete_project_files request contains a refused path",
+        );
+    }
+    let canonical_root = match resolved_project_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => {
+            return delete_project_files_error(
+                start,
+                "delete_project_files project root is unavailable",
+            )
+        }
+    };
+
+    for path in &payload.paths {
+        let target = canonical_root.join(path);
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => {
+                if metadata.file_type().is_dir() {
+                    return delete_project_files_error(
+                        start,
+                        "delete_project_files refuses directory targets",
+                    );
+                }
+                let containment = if metadata.file_type().is_symlink() {
+                    target
+                        .parent()
+                        .and_then(|parent| parent.canonicalize().ok())
+                } else {
+                    target.canonicalize().ok()
+                };
+                if !containment.as_ref().is_some_and(|candidate| {
+                    webcodex_agent_config::paths::path_is_within(candidate, &canonical_root)
+                }) {
+                    return delete_project_files_error(
+                        start,
+                        "delete_project_files target is outside the project",
+                    );
+                }
+                match std::fs::remove_file(&target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        return delete_project_files_error(start, "delete_project_files failed")
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(ancestor) =
+                    canonical_existing_ancestor(target.parent().unwrap_or(&canonical_root))
+                else {
+                    return delete_project_files_error(
+                        start,
+                        "delete_project_files parent is unavailable",
+                    );
+                };
+                if !webcodex_agent_config::paths::path_is_within(&ancestor, &canonical_root) {
+                    return delete_project_files_error(
+                        start,
+                        "delete_project_files target is outside the project",
+                    );
+                }
+            }
+            Err(_) => return delete_project_files_error(start, "delete_project_files failed"),
+        }
+    }
+
+    let output = serde_json::json!({
+        "deleted_paths": payload.paths,
+        "missing_paths": [],
+        "refused_paths": [],
+    });
+    CommandResult {
+        exit_code: Some(0),
+        stdout: Some(output.to_string()),
+        stderr: Some(String::new()),
+        duration_ms: Some(start.elapsed().as_millis() as u64),
+        error: None,
     }
 }
 

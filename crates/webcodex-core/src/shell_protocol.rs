@@ -97,6 +97,10 @@ pub const AGENT_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 pub const SHELL_CLIENT_CAPABILITY_SHELL: &str = "shell";
 pub const SHELL_CLIENT_CAPABILITY_FILE_READ: &str = "file_read";
 pub const SHELL_CLIENT_CAPABILITY_FILE_WRITE: &str = "file_write";
+/// The Runner implements bounded, project-root-enforced structured file deletion.
+/// Missing on older Runners and false; never inferred from file_write, shell,
+/// protocol version, transport, or operating system.
+pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE: &str = "structured_file_delete";
 pub const SHELL_CLIENT_CAPABILITY_GIT: &str = "git";
 pub const SHELL_CLIENT_CAPABILITY_JOBS: &str = "jobs";
 pub const SHELL_CLIENT_CAPABILITY_ASYNC_JOBS: &str = "async_jobs";
@@ -161,6 +165,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
     SHELL_CLIENT_CAPABILITY_FILE_WRITE,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
     SHELL_CLIENT_CAPABILITY_GIT,
     SHELL_CLIENT_CAPABILITY_JOBS,
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
@@ -208,6 +213,10 @@ pub struct ShellClientCapabilities {
     pub file_read: bool,
     #[serde(default)]
     pub file_write: bool,
+    /// Bounded structured file deletion with Runner-authoritative project-root
+    /// containment and file-only semantics. Missing on older Runners is false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_file_delete: bool,
     #[serde(default)]
     pub git: bool,
     #[serde(default)]
@@ -313,6 +322,7 @@ impl Default for ShellClientCapabilities {
             shell: true,
             file_read: false,
             file_write: false,
+            structured_file_delete: false,
             git: false,
             jobs: false,
             async_jobs: false,
@@ -2300,6 +2310,7 @@ mod envelope_tests {
                 shell: true,
                 file_read: true,
                 file_write: false,
+                structured_file_delete: false,
                 git: false,
                 jobs: true,
                 async_jobs: true,
@@ -2391,8 +2402,18 @@ mod envelope_tests {
         assert!(!capabilities.ssh_persistent_shell);
         assert!(!capabilities.structured_execution_jobs);
         assert!(!capabilities.project_path_registration);
+        assert!(!capabilities.structured_file_delete);
         assert!(!ShellClientCapabilities::default().ssh_persistent_shell);
         assert!(!ShellClientCapabilities::default().project_path_registration);
+    }
+
+    #[test]
+    fn structured_file_delete_capability_deserializes_only_when_present() {
+        let missing: ShellClientCapabilities = serde_json::from_str(r#"{"shell":true}"#).unwrap();
+        assert!(!missing.structured_file_delete);
+        let present: ShellClientCapabilities =
+            serde_json::from_str(r#"{"structured_file_delete":true}"#).unwrap();
+        assert!(present.structured_file_delete);
     }
 
     #[test]

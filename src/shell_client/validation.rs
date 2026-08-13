@@ -231,6 +231,7 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         | "write"
         | "list"
         | "project_overview"
+        | "delete_project_files"
         | "write_project_file"
         | "apply_text_edits"
         | "save_project_artifact"
@@ -250,6 +251,7 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         }
     }
     let structured_edit_payload = body.op == "write_project_file";
+    let structured_delete_payload = body.op == "delete_project_files";
     let artifact_payload = matches!(
         body.op.as_str(),
         "save_project_artifact"
@@ -320,11 +322,12 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
             && body.op != "project_overview"
             && body.op != "apply_text_edits"
             && !structured_edit_payload
+            && !structured_delete_payload
             && !artifact_payload
             && !checkpoint_payload
         {
             return Err(
-                "content is only allowed for op=write, project_overview options, apply_text_edits, structured edit tools, artifact tools, or checkpoint tools"
+                "content is only allowed for op=write, project_overview options, delete_project_files, apply_text_edits, structured edit tools, artifact tools, or checkpoint tools"
                     .to_string(),
             );
         }

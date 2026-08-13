@@ -370,6 +370,7 @@ mod tests {
                     shell: true,
                     file_read: true,
                     file_write: true,
+                    structured_file_delete: true,
                     git: false,
                     jobs: true,
                     async_jobs: true,
@@ -988,6 +989,7 @@ mod tests {
                 assert_eq!(client.client_id, "ws-recon");
                 assert_eq!(client.transport, "websocket");
                 assert!(client.connected);
+                assert!(client.capabilities.structured_file_delete);
             }
             other => panic!("expected registered ack on reconnect, got {:?}", other),
         }
@@ -996,6 +998,7 @@ mod tests {
         assert_eq!(view2.transport, "websocket");
         assert!(view2.connected);
         assert_eq!(view2.status, "online");
+        assert!(view2.capabilities.structured_file_delete);
     }
 
     #[tokio::test]

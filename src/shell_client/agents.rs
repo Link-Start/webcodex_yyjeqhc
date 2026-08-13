@@ -178,6 +178,22 @@ impl ShellClientRegistry {
                     .to_string(),
             );
         }
+        // `agent_instance_id` is the Runner process identity, so a same-process
+        // reconnect that stops advertising structured_file_delete is a
+        // downgrade of process-lifetime capability: reject it before replacing
+        // the current record so a queued structured delete is never handed to a
+        // registration that cannot understand it. false -> false, false -> true
+        // and true -> true reconnects remain allowed.
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.capabilities.structured_file_delete
+                && !capabilities.structured_file_delete
+        }) {
+            return Err(
+                "same runner instance cannot downgrade structured_file_delete capability"
+                    .to_string(),
+            );
+        }
         // Enforce the agent instance lease. `client_id` is the unique active
         // agent identity: at most one agent process may be online for it at a
         // time.
@@ -213,6 +229,19 @@ impl ShellClientRegistry {
                 .as_deref()
                 .expect("replacement id captured");
             terminate_instance_jobs_locked(&mut inner, &client_id, replaced_instance_id, now);
+            // A different `agent_instance_id` is a new Runner process; pending
+            // synchronous requests were admitted for the process that existed
+            // when they were queued, so they must not be inherited by or
+            // dispatched to the replacement. Fail and drain them here, under
+            // the same lock and before the new lease is installed, preserving
+            // `request_dispatched` truth. Job-backed requests are governed by
+            // `terminate_instance_jobs_locked` above and are never drained as
+            // synchronous requests.
+            resolve_disconnected_sync_requests_locked(
+                &mut inner,
+                &client_id,
+                "runner instance was replaced before the request completed; the request was not handed to the replacement instance",
+            );
             let retired = inner
                 .retired_instances
                 .entry(client_id.clone())

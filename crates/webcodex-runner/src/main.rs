@@ -1539,6 +1539,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     capabilities.jobs = true;
     capabilities.file_read = true;
     capabilities.file_write = true;
+    // This binary implements the complete bounded structured delete contract.
+    // Older binaries omit the field and therefore keep using the Server's legacy path.
+    capabilities.structured_file_delete = true;
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
     // SSH support intentionally depends on the local OpenSSH executable.
@@ -1871,7 +1874,11 @@ fn handle_file_request(policy: &AgentPolicy, request: &ShellAgentShellRequest) -
         "file_checkpoint_create" | "file_checkpoint_restore" => {
             handle_checkpoint_file_request(request, &resolved, start)
         }
-        "file_read" | "file_write" | "file_list" | "file_project_overview" => {
+        "file_read"
+        | "file_write"
+        | "file_list"
+        | "file_project_overview"
+        | "file_delete_project_files" => {
             handle_basic_file_request(policy, request, &resolved, start)
         }
         _ => CommandResult {

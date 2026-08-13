@@ -88,21 +88,21 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "ok",
                 schema_type(
                     "boolean",
-                    "True when the delete command completed successfully.",
+                    "True when the bounded file cleanup completed successfully.",
                 ),
             ),
             (
                 "deleted_paths",
                 array_schema(
                     schema_type("string", "Deleted project-relative path."),
-                    "Requested paths removed with rm -f.",
+                    "Requested project-relative file paths removed by the selected cleanup path.",
                 ),
             ),
             (
                 "missing_paths",
                 array_schema(
                     schema_type("string", "Missing project-relative path."),
-                    "Reserved for future missing-path detail; currently empty for rm -f success.",
+                    "Reserved for future missing-path detail; currently empty for compatible cleanup success.",
                 ),
             ),
             (
@@ -116,14 +116,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "stdout_present",
                 schema_type(
                     "boolean",
-                    "Whether the underlying command produced stdout. Raw stdout is not exposed by default.",
+                    "Whether the legacy cleanup command produced stdout; false for structured/direct cleanup. Raw output is never exposed.",
                 ),
             ),
             (
                 "stderr_present",
                 schema_type(
                     "boolean",
-                    "Whether the underlying command produced stderr. Raw stderr is not exposed by default.",
+                    "Whether the legacy cleanup command produced stderr; false for structured/direct cleanup. Raw output is never exposed.",
                 ),
             ),
         ])),

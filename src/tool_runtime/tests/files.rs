@@ -164,13 +164,16 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
 }
 
 #[tokio::test]
-async fn delete_project_files_success_omits_raw_command_output() {
+async fn delete_project_files_capable_agent_uses_structured_delete_without_output_leaks() {
     let runtime = runtime_with_agent_project("cleanup-delete");
     register_agent(
         &runtime,
         "cleanup-delete",
         None,
-        ShellClientCapabilities::default(),
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
     )
     .await;
     let project = agent_test_project_id("cleanup-delete");
@@ -186,16 +189,19 @@ async fn delete_project_files_success_omits_raw_command_output() {
 
     let req = next_patch_agent_request(&runtime, "cleanup-delete")
         .await
-        .expect("delete_project_files should enqueue a shell request");
-    assert_eq!(req.kind, "run_shell");
-    assert!(req.command.contains("rm -f --"));
+        .expect("delete_project_files should enqueue a structured file request");
+    assert_eq!(req.kind, "file_delete_project_files");
+    assert!(req.command.is_empty());
+    assert_eq!(req.path.as_deref(), Some("."));
+    let payload: Value = serde_json::from_str(req.content.as_deref().unwrap()).unwrap();
+    assert_eq!(payload, json!({"paths": ["tmp.txt"]}));
     complete_patch_agent_request(
         &runtime,
         "cleanup-delete",
         &req.request_id,
         0,
-        "raw stdout should not leak\n",
-        "raw stderr should not leak\n",
+        r#"{"deleted_paths":["tmp.txt"],"missing_paths":[],"refused_paths":[]}"#,
+        "/private/runner/path raw stderr must not leak\n",
     )
     .await;
 
@@ -205,14 +211,609 @@ async fn delete_project_files_success_omits_raw_command_output() {
     assert_eq!(result.output["deleted_paths"], json!(["tmp.txt"]));
     assert_eq!(result.output["missing_paths"], json!([]));
     assert_eq!(result.output["refused_paths"], json!([]));
-    assert_eq!(result.output["stdout_present"], true);
-    assert_eq!(result.output["stderr_present"], true);
-    assert!(result.output.get("command_result").is_none());
-    assert!(result.output.get("stdout").is_none());
-    assert!(result.output.get("stderr").is_none());
+    assert_eq!(result.output["stdout_present"], false);
+    assert_eq!(result.output["stderr_present"], false);
     let serialized = serde_json::to_string(&result.output).unwrap();
-    assert!(!serialized.contains("raw stdout should not leak"));
-    assert!(!serialized.contains("raw stderr should not leak"));
+    assert!(!serialized.contains("/private/runner/path"));
+    assert!(!serialized.contains("raw stderr"));
+}
+
+#[tokio::test]
+async fn delete_project_files_old_agent_keeps_legacy_shell_fallback() {
+    let runtime = runtime_with_agent_project("cleanup-delete-legacy");
+    register_agent(
+        &runtime,
+        "cleanup-delete-legacy",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-legacy");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files(project, vec!["tmp.txt".to_string()])
+                .await
+        }
+    });
+
+    let req = next_patch_agent_request(&runtime, "cleanup-delete-legacy")
+        .await
+        .expect("old agent should receive the legacy shell request");
+    assert_eq!(req.kind, "run_shell");
+    assert!(req.command.contains("rm -f --"));
+    complete_patch_agent_request(
+        &runtime,
+        "cleanup-delete-legacy",
+        &req.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    assert!(task.await.unwrap().success);
+}
+
+#[tokio::test]
+async fn delete_project_files_replaced_agent_keeps_legacy_shell_fallback() {
+    let runtime = runtime_with_agent_project("cleanup-delete-replaced");
+    // Capability advertised at first registration...
+    register_agent(
+        &runtime,
+        "cleanup-delete-replaced",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // ...then the capable instance goes stale and a different Runner process
+    // without the capability takes over the lease before the delete decision:
+    // the pre-check sees the current registration and routes to legacy shell.
+    // (A same-instance downgrade is rejected by the monotonic capability rule.)
+    runtime
+        .shell_clients
+        .set_last_seen_for_test(
+            "cleanup-delete-replaced",
+            chrono::Utc::now().timestamp() - 120,
+        )
+        .await;
+    register_agent_with_instance(
+        &runtime,
+        "cleanup-delete-replaced",
+        "inst-b",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-replaced");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files(project, vec!["tmp.txt".to_string()])
+                .await
+        }
+    });
+
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-replaced", "inst-b")
+        .await
+        .expect("replaced agent should receive the legacy shell request");
+    assert_eq!(req.kind, "run_shell");
+    assert!(req.command.contains("rm -f --"));
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        "cleanup-delete-replaced",
+        "inst-b",
+        &req.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    assert!(task.await.unwrap().success);
+    let extra =
+        next_agent_request_for_instance(&runtime, "cleanup-delete-replaced", "inst-b").await;
+    assert!(
+        extra.is_none(),
+        "exactly one legacy request may be emitted: {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_project_files_capability_revoked_before_enqueue_falls_back_to_legacy() {
+    let runtime = runtime_with_agent_project("cleanup-delete-fence");
+    // Capability advertised at first registration...
+    register_agent(
+        &runtime,
+        "cleanup-delete-fence",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // ...then the capable instance goes stale and a different Runner process
+    // without the capability takes over the lease before the authoritative
+    // enqueue. This simulates the mixed-version TOCTOU window: an earlier
+    // observer saw structured_file_delete enabled, but the current
+    // registration does not advertise it when the structured request would be
+    // enqueued. (A same-instance downgrade is rejected by the monotonic
+    // capability rule.)
+    runtime
+        .shell_clients
+        .set_last_seen_for_test("cleanup-delete-fence", chrono::Utc::now().timestamp() - 120)
+        .await;
+    register_agent_with_instance(
+        &runtime,
+        "cleanup-delete-fence",
+        "inst-b",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-fence");
+    let proj = runtime.resolve_project(&project).await.unwrap();
+    let client_id = proj.agent_client_id().unwrap().to_string();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files_structured_agent(
+                    &proj,
+                    client_id,
+                    vec!["tmp.txt".to_string()],
+                    project,
+                    30,
+                )
+                .await
+        }
+    });
+
+    // The only request the Runner receives is the legacy shell fallback: no
+    // structured request may be queued for a client that no longer advertises
+    // the capability, and no duplicate structured + legacy pair may appear.
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-fence", "inst-b")
+        .await
+        .expect("replaced agent should receive exactly one legacy shell request");
+    assert_eq!(req.kind, "run_shell");
+    assert!(req.command.contains("rm -f --"));
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        "cleanup-delete-fence",
+        "inst-b",
+        &req.request_id,
+        0,
+        "",
+        "",
+    )
+    .await;
+    assert!(task.await.unwrap().success);
+    let extra = next_agent_request_for_instance(&runtime, "cleanup-delete-fence", "inst-b").await;
+    assert!(
+        extra.is_none(),
+        "no duplicate structured + legacy request may be emitted: {extra:?}"
+    );
+}
+
+/// Spin (yield, never sleep) until the client has at least `expected` pending
+/// requests, without polling/dispatching any of them. Used to synchronize
+/// replacement/timeout tests deterministically on the queue being populated.
+async fn wait_for_pending_requests(runtime: &ToolRuntime, client_id: &str, expected: usize) {
+    for _ in 0..200 {
+        let view = runtime
+            .shell_clients
+            .get_client_view(client_id)
+            .await
+            .unwrap_or_else(|| panic!("client {client_id} must be registered"));
+        if view.pending_requests >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("pending requests did not reach {expected} for {client_id}");
+}
+
+#[tokio::test]
+async fn delete_project_files_replacement_before_poll_reports_not_started() {
+    let runtime = runtime_with_agent_project("cleanup-delete-replace-early");
+    register_agent(
+        &runtime,
+        "cleanup-delete-replace-early",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-replace-early");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files(project, vec!["tmp.txt".to_string()])
+                .await
+        }
+    });
+
+    // Wait until the structured request is queued, without polling it.
+    wait_for_pending_requests(&runtime, "cleanup-delete-replace-early", 1).await;
+    // Replace the Runner process before the request was ever polled.
+    runtime
+        .shell_clients
+        .set_last_seen_for_test(
+            "cleanup-delete-replace-early",
+            chrono::Utc::now().timestamp() - 120,
+        )
+        .await;
+    register_agent_with_instance(
+        &runtime,
+        "cleanup-delete-replace-early",
+        "inst-b",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["failure_kind"], "not_started");
+    assert_eq!(result.output["tool_failure"], true);
+    assert_ne!(result.output["execution_state"], "outcome_unknown");
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("was not dispatched") && error.contains("did not start"),
+        "error was: {error}"
+    );
+
+    // No legacy fallback and no inherited structured request for the
+    // replacement Runner.
+    let extra =
+        next_agent_request_for_instance(&runtime, "cleanup-delete-replace-early", "inst-b").await;
+    assert!(
+        extra.is_none(),
+        "replacement Runner must receive no request: {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
+    let runtime = runtime_with_agent_project("cleanup-delete-replace-late");
+    register_agent(
+        &runtime,
+        "cleanup-delete-replace-late",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-replace-late");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files(project, vec!["tmp.txt".to_string()])
+                .await
+        }
+    });
+
+    wait_for_pending_requests(&runtime, "cleanup-delete-replace-late", 1).await;
+    // Dispatch the structured request to the original instance.
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-replace-late", "inst")
+        .await
+        .expect("structured delete should be polled by the original instance");
+    assert_eq!(req.kind, "file_delete_project_files");
+    // Replace the Runner before it returns its result.
+    runtime
+        .shell_clients
+        .set_last_seen_for_test(
+            "cleanup-delete-replace-late",
+            chrono::Utc::now().timestamp() - 120,
+        )
+        .await;
+    register_agent_with_instance(
+        &runtime,
+        "cleanup-delete-replace-late",
+        "inst-b",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert_eq!(result.output["tool_failure"], true);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("may already have deleted files"),
+        "error was: {error}"
+    );
+    assert!(
+        error.contains("Inspect current workspace state"),
+        "error was: {error}"
+    );
+
+    // The replacement Runner cannot complete or inherit the dispatched
+    // request, and no legacy fallback is emitted.
+    let err = runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: "cleanup-delete-replace-late".to_string(),
+            agent_instance_id: "inst-b".to_string(),
+            request_id: req.request_id,
+            exit_code: Some(0),
+            stdout: Some(
+                r#"{"deleted_paths":["tmp.txt"],"missing_paths":[],"refused_paths":[]}"#
+                    .to_string(),
+            ),
+            stderr: None,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("unknown or expired shell request"),
+        "replacement must not complete the replaced request: {err}"
+    );
+    let extra =
+        next_agent_request_for_instance(&runtime, "cleanup-delete-replace-late", "inst-b").await;
+    assert!(
+        extra.is_none(),
+        "replacement Runner must receive no inherited request: {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_project_files_timeout_before_dispatch_reports_not_started() {
+    let runtime = runtime_with_agent_project("cleanup-delete-timeout-early");
+    register_agent(
+        &runtime,
+        "cleanup-delete-timeout-early",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-timeout-early");
+    let proj = runtime.resolve_project(&project).await.unwrap();
+    let client_id = proj.agent_client_id().unwrap().to_string();
+
+    // Short wait bound: the request is never polled, so the wait timeout fires
+    // and the dispatch-aware cancellation proves the request was never
+    // dispatched.
+    let result = runtime
+        .delete_project_files_structured_agent(
+            &proj,
+            client_id,
+            vec!["tmp.txt".to_string()],
+            project,
+            1,
+        )
+        .await;
+
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["failure_kind"], "not_started");
+    assert_eq!(result.output["tool_failure"], true);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("timed out") && error.contains("did not start"),
+        "error was: {error}"
+    );
+    // The timed-out request was removed: no queue/waiter leak.
+    let view = runtime
+        .shell_clients
+        .get_client_view("cleanup-delete-timeout-early")
+        .await
+        .unwrap();
+    assert_eq!(view.pending_requests, 0);
+}
+
+#[tokio::test]
+async fn delete_project_files_timeout_after_dispatch_reports_outcome_unknown() {
+    let runtime = runtime_with_agent_project("cleanup-delete-timeout-late");
+    register_agent(
+        &runtime,
+        "cleanup-delete-timeout-late",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-timeout-late");
+    let proj = runtime.resolve_project(&project).await.unwrap();
+    let client_id = proj.agent_client_id().unwrap().to_string();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let client_id = client_id.clone();
+        async move {
+            runtime
+                .delete_project_files_structured_agent(
+                    &proj,
+                    client_id,
+                    vec!["tmp.txt".to_string()],
+                    project,
+                    1,
+                )
+                .await
+        }
+    });
+
+    wait_for_pending_requests(&runtime, "cleanup-delete-timeout-late", 1).await;
+    // Dispatch the structured request; the Runner never returns a result, so
+    // the wait timeout fires after dispatch may have started deleting.
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-timeout-late", "inst")
+        .await
+        .expect("structured delete should be polled");
+    assert_eq!(req.kind, "file_delete_project_files");
+
+    let result = task.await.unwrap();
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("timed out") && error.contains("may already have deleted files"),
+        "error was: {error}"
+    );
+    // The timed-out request was removed: no queue/waiter leak.
+    let view = runtime
+        .shell_clients
+        .get_client_view("cleanup-delete-timeout-late")
+        .await
+        .unwrap();
+    assert_eq!(view.pending_requests, 0);
+}
+
+#[tokio::test]
+async fn delete_project_files_waiter_dropped_without_undispatch_proof_reports_outcome_unknown() {
+    let runtime = runtime_with_agent_project("cleanup-delete-waiter");
+    register_agent(
+        &runtime,
+        "cleanup-delete-waiter",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-waiter");
+    let proj = runtime.resolve_project(&project).await.unwrap();
+    let client_id = proj.agent_client_id().unwrap().to_string();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let client_id = client_id.clone();
+        async move {
+            runtime
+                .delete_project_files_structured_agent(
+                    &proj,
+                    client_id,
+                    vec!["tmp.txt".to_string()],
+                    project,
+                    30,
+                )
+                .await
+        }
+    });
+
+    wait_for_pending_requests(&runtime, "cleanup-delete-waiter", 1).await;
+    // Manufacture the dropped waiter through the existing dispatch-state-aware
+    // cancellation API: remove the pending record (dropping the oneshot
+    // sender) without resolving it, so the tool's receiver observes the
+    // channel close. The registry returns the preserved dispatch truth.
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-waiter", "inst")
+        .await
+        .expect("structured delete should be polled");
+    let dispatch = runtime
+        .shell_clients
+        .cancel_request_dispatch_state(&req.request_id)
+        .await;
+    assert_eq!(
+        dispatch,
+        Some(true),
+        "registry must preserve dispatch truth for the cancelled request"
+    );
+
+    // The subsequent cancellation in the tool finds no record, which cannot
+    // prove undispatch: the result must be outcome_unknown, never not_started.
+    let result = task.await.unwrap();
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert_eq!(result.output["tool_failure"], true);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("may already have deleted files"),
+        "error was: {error}"
+    );
+    let view = runtime
+        .shell_clients
+        .get_client_view("cleanup-delete-waiter")
+        .await
+        .unwrap();
+    assert_eq!(view.pending_requests, 0);
+}
+
+#[tokio::test]
+async fn delete_project_files_terminal_failure_reports_outcome_unknown() {
+    let runtime = runtime_with_agent_project("cleanup-delete-terminal");
+    register_agent(
+        &runtime,
+        "cleanup-delete-terminal",
+        None,
+        ShellClientCapabilities {
+            structured_file_delete: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("cleanup-delete-terminal");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .delete_project_files(project, vec!["tmp.txt".to_string()])
+                .await
+        }
+    });
+
+    wait_for_pending_requests(&runtime, "cleanup-delete-terminal", 1).await;
+    // The Runner returns a definitive terminal failure after dispatch
+    // (non-zero exit). The mutation may already have deleted files, so the
+    // failure must never collapse into an ordinary retry-safe error.
+    let req = next_agent_request_for_instance(&runtime, "cleanup-delete-terminal", "inst")
+        .await
+        .expect("structured delete should be polled");
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        "cleanup-delete-terminal",
+        "inst",
+        &req.request_id,
+        1,
+        "",
+        "delete failed",
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success, "{:?}", result.error);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert_eq!(result.output["tool_failure"], true);
+    let error = result.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("may already have deleted files"),
+        "error was: {error}"
+    );
+    // No automatic legacy fallback follows the uncertain mutation.
+    let extra = next_agent_request_for_instance(&runtime, "cleanup-delete-terminal", "inst").await;
+    assert!(
+        extra.is_none(),
+        "no legacy fallback may follow an uncertain structured delete: {extra:?}"
+    );
 }
 
 #[tokio::test]

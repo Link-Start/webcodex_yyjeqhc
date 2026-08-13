@@ -367,6 +367,37 @@ pub(in crate::tool_runtime::tests) fn agent_test_project_id(client_id: &str) -> 
     crate::tool_runtime::agent_project_runtime_id(client_id, "agent-proj")
 }
 
+/// Register an agent under an explicit `agent_instance_id`. `register_agent`
+/// always uses `"inst"`; replacement scenarios need a different instance id to
+/// model a new Runner process taking over the lease.
+pub(in crate::tool_runtime::tests) async fn register_agent_with_instance(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    agent_instance_id: &str,
+    owner: Option<&str>,
+    caps: ShellClientCapabilities,
+) {
+    runtime
+        .shell_clients
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            client_id: client_id.to_string(),
+            agent_instance_id: agent_instance_id.to_string(),
+            display_name: None,
+            owner: owner.map(str::to_string),
+            hostname: None,
+            capabilities: Some(caps),
+            projects: Some(vec![registered_project("agent-proj", "/tmp/agent-proj")]),
+            agent_protocol_version: Some("polling-v1".to_string()),
+            policy: None,
+        })
+        .await
+        .unwrap();
+}
+
 /// Build a ToolRuntime backed by a single server-configured (local) project
 /// rooted at `root`. Used to assert the runtime surface rejects
 /// server-configured projects in favor of agent-registered ones.

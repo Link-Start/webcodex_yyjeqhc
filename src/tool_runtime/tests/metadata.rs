@@ -106,6 +106,7 @@ async fn register_agent_projects_for_auth(
                     shell: true,
                     file_read: true,
                     file_write: true,
+                    structured_file_delete: false,
                     git: true,
                     jobs: true,
                     async_jobs: true,

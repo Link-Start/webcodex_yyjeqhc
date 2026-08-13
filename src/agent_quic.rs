@@ -576,6 +576,7 @@ mod tests {
                     shell: true,
                     file_read: true,
                     file_write: true,
+                    structured_file_delete: true,
                     git: false,
                     jobs: true,
                     async_jobs: true,
@@ -757,6 +758,7 @@ mod tests {
                 assert!(client.capabilities.shell);
                 assert!(client.capabilities.file_read);
                 assert!(client.capabilities.file_write);
+                assert!(client.capabilities.structured_file_delete);
                 assert!(!client.capabilities.git);
                 assert!(client.capabilities.jobs);
                 assert!(client.capabilities.async_jobs);
@@ -777,6 +779,7 @@ mod tests {
         assert!(view.capabilities.shell);
         assert!(view.capabilities.file_read);
         assert!(view.capabilities.file_write);
+        assert!(view.capabilities.structured_file_delete);
         assert!(!view.capabilities.git);
         assert!(view.capabilities.jobs);
         assert!(view.capabilities.async_jobs);

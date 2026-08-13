@@ -15,7 +15,8 @@ use crate::shell_protocol::{
     ShellJobContext, ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptPayload,
     SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY, SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
     SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
-    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 use std::fmt;
@@ -248,6 +249,82 @@ impl ShellClientRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
+        enqueue_pending_request_locked(
+            &mut inner,
+            &body.client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_client_locked(&inner, &body.client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue a structured `delete_project_files` agent file op. This is the
+    /// authoritative TOCTOU fence for mixed-version rolling upgrades: the
+    /// `structured_file_delete` capability check and the pending-request
+    /// admission happen under the same registry lock, so an agent that
+    /// re-registers without the capability between a caller's pre-check and
+    /// this call never receives a structured delete request it cannot
+    /// understand.
+    ///
+    /// When the current client no longer advertises the capability, nothing is
+    /// queued, no waiter or request is created, and an error carrying the
+    /// `capability_unavailable:` prefix is returned so the caller can take the
+    /// legacy shell fallback (supported by old and new Runners).
+    pub(crate) async fn enqueue_structured_file_delete(
+        &self,
+        body: ShellFileOpRequest,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_file_request(&body)?;
+        if body.op != "delete_project_files" {
+            return Err(format!(
+                "structured file delete only accepts op=delete_project_files (got {})",
+                body.op
+            ));
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let kind = format!("file_{}", body.op);
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: body.client_id.clone(),
+            kind,
+            job_id: None,
+            cwd: body.cwd.clone().map(|cwd| cwd.trim().to_string()),
+            path: Some(body.path.trim().to_string()),
+            content: body.content.clone(),
+            max_bytes: body.max_bytes,
+            expected_sha256: body.expected_sha256.clone(),
+            expected_prefix: body.expected_prefix.clone(),
+            start_line: body.start_line,
+            end_line: body.end_line,
+            create_dirs: body.create_dirs,
+            command: String::new(),
+            process: None,
+            script: None,
+            stdin: None,
+            timeout_secs: 30,
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+            persistent_shell: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&body.client_id) else {
+            return Err(format!("unknown shell client: {}", body.client_id));
+        };
+        if !client.capabilities.structured_file_delete {
+            return Err(format!(
+                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE}",
+                body.client_id
+            ));
+        }
         enqueue_pending_request_locked(
             &mut inner,
             &body.client_id,

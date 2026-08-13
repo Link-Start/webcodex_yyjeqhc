@@ -196,6 +196,9 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             shell: true,
             file_read: true,
             file_write: true,
+            // The running binary advertises structured deletion only after its
+            // complete project-root-enforced handler is installed.
+            structured_file_delete: false,
             git: true,
             jobs: true,
             async_jobs: true,
