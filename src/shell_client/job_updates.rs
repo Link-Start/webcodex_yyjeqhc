@@ -584,9 +584,10 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
-        if validation_steps.iter().any(|step| {
-            step.name == "test" && step.program == "go" && step.args == ["test", "-json", "./..."]
-        }) && !client.capabilities.structured_go_test_json
+        if validation_steps
+            .iter()
+            .any(crate::shell_protocol::ShellJobValidationStep::is_structured_go_test_json)
+            && !client.capabilities.structured_go_test_json
         {
             return Err(format!(
                 "structured_go_test_json_unavailable: agent client {} does not support machine-readable Go test validation",

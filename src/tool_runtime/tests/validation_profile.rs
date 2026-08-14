@@ -5,7 +5,7 @@ use super::super::validation_parser::{
 use super::super::validation_profile::{
     validation_adapter_for_tool, ValidationCommandOptions, ValidationFailureEvidence,
 };
-use super::super::{is_known_tool_name, registered_tool_specs};
+use super::super::{is_known_tool_name, registered_tool_specs, ToolCall};
 
 #[test]
 fn rust_profile_selects_cargo_fmt_adapter_and_preserves_command() {
@@ -57,6 +57,12 @@ fn rust_profile_selects_cargo_test_adapter_and_preserves_command() {
             .unwrap(),
         "cargo test 'tool_runtime'"
     );
+    assert!(adapter
+        .build_command(ValidationCommandOptions {
+            go_packages: Some(vec!["./pkg".to_string()]),
+            ..ValidationCommandOptions::default()
+        })
+        .is_err());
 }
 
 #[test]
@@ -91,6 +97,18 @@ fn go_profile_selects_only_go_test_and_preserves_json_command() {
             .unwrap(),
         "go test -json ./..."
     );
+    assert_eq!(
+        adapter
+            .build_command(ValidationCommandOptions {
+                go_packages: Some(vec![
+                    "./internal/control".to_string(),
+                    "./internal/node".to_string(),
+                ]),
+                ..ValidationCommandOptions::default()
+            })
+            .unwrap(),
+        "go test -json './internal/control' './internal/node'"
+    );
     assert!(adapter
         .build_command(ValidationCommandOptions {
             filter: Some("TestOne".to_string()),
@@ -104,6 +122,57 @@ fn go_profile_selects_only_go_test_and_preserves_json_command() {
         adapter.parse(stdout, "ordinary stderr must be ignored", false),
         parse_go_test_diagnostics(stdout, false)
     );
+}
+
+#[test]
+fn go_test_schema_and_audit_projection_are_bounded_and_explicit() {
+    let specs = registered_tool_specs();
+    let spec = specs.iter().find(|spec| spec.name == "go_test").unwrap();
+    let packages = &spec.input_schema["properties"]["packages"];
+    assert_eq!(packages["minItems"], 1);
+    assert_eq!(
+        packages["maxItems"],
+        crate::shell_protocol::GO_TEST_PACKAGE_MAX_ITEMS
+    );
+    assert_eq!(
+        packages["items"]["maxLength"],
+        crate::shell_protocol::GO_TEST_PACKAGE_MAX_BYTES
+    );
+
+    let raw = serde_json::json!({
+        "project": "agent:test:demo",
+        "cwd": "internal/control",
+        "packages": ["./internal/control", "./internal/node"],
+        "timeout_secs": 90,
+        "unrecognized_private_field": "NEVER_PERSIST_GO_TEST_UNKNOWN"
+    });
+    let raw_audit =
+        super::super::tool_audit::session_log_arguments_for_tool_request("go_test", &raw);
+    assert_eq!(
+        raw_audit,
+        serde_json::json!({
+            "project": "agent:test:demo",
+            "cwd": "internal/control",
+            "packages_present": true,
+            "package_count": 2,
+            "timeout_secs": 90
+        })
+    );
+    assert!(!raw_audit
+        .to_string()
+        .contains("NEVER_PERSIST_GO_TEST_UNKNOWN"));
+
+    let call = ToolCall::from_tool_name(
+        "go_test",
+        serde_json::json!({
+            "project": "agent:test:demo",
+            "cwd": "internal/control",
+            "packages": ["./internal/control", "./internal/node"],
+            "timeout_secs": 90
+        }),
+    )
+    .unwrap();
+    assert_eq!(call.session_log_arguments(), raw_audit);
 }
 
 #[test]

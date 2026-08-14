@@ -52,6 +52,9 @@ impl ValidationAdapter for RustValidationAdapter {
     }
 
     fn build_command(&self, options: ValidationCommandOptions) -> Result<String, String> {
+        if options.go_packages.is_some() {
+            return Err("Cargo validation does not accept go_test packages".to_string());
+        }
         match self.kind {
             RustAdapterKind::Format => Ok(cargo_fmt_command(options.check)),
             RustAdapterKind::Check => cargo_check_command(options),

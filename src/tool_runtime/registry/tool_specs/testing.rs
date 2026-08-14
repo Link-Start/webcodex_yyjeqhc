@@ -23,7 +23,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "go_test",
-            "Preferred structured Go test runner. Runs exactly go test -json ./... with an optional project-relative cwd. Requires Runner structured Go JSON validation support; a short run may return immediately and a longer run continues as the same Job.",
+            "Preferred structured Go test runner. Defaults to exactly go test -json ./... and accepts an optional bounded list of project-relative package patterns. Requires Runner structured Go JSON validation support; a short run may return immediately and a longer run continues as the same Job.",
             go_test_input_schema(),
         ),
     ]

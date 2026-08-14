@@ -784,13 +784,16 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
     },
 
-    /// Run canonical structured `go test -json ./...` validation.
+    /// Run canonical structured `go test -json` validation with an optional
+    /// bounded project-relative package scope.
     GoTest {
         project: String,
         #[serde(default)]
         session_id: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        packages: Option<Vec<String>>,
         #[serde(default)]
         timeout_secs: Option<u64>,
     },

@@ -282,6 +282,18 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
                 ),
             );
         }
+        "go_test" => {
+            copy_keys(obj, &mut out, &["cwd", "timeout_secs"]);
+            let packages = obj.get("packages").and_then(Value::as_array);
+            out.insert(
+                "packages_present".to_string(),
+                Value::Bool(obj.get("packages").is_some_and(|value| !value.is_null())),
+            );
+            out.insert(
+                "package_count".to_string(),
+                Value::from(packages.map(Vec::len).unwrap_or_default()),
+            );
+        }
         "workspace_checkpoint_create" => {
             copy_keys(obj, &mut out, &["title", "include_untracked"]);
             out.insert(
@@ -616,11 +628,14 @@ impl ToolCall {
             Self::GoTest {
                 project,
                 cwd,
+                packages,
                 timeout_secs,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "cwd": cwd,
+                "packages_present": packages.is_some(),
+                "package_count": packages.as_ref().map(Vec::len).unwrap_or_default(),
                 "timeout_secs": timeout_secs,
             }),
             Self::ReadFile {

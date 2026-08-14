@@ -21,6 +21,9 @@ pub(crate) struct ValidationCommandOptions {
     pub(crate) features: Option<String>,
     pub(crate) package: Option<String>,
     pub(crate) no_run: Option<bool>,
+    /// First-class `go_test` package scope. Other validation adapters must
+    /// reject this Go-specific option rather than silently ignoring it.
+    pub(crate) go_packages: Option<Vec<String>>,
 }
 
 pub(crate) struct ValidationFailureEvidence<'a> {

@@ -222,6 +222,7 @@ async fn go_test_requires_first_class_tool_capability_before_job_reservation() {
                 project: project.clone(),
                 session_id: Some(session.session_id.clone()),
                 cwd: None,
+                packages: None,
                 timeout_secs: Some(1800),
             },
             Some(&auth),
@@ -299,6 +300,54 @@ async fn go_test_requires_first_class_tool_capability_before_job_reservation() {
 }
 
 #[tokio::test]
+async fn go_test_rejects_empty_or_oversized_package_lists_before_dispatch() {
+    let client_id = "vhandoff-go-invalid-packages";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_go_test_json: true,
+            structured_go_test_tool: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    for packages in [
+        Vec::<String>::new(),
+        (0..=crate::shell_protocol::GO_TEST_PACKAGE_MAX_ITEMS)
+            .map(|index| format!("./pkg{index}"))
+            .collect::<Vec<_>>(),
+    ] {
+        let result = runtime
+            .dispatch_with_auth(
+                ToolCall::GoTest {
+                    project: project.clone(),
+                    session_id: None,
+                    cwd: None,
+                    packages: Some(packages),
+                    timeout_secs: Some(1800),
+                },
+                Some(&auth),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.output["command_started"], false);
+    }
+    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn fast_go_test_uses_exact_structured_argv_cwd_and_records_session_evidence() {
     let client_id = "vhandoff-go-fast";
     let tmp = tempfile::tempdir().unwrap();
@@ -340,6 +389,7 @@ async fn fast_go_test_uses_exact_structured_argv_cwd_and_records_session_evidenc
                         project,
                         session_id: Some(session_id),
                         cwd: Some("internal/nodeapp".to_string()),
+                        packages: None,
                         timeout_secs: Some(1800),
                     },
                     Some(&auth),
@@ -448,6 +498,7 @@ async fn go_test_failure_reports_failed_test_identity_in_result_and_session() {
                         project,
                         session_id: Some(session_id),
                         cwd: None,
+                        packages: None,
                         timeout_secs: Some(1800),
                     },
                     Some(&auth),
@@ -535,6 +586,10 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
                         project,
                         session_id: Some(session_id),
                         cwd: None,
+                        packages: Some(vec![
+                            "./internal/control".to_string(),
+                            "./internal/node".to_string(),
+                        ]),
                         timeout_secs: Some(1800),
                     },
                     Some(&auth),
@@ -545,6 +600,15 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
     let request = wait_for_agent_request(&runtime, client_id).await;
     assert_eq!(request.kind, "start_validation_job");
     let job_id = request.job_id.clone().expect("start_validation_job job_id");
+    let steps: Vec<crate::shell_protocol::ShellJobValidationStep> =
+        serde_json::from_str(&request.command).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].program, "go");
+    assert_eq!(
+        steps[0].args,
+        vec!["test", "-json", "./internal/control", "./internal/node"]
+    );
+    assert!(steps[0].env.is_empty());
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["promoted_to_job"], true);

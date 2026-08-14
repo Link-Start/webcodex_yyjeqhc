@@ -334,6 +334,7 @@ impl ToolRuntime {
                     features: None,
                     package: None,
                     no_run: None,
+                    go_packages: None,
                     timeout_secs,
                     session_id,
                     ssh_resource,
@@ -437,6 +438,7 @@ impl ToolRuntime {
                 features,
                 package,
                 no_run: None,
+                go_packages: None,
                 timeout_secs,
                 session_id,
                 ssh_resource,
@@ -549,6 +551,7 @@ impl ToolRuntime {
                 features,
                 package,
                 no_run,
+                go_packages: None,
                 timeout_secs,
                 session_id,
                 ssh_resource,
@@ -566,7 +569,7 @@ impl ToolRuntime {
         cwd: Option<String>,
         timeout_secs: Option<u64>,
     ) -> ToolResult {
-        self.go_test_with_context(project, cwd, timeout_secs, None, None, None, None)
+        self.go_test_with_context(project, cwd, None, timeout_secs, None, None, None, None)
             .await
     }
 
@@ -574,6 +577,7 @@ impl ToolRuntime {
         &self,
         project: String,
         cwd: Option<String>,
+        packages: Option<Vec<String>>,
         timeout_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
@@ -593,6 +597,7 @@ impl ToolRuntime {
                 features: None,
                 package: None,
                 no_run: None,
+                go_packages: packages,
                 timeout_secs,
                 session_id,
                 ssh_resource,
@@ -641,13 +646,18 @@ impl ToolRuntime {
             features: request.features,
             package: request.package,
             no_run: request.no_run,
+            go_packages: request.go_packages,
         };
         let command = match adapter.build_command(options.clone()) {
             Ok(command) => command,
             Err(e) => {
                 return ToolResult::err(command_rejected_message(
                     e,
-                    "fix the cargo argument format, then retry.",
+                    if tool_name == "go_test" {
+                        "fix the Go package pattern format, then retry."
+                    } else {
+                        "fix the cargo argument format, then retry."
+                    },
                 ))
             }
         };
@@ -1852,6 +1862,7 @@ struct ValidationRunRequest<'a> {
     features: Option<String>,
     package: Option<String>,
     no_run: Option<bool>,
+    go_packages: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     session_id: Option<String>,
     ssh_resource: Option<&'a str>,
@@ -1880,6 +1891,9 @@ fn validation_step(
     tool_name: &str,
     options: &ValidationCommandOptions,
 ) -> Result<ShellJobValidationStep, String> {
+    if tool_name != "go_test" && options.go_packages.is_some() {
+        return Err("only go_test accepts Go package patterns".to_string());
+    }
     let (name, program, args) = match tool_name {
         "cargo_fmt" => (
             "format",
@@ -1928,11 +1942,14 @@ fn validation_step(
             }
             ("test", "cargo", args)
         }
-        "go_test" => (
-            "test",
-            "go",
-            vec!["test".to_string(), "-json".to_string(), "./...".to_string()],
-        ),
+        "go_test" => {
+            let packages =
+                crate::shell_protocol::normalize_go_test_packages(options.go_packages.as_deref())
+                    .map_err(|reason| format!("packages {reason}"))?;
+            let mut args = vec!["test".to_string(), "-json".to_string()];
+            args.extend(packages);
+            ("test", "go", args)
+        }
         _ => return Err("unknown validation tool".to_string()),
     };
     let step = ShellJobValidationStep {
@@ -2195,6 +2212,32 @@ mod structured_cargo_arg_parity_tests {
             }
             assert!(step.is_canonical(), "{tool_name} step must be canonical");
         }
+    }
+
+    #[test]
+    fn go_test_job_and_sync_paths_share_normalized_package_scope() {
+        let options = ValidationCommandOptions {
+            go_packages: Some(vec![
+                "./internal/control".to_string(),
+                "./internal/node".to_string(),
+            ]),
+            ..ValidationCommandOptions::default()
+        };
+        let adapter = validation_adapter_for_tool("go_test").unwrap();
+        assert_eq!(
+            adapter.build_command(options.clone()).unwrap(),
+            "go test -json './internal/control' './internal/node'"
+        );
+        let step = validation_step("go_test", &options).unwrap();
+        assert_eq!(step.name, "test");
+        assert_eq!(step.program, "go");
+        assert_eq!(
+            step.args,
+            vec!["test", "-json", "./internal/control", "./internal/node"]
+        );
+        assert!(step.env.is_empty());
+        assert!(step.is_structured_go_test_json());
+        assert!(step.is_canonical());
     }
 
     #[test]

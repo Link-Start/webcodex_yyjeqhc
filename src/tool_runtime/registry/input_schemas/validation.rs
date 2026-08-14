@@ -148,13 +148,19 @@ pub(crate) fn cargo_test_input_schema() -> Value {
 }
 
 pub(crate) fn go_test_input_schema() -> Value {
-    with_validation_timeout_bounds(
+    let mut schema = with_validation_timeout_bounds(
         object_schema(with_optional_session_id(vec![
             ("project", "string", "Agent-registered project id.", true),
             (
                 "cwd",
                 "string",
                 "Optional project-relative working directory.",
+                false,
+            ),
+            (
+                "packages",
+                "array",
+                "Optional 1..8 project-relative Go package patterns: '.', './path', './...', or './path/...'.",
                 false,
             ),
             (
@@ -165,7 +171,14 @@ pub(crate) fn go_test_input_schema() -> Value {
             ),
         ])),
         1800,
-    )
+    );
+    schema["properties"]["packages"]["minItems"] = json!(1);
+    schema["properties"]["packages"]["maxItems"] =
+        json!(crate::shell_protocol::GO_TEST_PACKAGE_MAX_ITEMS);
+    schema["properties"]["packages"]["items"]["minLength"] = json!(1);
+    schema["properties"]["packages"]["items"]["maxLength"] =
+        json!(crate::shell_protocol::GO_TEST_PACKAGE_MAX_BYTES);
+    schema
 }
 
 pub(crate) fn validate_patch_input_schema() -> Value {

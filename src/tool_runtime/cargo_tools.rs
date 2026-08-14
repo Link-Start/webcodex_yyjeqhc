@@ -95,11 +95,13 @@ impl ToolRuntime {
                 project,
                 session_id,
                 cwd,
+                packages,
                 timeout_secs,
             } => {
                 self.go_test_with_context(
                     project,
                     cwd,
+                    packages,
                     timeout_secs,
                     session_id,
                     ssh_resource,
