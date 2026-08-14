@@ -63,6 +63,11 @@ fn serialized_batch_fits(output: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn retryable_agent_request_failure(result: &ToolResult) -> bool {
+    !result.success
+        && result.output.get("code").and_then(Value::as_str) == Some("search_request_dropped")
+}
+
 fn apply_output_budget(project: &str, requested_count: usize, completed: Vec<Value>) -> Value {
     let mut returned = Vec::with_capacity(completed.len());
     let mut next_index = None;
@@ -184,6 +189,28 @@ impl ToolRuntime {
                 let output_project = runtime_project_id.as_str();
                 async move {
                     let result = match SearchOptions::normalize(query.into()) {
+                        Ok(options) if project.is_agent() => {
+                            let first = self
+                                .search_one_resolved_project_text(
+                                    project,
+                                    output_project,
+                                    options.clone(),
+                                    Some(deadline),
+                                )
+                                .await;
+                            if retryable_agent_request_failure(&first) && Instant::now() < deadline
+                            {
+                                self.search_one_resolved_project_text(
+                                    project,
+                                    output_project,
+                                    options,
+                                    Some(deadline),
+                                )
+                                .await
+                            } else {
+                                first
+                            }
+                        }
                         Ok(options) => {
                             self.search_one_resolved_project_text(
                                 project,

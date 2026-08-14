@@ -65,6 +65,63 @@ async fn complete_search_success(
     .await;
 }
 
+async fn poll_agent_request(
+    runtime: &ToolRuntime,
+    client_id: &str,
+) -> Option<ShellAgentShellRequest> {
+    runtime
+        .shell_clients
+        .poll(ShellAgentPollRequest {
+            client_id: client_id.to_string(),
+            agent_instance_id: "inst".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn assert_no_agent_request(runtime: &ToolRuntime, client_id: &str) {
+    assert!(
+        poll_agent_request(runtime, client_id).await.is_none(),
+        "unexpected additional Runner request for {client_id}"
+    );
+}
+
+async fn run_single_agent_batch_response(
+    client_id: &str,
+    batch_query: SearchProjectTextsQuery,
+    exit_code: i32,
+    stdout: String,
+    stderr: &str,
+) -> ToolResult {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts("demo".to_string(), vec![batch_query])
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("single batch search request");
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &request.request_id,
+        exit_code,
+        &stdout,
+        stderr,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert_no_agent_request(&runtime, client_id).await;
+    result
+}
+
 #[test]
 fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
     let specs = registered_tool_specs();
@@ -166,6 +223,323 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         single.input_schema["required"],
         json!(["project", "pattern"]),
         "single-query schema remains unchanged"
+    );
+}
+
+#[tokio::test]
+async fn search_project_texts_retries_one_dropped_agent_request_and_restores_order() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-search-retry-once";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts(
+                    "demo".to_string(),
+                    vec![query("retry-me", None), query("steady", None)],
+                )
+                .await
+        }
+    });
+
+    let first_two = vec![
+        next_patch_agent_request(&runtime, client_id).await.unwrap(),
+        next_patch_agent_request(&runtime, client_id).await.unwrap(),
+    ];
+    let dropped = first_two
+        .iter()
+        .find(|request| request_pattern(request) == "retry-me")
+        .unwrap();
+    let steady = first_two
+        .iter()
+        .find(|request| request_pattern(request) == "steady")
+        .unwrap();
+    runtime
+        .shell_clients
+        .cancel_request(&dropped.request_id)
+        .await;
+    complete_search_success(&runtime, client_id, steady, "src/steady.rs").await;
+
+    let retry = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("dropped query retry");
+    assert_eq!(request_pattern(&retry), "retry-me");
+    assert_ne!(retry.request_id, dropped.request_id);
+    complete_search_success(&runtime, client_id, &retry, "src/retried.rs").await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let items = result.output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["index"], 0);
+    assert_eq!(items[0]["success"], true);
+    assert_eq!(items[0]["output"]["matches"][0]["path"], "src/retried.rs");
+    assert_eq!(items[1]["index"], 1);
+    assert_eq!(items[1]["success"], true);
+    assert_eq!(items[1]["output"]["matches"][0]["path"], "src/steady.rs");
+    assert_no_agent_request(&runtime, client_id).await;
+}
+
+#[tokio::test]
+async fn search_project_texts_stops_after_two_dropped_agent_attempts() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-search-retry-dropped-twice";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts("demo".to_string(), vec![query("drop-twice", None)])
+                .await
+        }
+    });
+
+    let first = next_patch_agent_request(&runtime, client_id).await.unwrap();
+    assert_eq!(request_pattern(&first), "drop-twice");
+    runtime
+        .shell_clients
+        .cancel_request(&first.request_id)
+        .await;
+    let second = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("one retry after first drop");
+    assert_eq!(request_pattern(&second), "drop-twice");
+    assert_ne!(second.request_id, first.request_id);
+    runtime
+        .shell_clients
+        .cancel_request(&second.request_id)
+        .await;
+
+    let result = task.await.unwrap();
+    let items = result.output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["index"], 0);
+    assert_eq!(items[0]["success"], false);
+    assert_eq!(items[0]["output"]["reason_code"], "search_request_dropped");
+    assert_no_agent_request(&runtime, client_id).await;
+}
+
+#[tokio::test]
+async fn search_project_texts_retry_stays_inside_existing_concurrency_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-search-retry-slot";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts(
+                    "demo".to_string(),
+                    vec![
+                        query("retry-slot", None),
+                        query("blocker", None),
+                        query("third", None),
+                    ],
+                )
+                .await
+        }
+    });
+
+    let first_two = vec![
+        next_patch_agent_request(&runtime, client_id).await.unwrap(),
+        next_patch_agent_request(&runtime, client_id).await.unwrap(),
+    ];
+    let retry_slot = first_two
+        .iter()
+        .find(|request| request_pattern(request) == "retry-slot")
+        .unwrap();
+    let blocker = first_two
+        .iter()
+        .find(|request| request_pattern(request) == "blocker")
+        .unwrap();
+    runtime
+        .shell_clients
+        .cancel_request(&retry_slot.request_id)
+        .await;
+
+    let retry = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("retry must replace work inside the occupied query slot");
+    assert_eq!(request_pattern(&retry), "retry-slot");
+    assert!(
+        poll_agent_request(&runtime, client_id).await.is_none(),
+        "third query reached Runner while blocker plus retry still occupied both slots"
+    );
+
+    complete_search_success(&runtime, client_id, &retry, "src/retry.rs").await;
+    let third = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("third query after retry slot completes");
+    assert_eq!(request_pattern(&third), "third");
+    complete_search_success(&runtime, client_id, blocker, "src/blocker.rs").await;
+    complete_search_success(&runtime, client_id, &third, "src/third.rs").await;
+
+    let result = task.await.unwrap();
+    assert_eq!(result.output["succeeded_count"], 3);
+    assert_no_agent_request(&runtime, client_id).await;
+}
+
+#[tokio::test]
+async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime =
+        ToolRuntime::new_for_tests().with_search_project_texts_deadline(Duration::from_secs(6));
+    let client_id = "batch-search-retry-deadline";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts("demo".to_string(), vec![query("deadline-retry", None)])
+                .await
+        }
+    });
+
+    let first = next_patch_agent_request(&runtime, client_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    runtime
+        .shell_clients
+        .cancel_request(&first.request_id)
+        .await;
+    let retry = next_patch_agent_request(&runtime, client_id)
+        .await
+        .expect("retry before batch deadline");
+    assert!(
+        retry.timeout_secs < first.timeout_secs,
+        "retry reset the command timeout instead of using remaining batch budget: first={} retry={}",
+        first.timeout_secs,
+        retry.timeout_secs
+    );
+    complete_search_success(&runtime, client_id, &retry, "src/deadline.rs").await;
+    let result = task.await.unwrap();
+    assert_eq!(result.output["succeeded_count"], 1);
+    assert_no_agent_request(&runtime, client_id).await;
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime =
+        ToolRuntime::new_for_tests().with_search_project_texts_deadline(Duration::from_millis(150));
+    let client_id = "batch-search-expired-deadline";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts("demo".to_string(), vec![query("deadline-expired", None)])
+                .await
+        }
+    });
+    let request = next_patch_agent_request(&runtime, client_id).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("absolute batch deadline should end the query")
+        .unwrap();
+    assert_eq!(
+        result.output["items"][0]["output"]["reason_code"],
+        "timeout"
+    );
+    assert_no_agent_request(&runtime, client_id).await;
+    let late = runtime
+        .shell_clients
+        .complete(ShellAgentResultRequest {
+            client_id: client_id.to_string(),
+            agent_instance_id: "inst".to_string(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some(search_stdout("matches", "src/late.rs", "late")),
+            stderr: Some(String::new()),
+            duration_ms: Some(200),
+            error: None,
+        })
+        .await;
+    assert!(
+        late.is_err(),
+        "expired request remained pending after batch timeout"
+    );
+}
+
+#[tokio::test]
+async fn search_project_texts_does_not_retry_nontransient_agent_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-search-no-retry-invalid";
+    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let mut invalid = query("invalid", None);
+    invalid.path = Some("../outside".to_string());
+    let invalid_result = runtime
+        .search_project_texts("demo".to_string(), vec![invalid])
+        .await;
+    assert_eq!(
+        invalid_result.output["items"][0]["output"]["reason_code"],
+        "invalid_path"
+    );
+    assert_no_agent_request(&runtime, client_id).await;
+
+    let mut timeout_query = query("timeout", None);
+    timeout_query.timeout_secs = Some(1);
+    let timeout_result = run_single_agent_batch_response(
+        "batch-search-no-retry-timeout",
+        timeout_query,
+        -1,
+        r#"{"webcodex_search":{"backend":"rg","feature_unavailable":false}}
+"#
+        .to_string(),
+        "command timed out after 1 seconds",
+    )
+    .await;
+    assert_eq!(
+        timeout_result.output["items"][0]["output"]["reason_code"],
+        "timeout"
+    );
+
+    let backend_result = run_single_agent_batch_response(
+        "batch-search-no-retry-backend",
+        query("backend", None),
+        2,
+        r#"{"webcodex_search":{"backend":"rg","feature_unavailable":false}}
+"#
+        .to_string(),
+        "rg failed",
+    )
+    .await;
+    assert_eq!(
+        backend_result.output["items"][0]["output"]["reason_code"],
+        "search_execution_failed"
+    );
+
+    let feature_result = run_single_agent_batch_response(
+        "batch-search-no-retry-feature",
+        query("feature", Some(SearchResultMode::Count)),
+        1,
+        r#"{"webcodex_search":{"backend":"grep","feature_unavailable":true}}
+"#
+        .to_string(),
+        "",
+    )
+    .await;
+    assert_eq!(
+        feature_result.output["items"][0]["output"]["reason_code"],
+        "search_backend_feature_unavailable"
+    );
+
+    let provider_result = run_single_agent_batch_response(
+        "batch-search-no-retry-provider",
+        query("provider", None),
+        0,
+        json!({
+            "format": "webcodex.external_provider_error.v1",
+            "message": "provider failed"
+        })
+        .to_string(),
+        "",
+    )
+    .await;
+    assert_eq!(
+        provider_result.output["items"][0]["output"]["reason_code"],
+        "external_provider_error"
     );
 }
 
