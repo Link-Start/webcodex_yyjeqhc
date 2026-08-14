@@ -1839,6 +1839,9 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // supported Connector Go evidence cannot be mistaken for a first-class
     // go_test executor by a newer Server.
     capabilities.structured_go_test_tool = true;
+    // Focused first-class go_test packages extend the older fixed `./...`
+    // wire shape, so advertise them independently for rolling upgrades.
+    capabilities.structured_go_test_packages = true;
     capabilities.structured_process_argv = true;
     capabilities.structured_script_payload = true;
     capabilities.structured_execution_jobs = true;

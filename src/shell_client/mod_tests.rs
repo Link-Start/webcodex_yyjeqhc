@@ -1,7 +1,8 @@
 use super::*;
 use crate::lsp_bridge::{AgentLspPayload, AgentLspRequest};
 use crate::shell_protocol::{
-    AGENT_PROTOCOL_VERSION_QUIC_V1, SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
+    AGENT_PROTOCOL_VERSION_QUIC_V1, SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
 };
 
 fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::AuthContext {
@@ -1410,6 +1411,7 @@ fn protocol_async_capability_defaults_false() {
     assert!(!capabilities.structured_validation_argv);
     assert!(!capabilities.structured_go_test_json);
     assert!(!capabilities.structured_go_test_tool);
+    assert!(!capabilities.structured_go_test_packages);
 
     let request: ShellClientRegisterRequest = serde_json::from_str(
         r#"{
@@ -1425,6 +1427,7 @@ fn protocol_async_capability_defaults_false() {
     assert!(!capabilities.structured_validation_argv);
     assert!(!capabilities.structured_go_test_json);
     assert!(!capabilities.structured_go_test_tool);
+    assert!(!capabilities.structured_go_test_packages);
 
     let old_go_runner: ShellClientRegisterRequest = serde_json::from_str(
         r#"{
@@ -1437,8 +1440,10 @@ fn protocol_async_capability_defaults_false() {
     let capabilities = old_go_runner.capabilities.unwrap();
     assert!(capabilities.structured_go_test_json);
     assert!(!capabilities.structured_go_test_tool);
+    assert!(!capabilities.structured_go_test_packages);
     let serialized = serde_json::to_string(&capabilities).unwrap();
     assert!(!serialized.contains("structured_go_test_tool"));
+    assert!(!serialized.contains("structured_go_test_packages"));
 }
 
 #[test]
@@ -1562,6 +1567,7 @@ async fn client_supports_reflects_registered_capabilities() {
         project_path_registration: true,
         structured_go_test_json: true,
         structured_go_test_tool: true,
+        structured_go_test_packages: true,
         ..Default::default()
     };
     registry
@@ -1606,9 +1612,14 @@ async fn client_supports_reflects_registered_capabilities() {
         .client_supports("oe", SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL)
         .await
         .unwrap());
+    assert!(registry
+        .client_supports("oe", SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES)
+        .await
+        .unwrap());
     let view = registry.get_client_view("oe").await.unwrap();
     assert!(view.capabilities.structured_go_test_json);
     assert!(view.capabilities.structured_go_test_tool);
+    assert!(view.capabilities.structured_go_test_packages);
     assert!(!registry
         .client_supports("oe", SHELL_CLIENT_CAPABILITY_GIT)
         .await
@@ -1667,6 +1678,7 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 structured_validation_argv: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
+                structured_go_test_packages: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
                 structured_execution_jobs: true,

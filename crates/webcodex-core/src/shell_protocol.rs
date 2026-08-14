@@ -126,9 +126,9 @@ pub const SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL: &str = "persistent_shell";
 /// must reject the request rather than silently opening a local shell.
 pub const SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL: &str = "ssh_persistent_shell";
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV: &str = "structured_validation_argv";
-/// The Runner accepts canonical machine-readable Go validation argv for the
-/// bounded `go test -json <project-relative packages...>` contract. Missing on
-/// older Runners and never inferred from generic structured validation support.
+/// The Runner accepts the canonical machine-readable `go test -json` validation
+/// shape. Older implementations may support only the historical fixed `./...`
+/// scope; expanded caller-selected packages are fenced separately.
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON: &str = "structured_go_test_json";
 /// The Runner understands the first-class model-facing `go_test` tool identity
 /// and its durable `ShellJobValidationMetadata` contract. This is deliberately
@@ -136,6 +136,11 @@ pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON: &str = "structured_go
 /// `structured_go_test_json` for Connector validation without understanding
 /// first-class `validation.tool = "go_test"` metadata.
 pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL: &str = "structured_go_test_tool";
+/// The Runner accepts the expanded first-class `go_test` argv shape with
+/// caller-selected bounded project-relative package patterns. Older Runners
+/// already advertised the JSON/tool capabilities for fixed `./...`, so this
+/// must remain a separate additive rolling-upgrade fence.
+pub const SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES: &str = "structured_go_test_packages";
 /// General model-facing native process execution with a typed executable and
 /// argv. This is deliberately independent from structured Cargo validation:
 /// older Runners may support validation argv without accepting arbitrary
@@ -183,6 +188,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
+    SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
@@ -249,9 +255,9 @@ pub struct ShellClientCapabilities {
     /// Missing on older agents and therefore fail-closed.
     #[serde(default)]
     pub structured_validation_argv: bool,
-    /// Machine-readable bounded `go test -json <project-relative packages...>`
-    /// validation. Missing on older Runners and false; never inferred from
-    /// structured_validation_argv or agent_protocol_version.
+    /// Machine-readable canonical `go test -json` validation. Older Runners may
+    /// support only the historical fixed `./...` scope; focused package argv is
+    /// an independent additive capability.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_go_test_json: bool,
     /// First-class `go_test` tool plus its durable validation metadata identity.
@@ -259,6 +265,11 @@ pub struct ShellClientCapabilities {
     /// generic structured validation, protocol version, or executable presence.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_go_test_tool: bool,
+    /// Expanded first-class `go_test` package argv beyond the historical fixed
+    /// `./...` shape. Missing on older Runners and false; never inferred from
+    /// the existing Go JSON or first-class tool capabilities.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_go_test_packages: bool,
     /// General native executable + argv requests. Missing on older agents and
     /// therefore false; the Server must fail closed without a shell fallback.
     #[serde(default)]
@@ -340,6 +351,7 @@ impl Default for ShellClientCapabilities {
             structured_validation_argv: false,
             structured_go_test_json: false,
             structured_go_test_tool: false,
+            structured_go_test_packages: false,
             structured_process_argv: false,
             structured_script_payload: false,
             structured_execution_jobs: false,
@@ -2421,6 +2433,7 @@ mod envelope_tests {
                 structured_validation_argv: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
+                structured_go_test_packages: true,
                 structured_process_argv: true,
                 structured_script_payload: true,
                 structured_execution_jobs: true,

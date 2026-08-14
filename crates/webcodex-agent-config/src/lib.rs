@@ -217,6 +217,9 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             // Like JSON parsing, first-class durable go_test support is
             // advertised by the running binary, never by generated static config.
             structured_go_test_tool: false,
+            // Focused Go package argv is likewise a running-binary capability;
+            // older generated configs must never claim it implicitly.
+            structured_go_test_packages: false,
             structured_process_argv: true,
             structured_script_payload: true,
             structured_execution_jobs: true,

@@ -300,6 +300,55 @@ async fn go_test_requires_first_class_tool_capability_before_job_reservation() {
 }
 
 #[tokio::test]
+async fn focused_go_test_packages_require_explicit_runner_capability_before_dispatch() {
+    let client_id = "vhandoff-go-pre-focused-runner";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        ShellClientCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_go_test_json: true,
+            structured_go_test_tool: true,
+            structured_go_test_packages: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::GoTest {
+                project,
+                session_id: None,
+                cwd: None,
+                packages: Some(vec!["./internal/control".to_string()]),
+                timeout_secs: Some(1800),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert_eq!(result.output["command_started"], false);
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("structured_go_test_packages"));
+    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn go_test_rejects_empty_or_oversized_package_lists_before_dispatch() {
     let client_id = "vhandoff-go-invalid-packages";
     let runtime = runtime_with_agent_project(client_id)
@@ -565,6 +614,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
             structured_validation_argv: true,
             structured_go_test_json: true,
             structured_go_test_tool: true,
+            structured_go_test_packages: true,
             ..Default::default()
         },
     )

@@ -77,6 +77,7 @@ async fn register_agent_with_lsp_capabilities(
                     structured_validation_argv: true,
                     structured_go_test_json: true,
                     structured_go_test_tool: true,
+                    structured_go_test_packages: true,
                     structured_process_argv: true,
                     structured_script_payload: false,
                     structured_execution_jobs: false,

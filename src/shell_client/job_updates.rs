@@ -594,6 +594,15 @@ impl ShellClientRegistry {
                 client_id
             ));
         }
+        if validation_steps.iter().any(|step| {
+            step.is_structured_go_test_json() && step.args.as_slice() != ["test", "-json", "./..."]
+        }) && !client.capabilities.structured_go_test_packages
+        {
+            return Err(format!(
+                "structured_go_test_packages_unavailable: agent client {} does not support focused Go package validation argv",
+                client_id
+            ));
+        }
         if validation
             .as_ref()
             .is_some_and(|metadata| metadata.tool == "go_test")

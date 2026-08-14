@@ -6138,6 +6138,7 @@ fn register_request_announces_correct_protocol_version() {
         let body = build_register_request(&cfg, Vec::new(), version, "inst-1", 0);
         let caps = body.capabilities.as_ref().expect("transport capabilities");
         assert!(caps.structured_go_test_tool, "{expected_str}");
+        assert!(caps.structured_go_test_packages, "{expected_str}");
         assert!(caps.structured_file_delete, "{expected_str}");
         assert_eq!(body.agent_instance_id, "inst-1");
         assert_eq!(
@@ -6165,6 +6166,7 @@ fn register_request_announces_correct_protocol_version() {
     assert!(caps.structured_validation_argv);
     assert!(caps.structured_go_test_json);
     assert!(caps.structured_go_test_tool);
+    assert!(caps.structured_go_test_packages);
     assert!(caps.structured_process_argv);
     assert!(caps.structured_script_payload);
     assert!(caps.structured_execution_jobs);

@@ -744,6 +744,25 @@ impl ToolRuntime {
                     }),
                 );
             }
+            if tool_name == "go_test"
+                && options.go_packages.is_some()
+                && !capabilities.structured_go_test_packages
+            {
+                return ToolResult::err_with_output(
+                    command_rejected_message(
+                        "capability_unavailable: this Runner does not advertise structured_go_test_packages",
+                        "upgrade and reconnect a Runner that supports focused go_test package argv, then retry go_test.",
+                    ),
+                    json!({
+                        "command_started": false,
+                        "command_completed": false,
+                        "command_ok": false,
+                        "failure_kind": "capability_unavailable",
+                        "tool_failure": true,
+                        "async_handoff_available": async_handoff_available,
+                    }),
+                );
+            }
             if tool_name == "go_test" && !async_handoff_available {
                 return ToolResult::err_with_output(
                     command_rejected_message(
