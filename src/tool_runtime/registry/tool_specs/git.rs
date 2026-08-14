@@ -32,7 +32,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "git_diff_hunks",
-            "Return bounded structured git diff hunks for review. Supports optional paths and cached diff; does not modify the worktree.",
+            "Return producer-bounded structured git diff hunks with fenced opaque continuation. Supports optional paths and cached diff; does not modify the worktree.",
             git_diff_hunks_input_schema(),
         ),
         tool_spec(

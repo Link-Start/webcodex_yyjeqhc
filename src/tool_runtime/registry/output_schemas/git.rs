@@ -32,6 +32,15 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "git_diff_hunks" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Runtime project input.")),
+            (
+                "paths",
+                array_schema(
+                    schema_type("string", "Normalized project-relative diff path."),
+                    "Normalized diff scope paths.",
+                ),
+            ),
+            ("cached", schema_type("boolean", "Whether the staged diff is inspected.")),
             (
                 "files",
                 array_schema(open_object_schema("File diff hunks."), "Changed files."),
@@ -39,13 +48,28 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("hunk_count", schema_type("integer", "Returned hunk count.")),
             (
                 "truncated",
-                schema_type("boolean", "Whether output was bounded/truncated."),
+                schema_type("boolean", "Whether any page or per-hunk preview bound fired."),
+            ),
+            (
+                "truncation_reasons",
+                array_schema(
+                    schema_type("string", "Stable git diff hunk truncation reason."),
+                    "Stable reasons for page/hunk truncation.",
+                ),
+            ),
+            (
+                "has_more",
+                schema_type("boolean", "Whether another logical diff page exists."),
+            ),
+            (
+                "next_continuation",
+                nullable_schema("string", "Opaque continuation for the next stable diff page."),
             ),
             (
                 "exit_code",
                 nullable_schema("integer", "Git diff exit code."),
             ),
-            ("stderr", schema_type("string", "Git diff stderr.")),
+            ("stderr", schema_type("string", "Bounded Git diff stderr.")),
         ])),
         "git_log" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Runtime project id.")),

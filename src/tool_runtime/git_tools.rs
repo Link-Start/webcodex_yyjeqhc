@@ -31,9 +31,17 @@ impl ToolRuntime {
                 max_hunks,
                 max_hunk_lines,
                 cached,
+                continuation,
             } => {
-                self.git_diff_hunks(project, paths, max_hunks, max_hunk_lines, cached)
-                    .await
+                self.git_diff_hunks_continued(
+                    project,
+                    paths,
+                    max_hunks,
+                    max_hunk_lines,
+                    cached,
+                    continuation,
+                )
+                .await
             }
             ToolCall::GitLog {
                 project,

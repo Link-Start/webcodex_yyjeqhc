@@ -120,6 +120,24 @@ where
     Ok(token)
 }
 
+fn deserialize_optional_git_diff_hunks_continuation<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let token = Option::<String>::deserialize(deserializer)?;
+    if token
+        .as_ref()
+        .is_some_and(|token| token.len() > super::git::GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES)
+    {
+        return Err(serde::de::Error::custom(
+            "continuation exceeds the git_diff_hunks size bound",
+        ));
+    }
+    Ok(token)
+}
+
 fn deserialize_read_files_items<'de, D>(deserializer: D) -> Result<Vec<ReadFilesItem>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -700,6 +718,11 @@ pub enum ToolCall {
         max_hunk_lines: Option<usize>,
         #[serde(default)]
         cached: Option<bool>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_git_diff_hunks_continuation"
+        )]
+        continuation: Option<String>,
     },
 
     /// Run `cargo fmt` in an agent-registered Rust project.

@@ -64,7 +64,7 @@ pub(crate) fn git_diff_input_schema() -> Value {
 }
 
 pub(crate) fn git_diff_hunks_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
+    let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Agent-registered project id.", true),
         (
             "paths",
@@ -90,7 +90,16 @@ pub(crate) fn git_diff_hunks_input_schema() -> Value {
             "Use staged diff via git diff --cached.",
             false,
         ),
-    ]))
+        (
+            "continuation",
+            "string",
+            "Optional opaque continuation returned by a previous git_diff_hunks page.",
+            false,
+        ),
+    ]));
+    schema["properties"]["continuation"]["maxLength"] =
+        Value::from(crate::tool_runtime::git::GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES);
+    schema
 }
 
 pub(crate) fn git_log_input_schema() -> Value {

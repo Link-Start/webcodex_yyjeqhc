@@ -7,8 +7,10 @@ use super::support::*;
 use crate::shell_protocol::{ShellAgentResultRequest, ShellClientCapabilities};
 use crate::tool_runtime::ToolRuntime;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
 #[tokio::test]
 async fn git_restore_paths_restores_tracked_filename_containing_target() {
@@ -62,26 +64,62 @@ fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
             "paths":["src/runtime_http.rs"],
             "max_hunks":20,
             "max_hunk_lines":120,
-            "cached":true
+            "cached":true,
+            "continuation":"opaque-continuation"
         }),
     )
     .unwrap();
     assert!(matches!(
         call,
-        ToolCall::GitDiffHunks { project, cached: Some(true), .. }
-            if project == "agent:oe:webcodex"
+        ToolCall::GitDiffHunks {
+            project,
+            cached: Some(true),
+            continuation: Some(continuation),
+            ..
+        } if project == "agent:oe:webcodex" && continuation == "opaque-continuation"
     ));
 
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "git_diff_hunks");
     let props = spec.input_schema["properties"].as_object().unwrap();
-    for field in ["project", "paths", "max_hunks", "max_hunk_lines", "cached"] {
+    for field in [
+        "project",
+        "paths",
+        "max_hunks",
+        "max_hunk_lines",
+        "cached",
+        "continuation",
+    ] {
         assert!(props.contains_key(field), "missing {}", field);
     }
+    assert_eq!(
+        props["continuation"]["maxLength"],
+        GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES
+    );
+    assert!(ToolCall::from_tool_name(
+        "git_diff_hunks",
+        json!({
+            "project": "agent:oe:webcodex",
+            "continuation": "x".repeat(GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES + 1),
+        }),
+    )
+    .is_err());
     let output_props = spec.output_schema["properties"]["output"]["properties"]
         .as_object()
         .unwrap();
-    for field in ["files", "hunk_count", "truncated", "exit_code", "stderr"] {
+    for field in [
+        "project",
+        "paths",
+        "cached",
+        "files",
+        "hunk_count",
+        "truncated",
+        "truncation_reasons",
+        "has_more",
+        "next_continuation",
+        "exit_code",
+        "stderr",
+    ] {
         assert!(output_props.contains_key(field), "missing {}", field);
     }
 }
@@ -126,6 +164,560 @@ fn show_changes_tool_is_known_and_parses() {
         output_props.contains_key("diff_stat_status"),
         "show_changes output schema should expose strict diff-stat observation"
     );
+}
+
+async fn run_agent_git_diff_hunks_page(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    repo: &Path,
+    paths: Option<Vec<String>>,
+    max_hunks: usize,
+    max_hunk_lines: usize,
+    cached: bool,
+    continuation: Option<String>,
+) -> (ToolResult, usize, String) {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        async move {
+            runtime
+                .git_diff_hunks_continued(
+                    project,
+                    paths,
+                    Some(max_hunks),
+                    Some(max_hunk_lines),
+                    Some(cached),
+                    continuation,
+                )
+                .await
+        }
+    });
+    let request = next_patch_agent_request(runtime, client_id)
+        .await
+        .expect("git_diff_hunks should enqueue one bounded agent request");
+    let command = request.command.clone();
+    let (exit_code, stdout, stderr) = run_command_full_capture(&command, repo, 30);
+    let stdout_bytes = stdout.len();
+    complete_patch_agent_request(
+        runtime,
+        client_id,
+        &request.request_id,
+        exit_code,
+        &stdout,
+        &stderr,
+    )
+    .await;
+    (task.await.unwrap(), stdout_bytes, command)
+}
+
+fn git_test_command_ok(repo: &Path, command: &str) {
+    let (exit_code, stdout, stderr, _) = run_command_sync(command, repo, 30);
+    assert_eq!(
+        exit_code, 0,
+        "{command} failed: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[tokio::test]
+async fn git_diff_hunks_stable_multi_page_traversal_has_no_duplicate_or_missing_records() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let original = (0..500)
+        .map(|line| format!("line-{line:03}\n"))
+        .collect::<String>();
+    for file in 0..3 {
+        commit_file(
+            repo.path(),
+            &format!("file-{file}.txt"),
+            &original,
+            &format!("add file {file}"),
+        );
+    }
+    for file in 0..3 {
+        let changed = (0..500)
+            .map(|line| {
+                if matches!(line, 10 | 210 | 410) {
+                    format!("changed-{file}-{line:03}\n")
+                } else {
+                    format!("line-{line:03}\n")
+                }
+            })
+            .collect::<String>();
+        fs::write(repo.path().join(format!("file-{file}.txt")), changed).unwrap();
+    }
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-pages";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let mut continuation = None;
+    let mut logical_files = Vec::new();
+    let mut logical_hunks = Vec::new();
+    let mut seen_tokens = HashSet::new();
+    let mut finished = false;
+
+    for _ in 0..10 {
+        let prior_token = continuation.clone();
+        let (result, _stdout_bytes, command) = run_agent_git_diff_hunks_page(
+            &runtime,
+            client_id,
+            &project,
+            repo.path(),
+            None,
+            2,
+            400,
+            false,
+            continuation,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        if let Some(prior_token) = prior_token.as_deref() {
+            assert!(
+                !command.contains(prior_token),
+                "opaque continuation must not be interpolated into the shell command"
+            );
+        }
+        for file in result.output["files"].as_array().unwrap() {
+            let path = file["path"].as_str().unwrap().to_string();
+            if file.get("continued").and_then(Value::as_bool) != Some(true) {
+                logical_files.push(path.clone());
+            }
+            for hunk in file["hunks"].as_array().unwrap() {
+                logical_hunks.push(format!("{}|{}", path, hunk["header"].as_str().unwrap()));
+            }
+        }
+        if result.output["has_more"] == false {
+            assert_eq!(result.output["next_continuation"], Value::Null);
+            finished = true;
+            break;
+        }
+        let next = result.output["next_continuation"]
+            .as_str()
+            .expect("non-final page continuation")
+            .to_string();
+        assert!(
+            seen_tokens.insert(next.clone()),
+            "continuation did not advance"
+        );
+        continuation = Some(next);
+    }
+
+    assert!(finished, "multi-page traversal did not terminate");
+    assert_eq!(
+        logical_files,
+        vec!["file-0.txt", "file-1.txt", "file-2.txt"]
+    );
+    assert_eq!(
+        logical_hunks.len(),
+        9,
+        "unexpected hunk traversal: {logical_hunks:?}"
+    );
+    assert_eq!(
+        logical_hunks.iter().collect::<HashSet<_>>().len(),
+        logical_hunks.len(),
+        "duplicate logical hunk returned across pages"
+    );
+}
+
+#[tokio::test]
+async fn git_diff_hunks_large_raw_diff_is_bounded_before_agent_transport_capture() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let original = (0..2500)
+        .map(|line| format!("original-{line:04}-{}\n", "x".repeat(72)))
+        .collect::<String>();
+    for file in 0..2 {
+        fs::write(repo.path().join(format!("large-{file}.txt")), &original).unwrap();
+    }
+    git_test_command_ok(repo.path(), "git add -- . && git commit -m large-baseline");
+    for file in 0..2 {
+        let changed = (0..2500)
+            .map(|line| format!("changed-{file}-{line:04}-{}\n", "y".repeat(72)))
+            .collect::<String>();
+        fs::write(repo.path().join(format!("large-{file}.txt")), changed).unwrap();
+    }
+    let (raw_exit, raw_diff, raw_stderr) =
+        run_command_full_capture("git diff --unified=80", repo.path(), 30);
+    assert_eq!(raw_exit, 0, "raw git diff failed: {raw_stderr}");
+    assert!(
+        raw_diff.len() > MAX_SERIALIZED_OUTPUT_BYTES,
+        "fixture did not exceed transport-sized retention: {} bytes",
+        raw_diff.len()
+    );
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-large";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let (result, agent_stdout_bytes, _command) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        1,
+        12,
+        false,
+        None,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert!(
+        agent_stdout_bytes <= GIT_DIFF_HUNKS_PAGE_BYTES + 4096,
+        "producer sent {agent_stdout_bytes} bytes through ordinary transport"
+    );
+    assert_eq!(result.output["files"][0]["path"], "large-0.txt");
+    assert_eq!(result.output["has_more"], true);
+    assert!(result.output["next_continuation"].as_str().is_some());
+    assert!(
+        serde_json::to_vec(&result).unwrap().len() <= MAX_SERIALIZED_OUTPUT_BYTES,
+        "serialized result exceeded model envelope"
+    );
+}
+
+#[tokio::test]
+async fn git_diff_hunks_worktree_continuation_fails_stale_after_relevant_change() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    commit_file(repo.path(), "a.txt", "a0\n", "add a");
+    commit_file(repo.path(), "b.txt", "b0\n", "add b");
+    fs::write(repo.path().join("a.txt"), "a1\n").unwrap();
+    fs::write(repo.path().join("b.txt"), "b1\n").unwrap();
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-worktree-stale";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let (page, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        1,
+        40,
+        false,
+        None,
+    )
+    .await;
+    assert!(page.success, "{:?}", page.error);
+    let token = page.output["next_continuation"]
+        .as_str()
+        .expect("first page continuation")
+        .to_string();
+    fs::write(repo.path().join("b.txt"), "b2\nextra\n").unwrap();
+
+    let (stale, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        1,
+        40,
+        false,
+        Some(token),
+    )
+    .await;
+    assert!(!stale.success);
+    assert_eq!(stale.output["reason_code"], "stale_continuation");
+    assert_eq!(stale.output["files"], json!([]));
+    assert_eq!(stale.output["next_continuation"], Value::Null);
+    assert_eq!(stale.output["state_changed"], false);
+}
+
+#[tokio::test]
+async fn git_diff_hunks_cached_continuation_fails_stale_after_index_change() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    commit_file(repo.path(), "a.txt", "a0\n", "add a");
+    commit_file(repo.path(), "b.txt", "b0\n", "add b");
+    fs::write(repo.path().join("a.txt"), "a1\n").unwrap();
+    fs::write(repo.path().join("b.txt"), "b1\n").unwrap();
+    git_test_command_ok(repo.path(), "git add -- a.txt b.txt");
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-cached-stale";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let (page, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        1,
+        40,
+        true,
+        None,
+    )
+    .await;
+    assert!(page.success, "{:?}", page.error);
+    let token = page.output["next_continuation"]
+        .as_str()
+        .expect("cached continuation")
+        .to_string();
+    fs::write(repo.path().join("b.txt"), "b2\n").unwrap();
+    git_test_command_ok(repo.path(), "git add -- b.txt");
+
+    let (stale, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        1,
+        40,
+        true,
+        Some(token),
+    )
+    .await;
+    assert!(!stale.success);
+    assert_eq!(stale.output["reason_code"], "stale_continuation");
+    assert_eq!(stale.output["files"], json!([]));
+    assert_eq!(stale.output["next_continuation"], Value::Null);
+}
+
+#[tokio::test]
+async fn git_diff_hunks_scoped_fence_ignores_outside_change_and_rejects_scope_mismatch() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    commit_file(repo.path(), "a.txt", "a0\n", "add a");
+    commit_file(repo.path(), "b.txt", "b0\n", "add b");
+    commit_file(repo.path(), "outside.txt", "outside0\n", "add outside");
+    fs::write(repo.path().join("a.txt"), "a1\n").unwrap();
+    fs::write(repo.path().join("b.txt"), "b1\n").unwrap();
+    let scope = Some(vec!["a.txt".to_string(), "b.txt".to_string()]);
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-scoped";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let (page, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        scope.clone(),
+        1,
+        40,
+        false,
+        None,
+    )
+    .await;
+    assert!(page.success, "{:?}", page.error);
+    let token = page.output["next_continuation"]
+        .as_str()
+        .expect("scoped continuation")
+        .to_string();
+    fs::write(repo.path().join("outside.txt"), "outside1\n").unwrap();
+
+    let (continued, _, command) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        Some(vec!["b.txt".to_string(), "a.txt".to_string()]),
+        1,
+        40,
+        false,
+        Some(token.clone()),
+    )
+    .await;
+    assert!(continued.success, "{:?}", continued.error);
+    assert!(
+        !command.contains(&token),
+        "opaque continuation content reached the shell command"
+    );
+
+    let other_client_id = "diff-hunks-scoped-other";
+    let other_project =
+        register_agent_project_at_path(&runtime, other_client_id, "repo", repo.path()).await;
+    let project_mismatch = runtime
+        .git_diff_hunks_continued(
+            other_project,
+            scope.clone(),
+            Some(1),
+            Some(40),
+            Some(false),
+            Some(token.clone()),
+        )
+        .await;
+    assert!(!project_mismatch.success);
+    assert_eq!(
+        project_mismatch.output["reason_code"],
+        "continuation_mismatch"
+    );
+    assert!(next_patch_agent_request(&runtime, other_client_id)
+        .await
+        .is_none());
+
+    let mismatch = runtime
+        .git_diff_hunks_continued(
+            project.clone(),
+            Some(vec!["a.txt".to_string()]),
+            Some(1),
+            Some(40),
+            Some(false),
+            Some(token.clone()),
+        )
+        .await;
+    assert!(!mismatch.success);
+    assert_eq!(mismatch.output["reason_code"], "continuation_mismatch");
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+
+    let cached_mismatch = runtime
+        .git_diff_hunks_continued(project, scope, Some(1), Some(40), Some(true), Some(token))
+        .await;
+    assert!(!cached_mismatch.success);
+    assert_eq!(
+        cached_mismatch.output["reason_code"],
+        "continuation_mismatch"
+    );
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn git_diff_hunks_binary_records_advance_across_byte_bounded_pages() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let file_count = 120usize;
+    let names = (0..file_count)
+        .map(|index| format!("binary-{index:03}-{}.bin", "x".repeat(96)))
+        .collect::<Vec<_>>();
+    for (index, name) in names.iter().enumerate() {
+        let mut bytes = vec![0u8; 512];
+        bytes[1] = index as u8;
+        fs::write(repo.path().join(name), bytes).unwrap();
+    }
+    git_test_command_ok(repo.path(), "git add -- . && git commit -m binary-baseline");
+    for (index, name) in names.iter().enumerate() {
+        let mut bytes = vec![0u8; 512];
+        bytes[1] = index as u8;
+        bytes[2] = 1;
+        fs::write(repo.path().join(name), bytes).unwrap();
+    }
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-binary";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let mut continuation = None;
+    let mut returned = Vec::new();
+    let mut finished = false;
+    for _ in 0..10 {
+        let (page, agent_stdout_bytes, _) = run_agent_git_diff_hunks_page(
+            &runtime,
+            client_id,
+            &project,
+            repo.path(),
+            None,
+            1,
+            20,
+            false,
+            continuation,
+        )
+        .await;
+        assert!(page.success, "{:?}", page.error);
+        assert_eq!(page.output["hunk_count"], 0);
+        assert!(agent_stdout_bytes <= GIT_DIFF_HUNKS_PAGE_BYTES + 4096);
+        for file in page.output["files"].as_array().unwrap() {
+            assert_ne!(file.get("continued").and_then(Value::as_bool), Some(true));
+            returned.push(file["path"].as_str().unwrap().to_string());
+        }
+        if page.output["has_more"] == false {
+            assert_eq!(page.output["next_continuation"], Value::Null);
+            finished = true;
+            break;
+        }
+        assert!(page.output["truncation_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "page_byte_budget"));
+        continuation = Some(
+            page.output["next_continuation"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    assert!(finished, "binary pagination did not terminate");
+    assert_eq!(returned.len(), file_count);
+    assert_eq!(returned.iter().collect::<HashSet<_>>().len(), file_count);
+    assert_eq!(returned, names);
+}
+
+#[tokio::test]
+async fn git_diff_hunks_hunk_line_limit_does_not_create_fake_continuation() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let original = (0..300)
+        .map(|line| format!("old-{line:03}\n"))
+        .collect::<String>();
+    commit_file(repo.path(), "long.txt", &original, "add long");
+    let changed = (0..300)
+        .map(|line| format!("new-{line:03}\n"))
+        .collect::<String>();
+    fs::write(repo.path().join("long.txt"), changed).unwrap();
+
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-line-limit";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let (page, _, _) = run_agent_git_diff_hunks_page(
+        &runtime,
+        client_id,
+        &project,
+        repo.path(),
+        None,
+        10,
+        5,
+        false,
+        None,
+    )
+    .await;
+    assert!(page.success, "{:?}", page.error);
+    assert_eq!(page.output["hunk_count"], 1);
+    assert_eq!(page.output["has_more"], false);
+    assert_eq!(page.output["next_continuation"], Value::Null);
+    assert_eq!(page.output["files"][0]["hunks"][0]["truncated"], true);
+    assert!(page.output["truncation_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "hunk_line_limit"));
+    assert!(!page.output["truncation_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "page_hunk_limit"));
+}
+
+#[tokio::test]
+async fn git_diff_hunks_malformed_continuation_fails_before_runner_dispatch() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    commit_file(repo.path(), "a.txt", "a0\n", "add a");
+    fs::write(repo.path().join("a.txt"), "a1\n").unwrap();
+    let runtime = test_runtime();
+    let client_id = "diff-hunks-invalid-token";
+    let project = register_agent_project_at_path(&runtime, client_id, "repo", repo.path()).await;
+    let result = runtime
+        .git_diff_hunks_continued(
+            project,
+            None,
+            Some(1),
+            Some(40),
+            Some(false),
+            Some("not-a-valid-continuation".to_string()),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["reason_code"], "invalid_continuation");
+    assert_eq!(result.output["files"], json!([]));
+    assert_eq!(result.output["next_continuation"], Value::Null);
+    assert!(next_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
 }
 
 #[test]
