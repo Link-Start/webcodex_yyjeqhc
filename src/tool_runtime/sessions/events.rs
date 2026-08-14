@@ -427,6 +427,9 @@ pub(crate) fn session_input_summary_for_tool(tool_name: &str, arguments: &Value)
             object.remove("command");
             object.remove("command_summary");
         }
+        "git_diff_hunks" => {
+            object.remove("continuation");
+        }
         "observe_jobs" => {
             if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
                 for item in items.iter_mut().filter_map(Value::as_object_mut) {

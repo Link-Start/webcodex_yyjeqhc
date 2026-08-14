@@ -268,6 +268,20 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
         "delete_project_files" | "git_restore_paths" | "discard_untracked" => {
             copy_keys(obj, &mut out, &["paths"]);
         }
+        "git_diff_hunks" => {
+            copy_keys(
+                obj,
+                &mut out,
+                &["paths", "max_hunks", "max_hunk_lines", "cached"],
+            );
+            out.insert(
+                "continuation_present".to_string(),
+                Value::Bool(
+                    obj.get("continuation")
+                        .is_some_and(|value| !value.is_null()),
+                ),
+            );
+        }
         "workspace_checkpoint_create" => {
             copy_keys(obj, &mut out, &["title", "include_untracked"]);
             out.insert(

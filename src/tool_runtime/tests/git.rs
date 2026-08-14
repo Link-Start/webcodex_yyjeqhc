@@ -125,6 +125,87 @@ fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
 }
 
 #[test]
+fn git_diff_hunks_session_audit_redacts_continuation() {
+    let continuation = "WCDH_UNIQUE_AUDIT_CONTINUATION_7f18b4a2";
+    let arguments = json!({
+        "project": "agent:oe:webcodex",
+        "paths": ["src/runtime_http.rs", "src/tool_runtime/git.rs"],
+        "max_hunks": 7,
+        "max_hunk_lines": 33,
+        "cached": true,
+        "continuation": continuation,
+    });
+
+    let raw_summary = super::super::tool_audit::session_log_arguments_for_tool_request(
+        "git_diff_hunks",
+        &arguments,
+    );
+    assert_eq!(raw_summary["project"], "agent:oe:webcodex");
+    assert_eq!(
+        raw_summary["paths"],
+        json!(["src/runtime_http.rs", "src/tool_runtime/git.rs"])
+    );
+    assert_eq!(raw_summary["max_hunks"], 7);
+    assert_eq!(raw_summary["max_hunk_lines"], 33);
+    assert_eq!(raw_summary["cached"], true);
+    assert_eq!(raw_summary["continuation_present"], true);
+    assert!(raw_summary.get("continuation").is_none());
+    assert!(!serde_json::to_string(&raw_summary)
+        .unwrap()
+        .contains(continuation));
+
+    let call = ToolCall::from_tool_name("git_diff_hunks", arguments.clone()).unwrap();
+    let typed_summary = call.session_log_arguments();
+    assert_eq!(typed_summary["project"], "agent:oe:webcodex");
+    assert_eq!(typed_summary["paths"], raw_summary["paths"]);
+    assert_eq!(typed_summary["max_hunks"], 7);
+    assert_eq!(typed_summary["max_hunk_lines"], 33);
+    assert_eq!(typed_summary["cached"], true);
+    assert!(typed_summary.get("continuation").is_none());
+    assert!(!serde_json::to_string(&typed_summary)
+        .unwrap()
+        .contains(continuation));
+
+    let defensive =
+        super::super::sessions::session_input_summary_for_tool("git_diff_hunks", &arguments);
+    assert_eq!(defensive["project"], "agent:oe:webcodex");
+    assert_eq!(defensive["paths"], raw_summary["paths"]);
+    assert_eq!(defensive["max_hunks"], 7);
+    assert_eq!(defensive["max_hunk_lines"], 33);
+    assert_eq!(defensive["cached"], true);
+    assert!(defensive.get("continuation").is_none());
+    assert!(!serde_json::to_string(&defensive)
+        .unwrap()
+        .contains(continuation));
+
+    let runtime = test_runtime();
+    let session = runtime.sessions.start_session(
+        Some("agent:oe:webcodex".to_string()),
+        Some("git diff audit".to_string()),
+    );
+    runtime.sessions.record_tool_call_started(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Api,
+        "git_diff_hunks",
+        &arguments,
+    );
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(10))
+        .unwrap();
+    let input_summary = summary.events[0].input_summary.as_ref().unwrap();
+    assert_eq!(input_summary["project"], "agent:oe:webcodex");
+    assert_eq!(input_summary["paths"], raw_summary["paths"]);
+    assert_eq!(input_summary["max_hunks"], 7);
+    assert_eq!(input_summary["max_hunk_lines"], 33);
+    assert_eq!(input_summary["cached"], true);
+    assert!(input_summary.get("continuation").is_none());
+    assert!(!serde_json::to_string(input_summary)
+        .unwrap()
+        .contains(continuation));
+}
+
+#[test]
 fn show_changes_tool_is_known_and_parses() {
     assert!(is_known_tool_name("show_changes"));
     let call = ToolCall::from_tool_name(
