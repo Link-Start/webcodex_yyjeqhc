@@ -6410,6 +6410,54 @@ fn sink_send_job_update_sends_job_update_envelope() {
     }
 }
 
+#[test]
+fn sink_try_send_job_update_preserves_full_ws_and_quic_queue_for_retry() {
+    for label in ["ws", "quic"] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(AgentEnvelope::Ping { ts: 11 }).unwrap();
+        let sink = match label {
+            "ws" => AgentSink::WebSocket {
+                tx,
+                client_id: "stream-client".to_string(),
+                agent_instance_id: "stream-instance".to_string(),
+            },
+            "quic" => AgentSink::Quic {
+                tx,
+                client_id: "stream-client".to_string(),
+                agent_instance_id: "stream-instance".to_string(),
+            },
+            _ => unreachable!(),
+        };
+        let body = ShellAgentJobUpdateRequest {
+            client_id: "stream-client".to_string(),
+            agent_instance_id: "stream-instance".to_string(),
+            job_id: "job-full".to_string(),
+            request_id: Some("request-full".to_string()),
+            update_seq: Some(2),
+            status: "running".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            log_snapshot: None,
+            exit_code: None,
+            duration_ms: None,
+            error: None,
+            command_execution_state: None,
+            validation_progress: None,
+            finished: false,
+        };
+
+        assert_eq!(sink.try_send_job_update(&body), Ok(false), "{label}");
+        assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 11 })));
+        assert_eq!(sink.try_send_job_update(&body), Ok(true), "{label}");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEnvelope::JobUpdate { payload }) if payload.job_id == "job-full"
+        ));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn job_manager_stop_all_clears_queue_and_requests_running_stop() {

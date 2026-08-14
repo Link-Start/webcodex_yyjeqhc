@@ -218,6 +218,110 @@ fn update(
 }
 
 #[tokio::test]
+async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_steps() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let steps = vec![
+        ShellJobValidationStep {
+            name: "format".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["fmt".to_string(), "--".to_string(), "--check".to_string()],
+            env: Vec::new(),
+        },
+        ShellJobValidationStep {
+            name: "check".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["check".to_string(), "--all-targets".to_string()],
+            env: Vec::new(),
+        },
+        ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            env: Vec::new(),
+        },
+    ];
+    let job = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("validation".to_string()),
+                shell: Some("bash".to_string()),
+                validation_steps: steps,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("validation start request");
+    assert_eq!(request.kind, "start_validation_job");
+
+    let validation_update = |sequence: u64,
+                             status: &str,
+                             completed: usize,
+                             current_step: Option<&str>,
+                             finished: bool| {
+        ShellAgentJobUpdateRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            job_id: job.job_id.clone(),
+            request_id: Some(request.request_id.clone()),
+            update_seq: Some(sequence),
+            status: status.to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            log_snapshot: None,
+            exit_code: finished.then_some(0),
+            duration_ms: finished.then_some(2_000),
+            error: None,
+            command_execution_state: None,
+            validation_progress: Some(ShellJobValidationProgress {
+                completed,
+                current_step: current_step.map(str::to_string),
+                failed_step: None,
+            }),
+            finished,
+        }
+    };
+
+    for update in [
+        validation_update(2, "running", 0, Some("format"), false),
+        validation_update(37, "running", 1, Some("check"), false),
+        validation_update(81, "running", 2, Some("test"), false),
+        validation_update(144, "completed", 3, None, true),
+    ] {
+        registry.update_job(update).await.unwrap();
+    }
+
+    let completed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(completed.status, "completed");
+    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(completed.last_update_seq, Some(144));
+    assert_eq!(
+        completed.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 3,
+            current_step: None,
+            failed_step: None,
+        })
+    );
+}
+
+#[tokio::test]
 async fn reconciliation_rejects_cross_product_first_class_go_test_metadata() {
     let registry = ShellClientRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;

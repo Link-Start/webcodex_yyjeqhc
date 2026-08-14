@@ -1049,6 +1049,63 @@ impl AgentSink {
         send_provider_metadata(tx, runtime, Some(generation));
     }
 
+    pub(crate) fn same_job_update_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AgentSink::Http(left), AgentSink::Http(right)) => {
+                left.server_url == right.server_url
+                    && left.client_id == right.client_id
+                    && left.agent_instance_id == right.agent_instance_id
+            }
+            (AgentSink::WebSocket { tx: left, .. }, AgentSink::WebSocket { tx: right, .. })
+            | (AgentSink::Quic { tx: left, .. }, AgentSink::Quic { tx: right, .. }) => {
+                left.same_channel(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Non-blocking stream enqueue used by the JobManager's single bounded
+    /// delivery worker. HTTP remains a bounded synchronous request, but only
+    /// that delivery worker waits for it; child output capture never does.
+    /// `Ok(false)` means the live WS/QUIC queue is full and the caller must
+    /// retain the update for a later retry rather than drop it.
+    pub(crate) fn try_send_job_update(
+        &self,
+        body: &ShellAgentJobUpdateRequest,
+    ) -> Result<bool, String> {
+        match self {
+            AgentSink::Http(h) => {
+                let resp: ShellAgentJobUpdateResponse = post_json_raw(
+                    &h.client,
+                    &h.server_url,
+                    &h.token,
+                    "/api/shell/agent/job_update",
+                    body,
+                )
+                .map_err(|e| e.to_string())?;
+                if resp.success {
+                    Ok(true)
+                } else {
+                    Err(resp
+                        .error
+                        .unwrap_or_else(|| "job_update failed without error".to_string()))
+                }
+            }
+            AgentSink::WebSocket { tx, .. } | AgentSink::Quic { tx, .. } => {
+                let env = AgentEnvelope::JobUpdate {
+                    payload: body.clone(),
+                };
+                match tx.try_send(env) {
+                    Ok(()) => Ok(true),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err("agent transport send failed".to_string())
+                    }
+                }
+            }
+        }
+    }
+
     /// Push an incremental/final job update. Mirrors the old `send_job_update`
     /// free function. Job updates stay best-effort: callers ignore failures
     /// and the terminal state is still resolved by the final result path.

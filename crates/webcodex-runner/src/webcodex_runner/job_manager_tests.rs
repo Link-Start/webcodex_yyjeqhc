@@ -164,10 +164,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             ..Default::default()
         },
     );
-    let first = rx.try_recv().expect("incremental update");
-    let AgentEnvelope::JobUpdate { payload: first } = first else {
-        panic!("expected job update");
-    };
+    let first = recv_job_update(&mut rx, Duration::from_secs(2), "incremental update");
     assert_eq!(first.update_seq, Some(2));
     assert!(first.stdout_chunk.is_none());
     let first_logs = first
@@ -246,8 +243,20 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         agent_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
+    assert!(wait_until(Duration::from_secs(2), || {
+        !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
+    }));
+    while reconnected_rx.try_recv().is_ok() {}
+
+    let (fresh_tx, mut fresh_rx) = tokio::sync::mpsc::channel(4);
+    manager.install_sink(AgentSink::WebSocket {
+        tx: fresh_tx,
+        client_id: "test-agent".to_string(),
+        agent_instance_id: "test-instance".to_string(),
+    });
+    manager.replay_snapshots_since(&registered_inventory);
     assert!(
-        reconnected_rx.try_recv().is_err(),
+        fresh_rx.try_recv().is_err(),
         "unchanged register snapshots need no network replay"
     );
     registered_inventory
@@ -257,10 +266,11 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         .unwrap()
         .update_seq -= 1;
     manager.replay_snapshots_since(&registered_inventory);
-    let replay = reconnected_rx.try_recv().expect("post-register replay");
-    let AgentEnvelope::JobUpdate { payload: replay } = replay else {
-        panic!("expected replay job update");
-    };
+    let replay = recv_job_update(
+        &mut fresh_rx,
+        Duration::from_secs(2),
+        "post-register replay",
+    );
     assert_eq!(replay.job_id, "offline-terminal-job");
     assert_eq!(replay.update_seq, Some(3));
     assert!(replay.finished);
@@ -269,15 +279,11 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     assert_eq!(logs.stdout.next_line, 3);
 
     manager.stop("offline-terminal-job").unwrap();
-    let stopped_race = reconnected_rx
-        .try_recv()
-        .expect("stop racing a lost terminal update replays the terminal snapshot");
-    let AgentEnvelope::JobUpdate {
-        payload: stopped_race,
-    } = stopped_race
-    else {
-        panic!("expected replay job update");
-    };
+    let stopped_race = recv_job_update(
+        &mut fresh_rx,
+        Duration::from_secs(2),
+        "stop racing a lost terminal update replays the terminal snapshot",
+    );
     assert_eq!(stopped_race.status, "completed");
     assert_eq!(stopped_race.update_seq, Some(3));
     assert!(stopped_race.finished);
@@ -550,6 +556,23 @@ fn collect_job_updates(
     updates
 }
 
+fn recv_job_update(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    timeout: Duration,
+    label: &str,
+) -> ShellAgentJobUpdateRequest {
+    let deadline = Instant::now() + timeout;
+    loop {
+        while let Ok(envelope) = rx.try_recv() {
+            if let AgentEnvelope::JobUpdate { payload } = envelope {
+                return payload;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        std::thread::yield_now();
+    }
+}
+
 /// Standalone native-argv helper used by the typed Job tests. The fixture can
 /// append a PID/nonce marker before sleeping, so any cancel-and-restart
 /// promotion would leave two durable start lines.
@@ -689,6 +712,48 @@ fn enqueue_structured_process_job(
                 "created_at": chrono::Utc::now().timestamp(),
                 "sandbox": sandbox,
                 "job_context": context,
+            }))
+            .unwrap(),
+        },
+    );
+}
+
+#[cfg(unix)]
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn enqueue_shell_job(
+    manager: &JobManager,
+    sink: &AgentSink,
+    cwd: &Path,
+    job_id: &str,
+    command: String,
+    timeout_secs: u64,
+) {
+    manager.enqueue(
+        sink.clone(),
+        PendingJobStart {
+            generation: 1,
+            policy: AgentPolicy {
+                allow_cwd_anywhere: true,
+                ..AgentPolicy::default()
+            },
+            shell: ShellConfig::default(),
+            ssh: SshConfig::default(),
+            projects_dir: cwd.join("projects.d"),
+            request: serde_json::from_value(json!({
+                "request_id": format!("request-{job_id}"),
+                "client_id": "backpressure-agent",
+                "kind": "start_job",
+                "job_id": job_id,
+                "cwd": cwd,
+                "command": command,
+                "timeout_secs": timeout_secs,
+                "requested_by": "test",
+                "created_at": chrono::Utc::now().timestamp(),
+                "job_context": test_job_context(cwd, Vec::new()),
             }))
             .unwrap(),
         },
@@ -1238,6 +1303,203 @@ fn structured_process_job_executes_exactly_once_and_reconciles_the_same_job() {
         Some(ShellCommandExecutionState::Completed)
     );
     assert_eq!(retained.request_id, "request-structured-once");
+}
+
+#[cfg(unix)]
+#[test]
+fn chatty_job_and_queued_job_progress_while_stream_transport_is_full() {
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let queued_marker = temp.path().join("queued-progressed");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(AgentEnvelope::Ping { ts: 1 }).unwrap();
+    let sink = AgentSink::WebSocket {
+        tx,
+        client_id: "backpressure-agent".into(),
+        agent_instance_id: "backpressure-instance".into(),
+    };
+    let manager = JobManager::new(1);
+
+    enqueue_shell_job(
+        &manager,
+        &sink,
+        temp.path(),
+        "chatty-backpressure",
+        format!("{} chatty 256", sh_quote(&helper.path)),
+        30,
+    );
+    enqueue_shell_job(
+        &manager,
+        &sink,
+        temp.path(),
+        "queued-after-chatty",
+        format!(
+            "{} mark {}",
+            sh_quote(&helper.path),
+            sh_quote(&queued_marker)
+        ),
+        30,
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            let inventory = manager.inventory();
+            let chatty_terminal = inventory.jobs.iter().any(|snapshot| {
+                snapshot.job_id == "chatty-backpressure" && runner_job_is_terminal(&snapshot.status)
+            });
+            chatty_terminal && queued_marker.exists()
+        }),
+        "a full transport queue backpressured child output capture or queued-job progression"
+    );
+    wait_for_job_workers(&manager);
+
+    let inventory = manager.inventory();
+    let chatty = inventory
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "chatty-backpressure")
+        .expect("chatty job retained");
+    assert_eq!(chatty.status, "completed", "{chatty:?}");
+    assert!(chatty.stdout.truncated);
+    assert!(chatty.stderr.truncated);
+    assert!(chatty.stdout.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    assert!(chatty.stderr.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    assert!(chatty.stdout.next_line > chatty.stdout.first_retained_line);
+    assert!(chatty.stderr.next_line > chatty.stderr.first_retained_line);
+    let queued = inventory
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "queued-after-chatty")
+        .expect("queued job retained");
+    assert_eq!(queued.status, "completed", "{queued:?}");
+
+    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 1 })));
+}
+
+#[test]
+fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants() {
+    let manager = JobManager::new(1);
+    let mut snapshot = test_job_snapshot("coalesced-output");
+    snapshot.status = "agent_queued".to_string();
+    snapshot.started_at = None;
+    lock_unpoison(&manager.jobs).insert(
+        snapshot.job_id.clone(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            agent_instance_id: "test-instance".into(),
+            snapshot,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(AgentEnvelope::Ping { ts: 7 }).unwrap();
+    manager.install_sink(AgentSink::WebSocket {
+        tx,
+        client_id: "test-agent".into(),
+        agent_instance_id: "test-instance".into(),
+    });
+
+    manager.update_and_send(
+        "coalesced-output",
+        RunnerJobDelta {
+            status: "running".to_string(),
+            stdout_chunk: Some("start 🙂\n".to_string()),
+            ..Default::default()
+        },
+    );
+    let chunk = "🙂\n".repeat(1024);
+    for _ in 0..100 {
+        manager.update_and_send(
+            "coalesced-output",
+            RunnerJobDelta {
+                status: "running".to_string(),
+                stdout_chunk: Some(chunk.clone()),
+                ..Default::default()
+            },
+        );
+    }
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending.get("coalesced-output").expect("pending delivery");
+        assert_eq!(queue.required.len(), 1);
+        assert!(queue.output_only.is_some());
+        assert!(queue.required.len() <= JOB_UPDATE_REQUIRED_PENDING_MAX);
+    }
+
+    manager.update_and_send(
+        "coalesced-output",
+        RunnerJobDelta {
+            status: "completed".to_string(),
+            stdout_chunk: Some("done 🙂\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(10),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    let retained = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "coalesced-output")
+        .unwrap();
+    assert_eq!(retained.status, "completed");
+    assert_eq!(retained.update_seq, 103);
+    assert_eq!(retained.stdout.next_line, 102_403);
+    assert!(retained.stdout.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    assert!(retained.stdout.truncated);
+    assert!(std::str::from_utf8(retained.stdout.tail.as_bytes()).is_ok());
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending
+            .get("coalesced-output")
+            .expect("terminal pending delivery");
+        assert_eq!(queue.required.len(), 2);
+        assert!(queue.output_only.is_none());
+    }
+    manager.resend_snapshot("coalesced-output");
+    manager.resend_snapshot("coalesced-output");
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending
+            .get("coalesced-output")
+            .expect("deduplicated terminal replay");
+        assert_eq!(queue.required.len(), 2);
+        assert_eq!(queue.required.back().unwrap().update_seq, 103);
+    }
+
+    manager.update_and_send(
+        "coalesced-output",
+        RunnerJobDelta {
+            status: "running".to_string(),
+            stdout_chunk: Some("late\n".to_string()),
+            ..Default::default()
+        },
+    );
+    let immutable = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "coalesced-output")
+        .unwrap();
+    assert_eq!(immutable.update_seq, 103);
+    assert_eq!(immutable.stdout.next_line, 102_403);
+
+    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 7 })));
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(5));
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    assert_eq!(updates[0].status, "running");
+    assert_eq!(updates[0].update_seq, Some(2));
+    assert_eq!(updates[1].status, "completed");
+    assert_eq!(updates[1].update_seq, Some(103));
+    assert!(updates[1].finished);
+    let first_logs = updates[0].log_snapshot.as_ref().unwrap();
+    let terminal_logs = updates[1].log_snapshot.as_ref().unwrap();
+    assert_eq!(first_logs.stdout.next_line, 102_403);
+    assert_eq!(terminal_logs.stdout.next_line, 102_403);
+    assert!(std::str::from_utf8(first_logs.stdout.tail.as_bytes()).is_ok());
 }
 
 #[test]
@@ -2043,6 +2305,159 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
         test_step_ran: temp.path().join("should-not-run").exists(),
         updates,
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn noisy_validation_progress_delivery_stays_ordered_after_transport_backpressure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let helper = structured_process_helper();
+    let steps_log = temp.path().join("validation-steps.log");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nexec {} chatty 96\n",
+            sh_quote(&steps_log),
+            sh_quote(&helper.path)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let steps = vec![
+        ShellJobValidationStep {
+            name: "format".into(),
+            program: "cargo".into(),
+            args: vec!["fmt".into(), "--".into(), "--check".into()],
+            env: Vec::new(),
+        },
+        ShellJobValidationStep {
+            name: "check".into(),
+            program: "cargo".into(),
+            args: vec!["check".into(), "--all-targets".into()],
+            env: Vec::new(),
+        },
+        ShellJobValidationStep {
+            name: "test".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            env: Vec::new(),
+        },
+    ];
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(AgentEnvelope::Ping { ts: 9 }).unwrap();
+    let sink = AgentSink::WebSocket {
+        tx,
+        client_id: "validation-agent".into(),
+        agent_instance_id: "validation-instance".into(),
+    };
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        PendingJobStart {
+            generation: 1,
+            policy: AgentPolicy {
+                allow_cwd_anywhere: true,
+                ..AgentPolicy::default()
+            },
+            shell,
+            ssh: SshConfig::default(),
+            projects_dir: temp.path().join("projects.d"),
+            request: serde_json::from_value(json!({
+                "request_id": "validation-backpressure-request",
+                "client_id": "validation-agent",
+                "kind": "start_validation_job",
+                "job_id": "validation-backpressure-job",
+                "cwd": temp.path(),
+                "command": serde_json::to_string(&steps).unwrap(),
+                "timeout_secs": 60,
+                "requested_by": "test",
+                "created_at": chrono::Utc::now().timestamp(),
+                "job_context": test_job_context(
+                    temp.path(),
+                    steps.iter().map(|step| step.name.clone()).collect(),
+                )
+            }))
+            .unwrap(),
+        },
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            manager.inventory().jobs.iter().any(|snapshot| {
+                snapshot.job_id == "validation-backpressure-job" && snapshot.status == "completed"
+            })
+        }),
+        "validation job did not finish locally while transport remained full"
+    );
+    wait_for_job_workers(&manager);
+    assert_eq!(
+        std::fs::read_to_string(&steps_log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["fmt", "check", "test"]
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = pending
+            .get("validation-backpressure-job")
+            .expect("validation semantic updates remain pending");
+        assert_eq!(queue.required.len(), 4);
+        assert!(queue.required.len() <= JOB_UPDATE_REQUIRED_PENDING_MAX);
+        assert!(queue.output_only.is_none());
+    }
+
+    assert!(matches!(rx.try_recv(), Ok(AgentEnvelope::Ping { ts: 9 })));
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+    assert_eq!(updates.len(), 4, "{updates:?}");
+    let expected_steps = ["format", "check", "test"];
+    let mut previous_completed = 0usize;
+    let mut previous_sequence = 0u64;
+    let mut previous_stdout_cursor = 0usize;
+    for update in &updates {
+        let sequence = update.update_seq.expect("sequenced validation update");
+        assert!(sequence > previous_sequence, "{updates:?}");
+        previous_sequence = sequence;
+        let progress = update
+            .validation_progress
+            .as_ref()
+            .expect("validation progress");
+        assert!(progress.completed >= previous_completed, "{updates:?}");
+        assert!(
+            progress.completed <= previous_completed.saturating_add(1),
+            "server live validation progress would reject a skipped step: {updates:?}"
+        );
+        previous_completed = progress.completed;
+        if update.finished {
+            assert_eq!(progress.completed, expected_steps.len());
+            assert!(progress.current_step.is_none());
+        } else {
+            assert_eq!(
+                progress.current_step.as_deref(),
+                expected_steps.get(progress.completed).copied()
+            );
+        }
+        let stdout_cursor = update
+            .log_snapshot
+            .as_ref()
+            .expect("authoritative logs")
+            .stdout
+            .next_line;
+        assert!(stdout_cursor >= previous_stdout_cursor);
+        previous_stdout_cursor = stdout_cursor;
+    }
+    let final_update = updates.last().unwrap();
+    assert_eq!(final_update.status, "completed");
+    assert_eq!(final_update.exit_code, Some(0));
+    assert!(final_update.finished);
 }
 
 #[cfg(unix)]

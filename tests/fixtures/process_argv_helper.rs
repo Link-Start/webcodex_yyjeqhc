@@ -142,6 +142,28 @@ fn main() {
             let millis = args.next().unwrap().parse::<u64>().unwrap();
             std::thread::sleep(Duration::from_millis(millis));
         }
+        Some("chatty") => {
+            use std::io::Write;
+
+            let chunks = args.next().unwrap().parse::<usize>().unwrap();
+            let payload = vec![b'x'; 8 * 1024];
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut stdout = stdout.lock();
+            let mut stderr = stderr.lock();
+            for _ in 0..chunks {
+                stdout.write_all(&payload).unwrap();
+                stdout.write_all(b"\n").unwrap();
+                stderr.write_all(&payload).unwrap();
+                stderr.write_all(b"\n").unwrap();
+            }
+            stdout.flush().unwrap();
+            stderr.flush().unwrap();
+        }
+        Some("mark") => {
+            let marker = args.next().unwrap();
+            std::fs::write(marker, "started\n").unwrap();
+        }
         Some("mark-sleep") => {
             use std::io::Write;
             let marker = args.next().unwrap();

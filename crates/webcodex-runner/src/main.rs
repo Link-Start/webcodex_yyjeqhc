@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use webcodex_process::{GracefulTermination, ManagedChild};
@@ -88,14 +88,67 @@ const AGENT_POLL_PATH: &str = "/api/shell/agent/poll";
 /// finite bound.
 const AGENT_HTTP_RESPONSE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+/// At most the validated Job state machine's semantic transitions are retained
+/// for live delivery. Output-only updates are coalesced separately below.
+const JOB_UPDATE_REQUIRED_PENDING_MAX: usize = 8;
+const JOB_UPDATE_DELIVERY_RETRY: Duration = Duration::from_millis(JOB_UPDATE_INTERVAL_MS);
+
+#[derive(Debug, Default)]
+struct JobUpdateDeliverySignalState {
+    generation: u64,
+    closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct JobUpdateDeliverySignal {
+    state: Mutex<JobUpdateDeliverySignalState>,
+    wake: Condvar,
+}
+
+impl JobUpdateDeliverySignal {
+    fn notify(&self) {
+        let mut state = lock_unpoison(&self.state);
+        state.generation = state.generation.saturating_add(1);
+        self.wake.notify_one();
+    }
+
+    fn close(&self) {
+        let mut state = lock_unpoison(&self.state);
+        state.closed = true;
+        state.generation = state.generation.saturating_add(1);
+        self.wake.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        lock_unpoison(&self.state).generation
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: Duration) -> Option<u64> {
+        let mut state = lock_unpoison(&self.state);
+        if state.closed {
+            return None;
+        }
+        if state.generation == observed {
+            let (next, _) = self
+                .wake
+                .wait_timeout(state, timeout)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+        (!state.closed).then_some(state.generation)
+    }
+}
+
 #[derive(Debug)]
 struct JobManagerOwnerLifetime {
-    jobs: std::sync::Weak<Mutex<HashMap<String, RunningJob>>>,
-    shutting_down: std::sync::Weak<AtomicBool>,
+    jobs: Weak<Mutex<HashMap<String, RunningJob>>>,
+    shutting_down: Weak<AtomicBool>,
+    delivery_signal: Arc<JobUpdateDeliverySignal>,
 }
 
 impl Drop for JobManagerOwnerLifetime {
     fn drop(&mut self) {
+        self.delivery_signal.close();
         if let Some(shutting_down) = self.shutting_down.upgrade() {
             shutting_down.store(true, Ordering::SeqCst);
         }
@@ -153,6 +206,8 @@ struct JobManager {
     shutting_down: Arc<AtomicBool>,
     workers: ActivityTracker,
     current_sink: Arc<Mutex<Option<AgentSink>>>,
+    pending_job_updates: Arc<Mutex<HashMap<String, JobUpdateDeliveryQueue>>>,
+    delivery_signal: Arc<JobUpdateDeliverySignal>,
     owner_lifetime: Option<Arc<JobManagerOwnerLifetime>>,
 }
 
@@ -160,9 +215,19 @@ impl JobManager {
     fn new(max_concurrent: usize) -> Self {
         let jobs = Arc::new(Mutex::new(HashMap::new()));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let current_sink = Arc::new(Mutex::new(None));
+        let pending_job_updates = Arc::new(Mutex::new(HashMap::new()));
+        let delivery_signal = Arc::new(JobUpdateDeliverySignal::default());
+        spawn_job_update_delivery_worker(
+            Arc::downgrade(&jobs),
+            Arc::downgrade(&current_sink),
+            Arc::downgrade(&pending_job_updates),
+            Arc::clone(&delivery_signal),
+        );
         let owner_lifetime = Arc::new(JobManagerOwnerLifetime {
             jobs: Arc::downgrade(&jobs),
             shutting_down: Arc::downgrade(&shutting_down),
+            delivery_signal: Arc::clone(&delivery_signal),
         });
         Self {
             max_concurrent: max_concurrent.max(1),
@@ -173,7 +238,9 @@ impl JobManager {
             lifecycle: Arc::new(Mutex::new(())),
             shutting_down,
             workers: ActivityTracker::default(),
-            current_sink: Arc::new(Mutex::new(None)),
+            current_sink,
+            pending_job_updates,
+            delivery_signal,
             owner_lifetime: Some(owner_lifetime),
         }
     }
@@ -196,6 +263,214 @@ struct RunningJob {
     child: Option<Arc<Mutex<ManagedChild>>>,
     stop_requested: Arc<AtomicBool>,
     slot_reserved: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingJobUpdateDelivery {
+    update_seq: u64,
+    status: String,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+    command_execution_state: Option<ShellCommandExecutionState>,
+    validation_progress: Option<ShellJobValidationProgress>,
+    finished: bool,
+}
+
+impl PendingJobUpdateDelivery {
+    fn from_update(update: &ShellAgentJobUpdateRequest) -> Self {
+        Self {
+            update_seq: update.update_seq.unwrap_or_default(),
+            status: update.status.clone(),
+            exit_code: update.exit_code,
+            duration_ms: update.duration_ms,
+            error: update.error.clone(),
+            command_execution_state: update.command_execution_state.clone(),
+            validation_progress: update.validation_progress.clone(),
+            finished: update.finished,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct JobUpdateDeliveryQueue {
+    required: VecDeque<PendingJobUpdateDelivery>,
+    output_only: Option<PendingJobUpdateDelivery>,
+    suspended_until_reconciliation: bool,
+}
+
+impl JobUpdateDeliveryQueue {
+    fn enqueue(&mut self, update: PendingJobUpdateDelivery, semantic: bool) -> bool {
+        if self.suspended_until_reconciliation {
+            return true;
+        }
+        if semantic {
+            self.output_only = None;
+            if let Some(last) = self.required.back_mut() {
+                if last.update_seq == update.update_seq {
+                    *last = update;
+                    return true;
+                }
+            }
+            if self.required.len() >= JOB_UPDATE_REQUIRED_PENDING_MAX {
+                self.required.clear();
+                self.suspended_until_reconciliation = true;
+                return false;
+            }
+            self.required.push_back(update);
+        } else {
+            self.output_only = Some(update);
+        }
+        true
+    }
+
+    fn next(&self) -> Option<&PendingJobUpdateDelivery> {
+        if self.suspended_until_reconciliation {
+            None
+        } else {
+            self.required.front().or(self.output_only.as_ref())
+        }
+    }
+
+    fn acknowledge(&mut self, update_seq: u64) {
+        if self
+            .required
+            .front()
+            .is_some_and(|update| update.update_seq == update_seq)
+        {
+            self.required.pop_front();
+        } else if self
+            .output_only
+            .as_ref()
+            .is_some_and(|update| update.update_seq == update_seq)
+        {
+            self.output_only = None;
+        }
+    }
+
+    fn discard_through(&mut self, update_seq: u64) {
+        while self
+            .required
+            .front()
+            .is_some_and(|update| update.update_seq <= update_seq)
+        {
+            self.required.pop_front();
+        }
+        if self
+            .output_only
+            .as_ref()
+            .is_some_and(|update| update.update_seq <= update_seq)
+        {
+            self.output_only = None;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.required.is_empty() && self.output_only.is_none()
+    }
+}
+
+fn job_update_from_delivery(
+    job: &RunningJob,
+    pending: &PendingJobUpdateDelivery,
+) -> ShellAgentJobUpdateRequest {
+    let mut update =
+        job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot);
+    update.update_seq = Some(pending.update_seq);
+    update.status = pending.status.clone();
+    update.exit_code = pending.exit_code;
+    update.duration_ms = pending.duration_ms;
+    update.error = pending.error.clone();
+    update.command_execution_state = pending.command_execution_state.clone();
+    update.validation_progress = pending.validation_progress.clone();
+    update.finished = pending.finished;
+    update
+}
+
+fn spawn_job_update_delivery_worker(
+    jobs: Weak<Mutex<HashMap<String, RunningJob>>>,
+    current_sink: Weak<Mutex<Option<AgentSink>>>,
+    pending_job_updates: Weak<Mutex<HashMap<String, JobUpdateDeliveryQueue>>>,
+    signal: Arc<JobUpdateDeliverySignal>,
+) {
+    std::thread::spawn(move || {
+        let mut observed_generation = signal.generation();
+        loop {
+            let Some(pending_map) = pending_job_updates.upgrade() else {
+                break;
+            };
+            let candidate = {
+                let pending = lock_unpoison(&pending_map);
+                pending.iter().find_map(|(job_id, queue)| {
+                    queue.next().cloned().map(|update| (job_id.clone(), update))
+                })
+            };
+            let Some((job_id, pending_update)) = candidate else {
+                let Some(next) =
+                    signal.wait_for_change(observed_generation, Duration::from_secs(60))
+                else {
+                    break;
+                };
+                observed_generation = next;
+                continue;
+            };
+
+            let Some(jobs_map) = jobs.upgrade() else {
+                break;
+            };
+            let update = {
+                let jobs = lock_unpoison(&jobs_map);
+                jobs.get(&job_id)
+                    .map(|job| job_update_from_delivery(job, &pending_update))
+            };
+            let Some(update) = update else {
+                lock_unpoison(&pending_map).remove(&job_id);
+                continue;
+            };
+
+            let Some(sink_slot) = current_sink.upgrade() else {
+                break;
+            };
+            let sink = lock_unpoison(&sink_slot).clone();
+            let Some(sink) = sink else {
+                let Some(next) =
+                    signal.wait_for_change(observed_generation, Duration::from_secs(60))
+                else {
+                    break;
+                };
+                observed_generation = next;
+                continue;
+            };
+
+            match sink.try_send_job_update(&update) {
+                Ok(true) => {
+                    let still_current = lock_unpoison(&sink_slot)
+                        .as_ref()
+                        .is_some_and(|current| current.same_job_update_target(&sink));
+                    if still_current {
+                        let mut pending = lock_unpoison(&pending_map);
+                        let remove = if let Some(queue) = pending.get_mut(&job_id) {
+                            queue.acknowledge(pending_update.update_seq);
+                            queue.is_empty() && !queue.suspended_until_reconciliation
+                        } else {
+                            false
+                        };
+                        if remove {
+                            pending.remove(&job_id);
+                        }
+                    }
+                }
+                Ok(false) | Err(_) => {
+                    let Some(next) =
+                        signal.wait_for_change(observed_generation, JOB_UPDATE_DELIVERY_RETRY)
+                    else {
+                        break;
+                    };
+                    observed_generation = next;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2591,25 +2866,35 @@ fn validate_runner_structured_common(request: &ShellAgentShellRequest) -> Result
 impl JobManager {
     fn install_sink(&self, sink: AgentSink) {
         *lock_unpoison(&self.current_sink) = Some(sink);
+        self.delivery_signal.notify();
     }
 
     fn current_sink(&self) -> Option<AgentSink> {
         lock_unpoison(&self.current_sink).clone()
     }
 
-    fn send_recorded_update(&self, update: ShellAgentJobUpdateRequest) {
-        let Some(sink) = self.current_sink() else {
-            return;
-        };
-        let _ = sink.send_job_update(&update);
+    fn queue_recorded_update(&self, update: ShellAgentJobUpdateRequest, semantic: bool) {
+        let job_id = update.job_id.clone();
+        let accepted = lock_unpoison(&self.pending_job_updates)
+            .entry(job_id.clone())
+            .or_default()
+            .enqueue(PendingJobUpdateDelivery::from_update(&update), semantic);
+        if !accepted {
+            tracing::warn!(
+                job_id = %job_id,
+                limit = JOB_UPDATE_REQUIRED_PENDING_MAX,
+                "runner job live delivery backlog exceeded its semantic bound; waiting for reconciliation"
+            );
+        }
+        self.delivery_signal.notify();
     }
 
     fn record_update(
         &self,
         job_id: &str,
         mut delta: RunnerJobDelta,
-    ) -> Option<ShellAgentJobUpdateRequest> {
-        let update = {
+    ) -> Option<(ShellAgentJobUpdateRequest, bool)> {
+        let (update, semantic) = {
             let mut jobs = lock_unpoison(&self.jobs);
             let job = jobs.get_mut(job_id)?;
             if runner_job_is_terminal(&job.snapshot.status) {
@@ -2618,6 +2903,10 @@ impl JobManager {
                 // must not revive a handle-free retained record.
                 return None;
             }
+            let previous_status = job.snapshot.status.clone();
+            let previous_progress = job.snapshot.validation_progress.clone();
+            let explicit_semantic =
+                delta.finished || delta.command_execution_state.is_some() || delta.error.is_some();
             let now = chrono::Utc::now().timestamp();
             append_runner_stream(&mut job.snapshot.stdout, delta.stdout_chunk.as_deref());
             append_runner_stream(&mut job.snapshot.stderr, delta.stderr_chunk.as_deref());
@@ -2664,41 +2953,94 @@ impl JobManager {
             } else if delta.error.is_some() {
                 job.snapshot.error = bounded_runner_error(delta.error.take());
             }
+            let semantic = explicit_semantic
+                || job.snapshot.status != previous_status
+                || job.snapshot.validation_progress != previous_progress;
             // Each sequenced update carries the current authoritative bounded
-            // tails. If transport calls complete out of order, a higher
-            // sequence still contains every retained byte visible to the
-            // lower one, so ignoring stale updates cannot lose or duplicate
-            // output.
-            job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot)
+            // tails. Delivery may coalesce output-only attempts, but semantic
+            // markers preserve their sequence while using the latest retained
+            // authoritative log snapshot at send time.
+            (
+                job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot),
+                semantic,
+            )
         };
         self.prune_terminal_records();
-        Some(update)
+        Some((update, semantic))
     }
 
     fn update_and_send(&self, job_id: &str, delta: RunnerJobDelta) {
-        if let Some(update) = self.record_update(job_id, delta) {
-            self.send_recorded_update(update);
+        if let Some((update, semantic)) = self.record_update(job_id, delta) {
+            self.queue_recorded_update(update, semantic);
         }
     }
 
     fn replay_snapshots_since(&self, registered: &ShellJobInventory) {
-        let Some(sink) = self.current_sink() else {
+        if self.current_sink().is_none() {
             return;
-        };
-        let registered_sequences = registered
+        }
+        let registered_by_job = registered
             .jobs
             .iter()
-            .map(|snapshot| (snapshot.job_id.as_str(), snapshot.update_seq))
-            .collect::<std::collections::HashMap<_, _>>();
-        for snapshot in self.inventory().jobs.into_iter().filter(|snapshot| {
-            registered_sequences
-                .get(snapshot.job_id.as_str())
-                .is_none_or(|sequence| snapshot.update_seq > *sequence)
-        }) {
-            let update =
-                job_update_from_snapshot(sink.client_id(), sink.agent_instance_id(), &snapshot);
-            let _ = sink.send_job_update(&update);
+            .map(|snapshot| (snapshot.job_id.as_str(), snapshot))
+            .collect::<HashMap<_, _>>();
+        let snapshots = self.inventory().jobs;
+        let mut pending = lock_unpoison(&self.pending_job_updates);
+        let mut remove = Vec::new();
+        for snapshot in snapshots {
+            let registered_snapshot = registered_by_job.get(snapshot.job_id.as_str()).copied();
+            let registered_seq = registered_snapshot.map(|item| item.update_seq).unwrap_or(0);
+            let queue = pending.entry(snapshot.job_id.clone()).or_default();
+            queue.discard_through(registered_seq);
+
+            if queue.suspended_until_reconciliation {
+                if registered_seq >= snapshot.update_seq {
+                    queue.suspended_until_reconciliation = false;
+                } else {
+                    continue;
+                }
+            }
+
+            if snapshot.update_seq > registered_seq && queue.is_empty() {
+                let replay_safe = if snapshot.context.validation_steps.is_empty() {
+                    true
+                } else {
+                    let previous_completed = registered_snapshot
+                        .and_then(|item| item.validation_progress.as_ref())
+                        .map(|progress| progress.completed)
+                        .unwrap_or(0);
+                    let current_completed = snapshot
+                        .validation_progress
+                        .as_ref()
+                        .map(|progress| progress.completed)
+                        .unwrap_or(0);
+                    current_completed <= previous_completed.saturating_add(1)
+                };
+                if replay_safe {
+                    let marker = PendingJobUpdateDelivery {
+                        update_seq: snapshot.update_seq,
+                        status: snapshot.status.clone(),
+                        exit_code: snapshot.exit_code,
+                        duration_ms: snapshot.duration_ms,
+                        error: snapshot.error.clone(),
+                        command_execution_state: snapshot.command_execution_state.clone(),
+                        validation_progress: snapshot.validation_progress.clone(),
+                        finished: runner_job_is_terminal(&snapshot.status),
+                    };
+                    let _ = queue.enqueue(marker, true);
+                } else {
+                    queue.suspended_until_reconciliation = true;
+                }
+            }
+            if queue.is_empty() && !queue.suspended_until_reconciliation {
+                remove.push(snapshot.job_id);
+            }
         }
+        for job_id in remove {
+            pending.remove(&job_id);
+        }
+        drop(pending);
+        self.delivery_signal.notify();
     }
 
     fn resend_snapshot(&self, job_id: &str) {
@@ -2706,7 +3048,7 @@ impl JobManager {
             job_update_from_snapshot(&job.client_id, &job.agent_instance_id, &job.snapshot)
         });
         if let Some(update) = update {
-            self.send_recorded_update(update);
+            self.queue_recorded_update(update, true);
         }
     }
 
@@ -2736,36 +3078,46 @@ impl JobManager {
 
     fn prune_terminal_records(&self) {
         let now = chrono::Utc::now().timestamp();
-        let mut jobs = lock_unpoison(&self.jobs);
-        let expired = jobs
-            .iter()
-            .filter(|(_, job)| {
-                runner_job_is_terminal(&job.snapshot.status)
-                    && job.snapshot.ended_at.is_some_and(|ended| {
-                        now.saturating_sub(ended) >= JOB_TERMINAL_RETENTION_SECS
-                    })
-            })
-            .map(|(job_id, _)| job_id.clone())
-            .collect::<Vec<_>>();
-        for job_id in expired {
-            jobs.remove(&job_id);
-        }
-        let mut terminal = jobs
-            .iter()
-            .filter(|(_, job)| runner_job_is_terminal(&job.snapshot.status))
-            .map(|(job_id, job)| {
-                (
-                    job_id.clone(),
-                    job.snapshot.ended_at.unwrap_or(job.snapshot.created_at),
-                )
-            })
-            .collect::<Vec<_>>();
-        terminal.sort_by_key(|(_, ended_at)| *ended_at);
-        let excess = terminal
-            .len()
-            .saturating_sub(JOB_INVENTORY_MAX_TERMINAL_JOBS);
-        for (job_id, _) in terminal.into_iter().take(excess) {
-            jobs.remove(&job_id);
+        let removed = {
+            let mut jobs = lock_unpoison(&self.jobs);
+            let mut removed = jobs
+                .iter()
+                .filter(|(_, job)| {
+                    runner_job_is_terminal(&job.snapshot.status)
+                        && job.snapshot.ended_at.is_some_and(|ended| {
+                            now.saturating_sub(ended) >= JOB_TERMINAL_RETENTION_SECS
+                        })
+                })
+                .map(|(job_id, _)| job_id.clone())
+                .collect::<Vec<_>>();
+            for job_id in &removed {
+                jobs.remove(job_id);
+            }
+            let mut terminal = jobs
+                .iter()
+                .filter(|(_, job)| runner_job_is_terminal(&job.snapshot.status))
+                .map(|(job_id, job)| {
+                    (
+                        job_id.clone(),
+                        job.snapshot.ended_at.unwrap_or(job.snapshot.created_at),
+                    )
+                })
+                .collect::<Vec<_>>();
+            terminal.sort_by_key(|(_, ended_at)| *ended_at);
+            let excess = terminal
+                .len()
+                .saturating_sub(JOB_INVENTORY_MAX_TERMINAL_JOBS);
+            for (job_id, _) in terminal.into_iter().take(excess) {
+                jobs.remove(&job_id);
+                removed.push(job_id);
+            }
+            removed
+        };
+        if !removed.is_empty() {
+            let mut pending = lock_unpoison(&self.pending_job_updates);
+            for job_id in removed {
+                pending.remove(&job_id);
+            }
         }
     }
 
