@@ -711,6 +711,87 @@ async fn full_operator_explicit_surface_lists_full_runtime_and_dispatches() {
 }
 
 #[tokio::test]
+async fn full_operator_tools_list_projects_destructive_hints_for_non_additive_mutations() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let listed = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/list",
+            Some(Value::from(721)),
+            mcp_2026_params(json!({})),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = listed else {
+        panic!("full operator tools/list must succeed");
+    };
+    let tools = value["result"]["tools"].as_array().unwrap();
+
+    for name in [
+        "apply_patch",
+        "apply_text_edits",
+        "apply_unified_diff",
+        "write_project_file",
+        "workspace_checkpoint_restore",
+        "save_project_artifact",
+        "import_conversation_files_to_project",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
+        "assign_agent_task",
+        "reconcile_agent_task_coding_run",
+        "heartbeat_agent_task_attempt",
+        "complete_agent_task_attempt",
+        "update_agent_identity",
+        "attach_agent_endpoint",
+        "detach_agent_endpoint",
+        "consume_agent_deliveries",
+        "consume_agent_wake",
+        "coding_agent_cancel",
+        "computer_write_clipboard",
+        "computer_pointer_click",
+        "computer_control",
+        "computer_key_input",
+        "update_session_context",
+        "close_session",
+        "resolve_session_message",
+        "complete_session_message",
+        "cargo_fmt",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} from full operator tools/list"));
+        assert_eq!(
+            tool["annotations"]["destructiveHint"], true,
+            "{name} may replace, restore, delete, or discard existing state"
+        );
+    }
+
+    for name in [
+        "workspace_checkpoint_create",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "computer_save_snapshot",
+        "start_agent_task_attempt",
+        "create_conversation",
+        "post_conversation_message",
+        "post_session_message",
+        "work_on_project",
+        "cargo_check",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} from full operator tools/list"));
+        assert_eq!(
+            tool["annotations"]["destructiveHint"], false,
+            "{name} is intentionally additive-only"
+        );
+    }
+}
+
+#[tokio::test]
 async fn explicit_local_coding_v1_selects_local_coding() {
     let runtime = test_runtime_from_model_surface_env(Some(
         crate::model_surface::MCP_MODEL_SURFACE_LOCAL_CODING_V1,

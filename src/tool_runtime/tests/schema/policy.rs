@@ -414,6 +414,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
     );
 
     for (tool, risk) in [
+        ("cargo_fmt", PERMISSION_RISK_VALIDATION),
         ("cargo_check", PERMISSION_RISK_VALIDATION),
         ("run_process", PERMISSION_RISK_SHELL),
         ("run_script", PERMISSION_RISK_SHELL),
@@ -423,10 +424,36 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("close_session_shell", PERMISSION_RISK_JOB),
         ("delete_project_files", PERMISSION_RISK_DESTRUCTIVE),
         ("save_project_artifact", PERMISSION_RISK_ARTIFACT_WRITE),
+        (
+            "import_conversation_files_to_project",
+            PERMISSION_RISK_ARTIFACT_WRITE,
+        ),
+        ("artifact_upload_finish", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("artifact_upload_abort", PERMISSION_RISK_ARTIFACT_WRITE),
         ("computer_save_snapshot", PERMISSION_RISK_ARTIFACT_WRITE),
         ("apply_patch", PERMISSION_RISK_PATCH),
         ("apply_unified_diff", PERMISSION_RISK_PATCH),
+        ("workspace_checkpoint_restore", PERMISSION_RISK_PATCH),
         ("write_project_file", PERMISSION_RISK_WRITE),
+        ("apply_text_edits", PERMISSION_RISK_WRITE),
+        ("assign_agent_task", PERMISSION_RISK_WRITE),
+        ("reconcile_agent_task_coding_run", PERMISSION_RISK_WRITE),
+        ("heartbeat_agent_task_attempt", PERMISSION_RISK_WRITE),
+        ("complete_agent_task_attempt", PERMISSION_RISK_WRITE),
+        ("update_agent_identity", PERMISSION_RISK_WRITE),
+        ("attach_agent_endpoint", PERMISSION_RISK_WRITE),
+        ("detach_agent_endpoint", PERMISSION_RISK_WRITE),
+        ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
+        ("consume_agent_wake", PERMISSION_RISK_WRITE),
+        ("coding_agent_cancel", PERMISSION_RISK_WRITE),
+        ("computer_write_clipboard", PERMISSION_RISK_WRITE),
+        ("computer_pointer_click", PERMISSION_RISK_WRITE),
+        ("computer_control", PERMISSION_RISK_WRITE),
+        ("computer_key_input", PERMISSION_RISK_WRITE),
+        ("update_session_context", PERMISSION_RISK_WRITE),
+        ("close_session", PERMISSION_RISK_WRITE),
+        ("resolve_session_message", PERMISSION_RISK_WRITE),
+        ("complete_session_message", PERMISSION_RISK_WRITE),
     ] {
         assert_eq!(runtime_tool_permission_risk(tool), risk, "{tool}");
     }
