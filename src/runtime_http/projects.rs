@@ -47,6 +47,11 @@ struct CreateProjectRequest {
     pub allow_existing_empty: bool,
     #[serde(default)]
     pub overwrite: bool,
+    /// Narrow pre-0.4 ingress sentinel. This dedicated endpoint historically
+    /// ignores unrelated unknown fields, so naming only the retired field keeps
+    /// that behavior without introducing a generic compatibility-field bag.
+    #[serde(default, rename = "managed_temporary_project")]
+    pub retired_managed_temporary_project: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +133,18 @@ pub async fn projects_create(req: &mut Request, depot: &mut Depot, res: &mut Res
     let Some(body) = parse_json_body::<CreateProjectRequest>(req, res).await else {
         return;
     };
+    if body.retired_managed_temporary_project.is_some() {
+        render_result(
+            res,
+            &audit,
+            "create_project",
+            None,
+            crate::tool_runtime::ToolResult::err(
+                "invalid arguments for create_project: field 'managed_temporary_project' is no longer supported; use ordinary explicit project creation",
+            ),
+        );
+        return;
+    }
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
         .dispatch_with_auth(
