@@ -8,8 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub(crate) const TOOL_CALL_CONTEXT_REQUEST_FIELD: &str = "context_request";
-pub(crate) const TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD: &str =
-    "__webcodex_stateless_context_request";
+pub(crate) use webcodex_core::workflow_session_contract::TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD;
 pub(crate) const MAX_CONTEXT_REQUEST_ITEMS: usize = 8;
 pub(crate) const MAX_CONTEXT_REQUEST_KEY_CHARS: usize = 64;
 pub(crate) const MAX_CONTEXT_PROJECTION_BYTES: usize = 20 * 1024;
@@ -65,7 +64,7 @@ pub(crate) const CONTEXT_MATERIAL_SPECS: &[ContextMaterialSpec] = &[
         key: "memory.bootstrap",
         project_required: true,
         scope_policy: ContextMaterialScopePolicy::RequireAll(
-            crate::auth::scopes::MEMORY_READ_SCOPES,
+            webcodex_core::authority::MEMORY_READ_SCOPES,
         ),
         surface: ContextMaterialSurface::MemorySurface,
     },
