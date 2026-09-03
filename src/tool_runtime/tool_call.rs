@@ -363,7 +363,7 @@ pub enum ToolCall {
 
     /// Read bounded structured validation evidence already present in an
     /// explicit project-scoped session ledger. Never executes validation,
-    /// shell commands, agent requests, or project file reads.
+    /// shell commands, Runner requests, or project file reads.
     ValidationSummary {
         project: String,
         session_id: String,
@@ -784,7 +784,7 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
-    /// Run `cargo fmt` in an agent-registered Rust project.
+    /// Run `cargo fmt` in a Runner-registered Rust project.
     CargoFmt {
         project: String,
         #[serde(default)]
@@ -797,7 +797,7 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
     },
 
-    /// Run `cargo check` in an agent-registered Rust project.
+    /// Run `cargo check` in a Runner-registered Rust project.
     CargoCheck {
         project: String,
         #[serde(default)]
@@ -818,7 +818,7 @@ pub enum ToolCall {
         timeout_secs: Option<u64>,
     },
 
-    /// Run `cargo test` in an agent-registered Rust project.
+    /// Run `cargo test` in a Runner-registered Rust project.
     CargoTest {
         project: String,
         #[serde(default)]
@@ -1343,10 +1343,10 @@ pub enum ToolCall {
         wait_secs: Option<u64>,
     },
 
-    /// List files in an agent-registered project directory (bounded, read-only).
+    /// List files in a Runner-registered project directory (bounded, read-only).
     /// Returns project-relative paths plus a file/dir kind. Routed to the
-    /// owning registered agent via the `file_list` op; the server never reads
-    /// the agent project path directly.
+    /// owning registered Runner via the `file_list` op; the server never reads
+    /// the Runner project path directly.
     ListProjectFiles {
         project: String,
         #[serde(default)]
@@ -1379,7 +1379,7 @@ pub enum ToolCall {
     },
 
     /// Return a deterministic, bounded, metadata-only overview of an
-    /// agent-registered project. The owning agent scans directory entries;
+    /// Runner-registered project. The owning Runner scans directory entries;
     /// file contents are never read and no LLM is used.
     ProjectOverview {
         project: String,
@@ -1436,7 +1436,7 @@ pub enum ToolCall {
 
     /// Read-only git diff summary for a project: `git status --porcelain`,
     /// `git diff --stat`, and a parsed changed-file list. Does not modify the
-    /// worktree. Routed to the owning agent.
+    /// worktree. Routed to the owning Runner.
     GitDiffSummary {
         project: String,
         #[serde(default)]
@@ -1491,10 +1491,10 @@ pub enum ToolCall {
         wait_secs: Option<u64>,
     },
 
-    /// Write a UTF-8 file in a project via the owning agent. Creates new files
+    /// Write a UTF-8 file in a project via the owning Runner. Creates new files
     /// and, with `overwrite=true` plus the exact current `expected_sha256`,
     /// replaces existing ones without a stale read clobbering concurrent work.
-    /// The server never reads the agent filesystem directly; the write runs as
+    /// The server never reads the Runner filesystem directly; the write runs as
     /// a native agent file operation.
     WriteProjectFile {
         project: String,
@@ -1508,8 +1508,8 @@ pub enum ToolCall {
         expected_sha256: Option<String>,
     },
 
-    /// Write a binary artifact in a project via the owning agent. The payload is
-    /// base64-encoded and decoded by the agent's native artifact file-op path.
+    /// Write a binary artifact in a project via the owning Runner. The payload is
+    /// base64-encoded and decoded by the Runner's native artifact file-op path.
     SaveProjectArtifact {
         project: String,
         path: String,
@@ -1631,7 +1631,7 @@ pub enum ToolCall {
     },
 
     /// Apply a bounded transactional batch of edit/create/delete/rename file
-    /// changes via the owning agent. Every existing input file requires a
+    /// changes via the owning Runner. Every existing input file requires a
     /// sha256 precondition and every change is preflighted before the first
     /// mutation. `dry_run` computes the full plan without writing. Exposed only
     /// through runtime tools / MCP / `callRuntimeTool` (no dedicated OpenAPI
@@ -1663,9 +1663,9 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
-    /// List all agent-registered runtime projects.
+    /// List all Runner-registered runtime Projects.
 
-    /// Probe agent-side language-server availability without starting it.
+    /// Probe Runner-side language-server availability without starting it.
     LspStatus {
         project: String,
         #[serde(default)]
@@ -1943,12 +1943,12 @@ pub enum ToolCall {
     },
 
     /// Register an existing directory as a WebCodex project on a selected
-    /// agent. The agent validates the path against its own policy, writes a
+    /// agent. The Runner validates the path against its own policy, writes a
     /// project registration record `<project_registry_dir>/<id>.toml` atomically, and refreshes its local
-    /// project list. The server refreshes its cached project summaries for
-    /// that agent so `listProjects` sees the new project immediately. This is
-    /// a mutating agent-side operation constrained by agent policy; the server
-    /// never writes project config files on the agent host directly.
+    /// Project list. The Server refreshes its cached Project summaries for
+    /// that Runner so `list_projects` sees the new Project immediately. This is
+    /// a mutating Runner-side operation constrained by Runner policy; the Server
+    /// never writes Project config files on the Runner host directly.
     RegisterProject {
         client_id: String,
         id: String,
@@ -1972,14 +1972,14 @@ pub enum ToolCall {
         expected_revision: String,
     },
 
-    /// Create a new directory on the selected agent and register it as a
-    /// WebCodex project. The agent validates the path against its own policy,
+    /// Create a new directory on the selected Runner and register it as a
+    /// WebCodex project. The Runner validates the path against its own policy,
     /// creates the directory (and optional template files / git init), writes
     /// a project registration record `<project_registry_dir>/<id>.toml` atomically, and refreshes its local
-    /// project list. The server refreshes its cached project summaries so
-    /// `listProjects` sees the new project immediately. This is a mutating
-    /// agent-side operation constrained by agent policy; the server never
-    /// creates directories or writes project config files on the agent host
+    /// Project list. The Server refreshes its cached Project summaries so
+    /// `list_projects` sees the new Project immediately. This is a mutating
+    /// Runner-side operation constrained by Runner policy; the Server never
+    /// creates directories or writes Project config files on the Runner host
     /// directly.
     CreateProject {
         client_id: String,
@@ -2000,8 +2000,8 @@ pub enum ToolCall {
         overwrite: bool,
     },
 
-    /// List connected shell/agent clients.
-    ListAgents {
+    /// List connected Runners.
+    ListRunners {
         #[serde(default)]
         client_id: Option<String>,
         #[serde(default)]
@@ -2016,7 +2016,7 @@ pub enum ToolCall {
     ///
     /// This is a read-only observability tool: it never exposes tokens,
     /// secrets, full env, or stdout/stderr. It returns service metadata,
-    /// project config status, agent client summaries, and job counts.
+    /// Project config status, Runner summaries, and Job counts.
     RuntimeStatus {
         #[serde(default)]
         compact: bool,
@@ -2240,7 +2240,7 @@ fn reject_unknown_targeted_inventory_fields(
 ) -> Result<(), String> {
     let allowed: &[&str] = match tool_name {
         "list_projects" => &["client_id", "project", "query", "limit", "summary_only"],
-        "list_agents" => &[
+        "list_runners" => &[
             "client_id",
             "client_ids",
             "include_projects",
@@ -2310,6 +2310,13 @@ impl ToolCall {
         name: &str,
         arguments: Value,
     ) -> Result<(Self, ToolCallRecorderMetadata), String> {
+        // `list_agents` was the pre-0.4 model-facing name for execution Runners.
+        // Keep one ingress-only compatibility alias without registering a second
+        // ToolDefinition or allowing new discovery surfaces to teach that name.
+        let name = match name {
+            "list_agents" => "list_runners",
+            _ => name,
+        };
         if name == "start_coding_task" {
             return Err(
                 "tool 'start_coding_task' is no longer supported; use 'work_on_project'"
@@ -2380,7 +2387,7 @@ impl ToolCall {
         }
         if matches!(
             name,
-            "list_projects" | "list_agents" | "runtime_status" | "list_jobs"
+            "list_projects" | "list_runners" | "runtime_status" | "list_jobs"
         ) {
             reject_unknown_targeted_inventory_fields(name, &arguments)?;
         }
@@ -2590,7 +2597,7 @@ impl ToolCall {
             Self::RegisterProject { .. } => "register_project",
             Self::UnregisterProject { .. } => "unregister_project",
             Self::CreateProject { .. } => "create_project",
-            Self::ListAgents { .. } => "list_agents",
+            Self::ListRunners { .. } => "list_runners",
             Self::RuntimeStatus { .. } => "runtime_status",
             Self::ReadToolTrace { .. } => "read_tool_trace",
             Self::ToolManifest { .. } => "tool_manifest",

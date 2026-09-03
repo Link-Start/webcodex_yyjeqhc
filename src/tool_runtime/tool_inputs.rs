@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub use webcodex_core::workflow_session_contract::{ExecutionShell, SessionMode};
 
 /// Serde default helper: `true`. Used by `ToolCall` variants whose `allow_patch`
-/// field defaults to true (matching the agent-side project TOML parser).
+/// field defaults to true (matching the Runner-side Project TOML parser).
 pub fn default_true() -> bool {
     true
 }
@@ -72,7 +72,7 @@ pub(crate) fn is_checkpoint_validation_status(value: &str) -> bool {
     CHECKPOINT_VALIDATION_STATUS_VALUES.contains(&value)
 }
 
-// The `apply_text_edits` wire types are shared verbatim with the agent binary,
+// The `apply_text_edits` wire types are shared verbatim with the Runner binary,
 // so they live in `crate::apply_edits_shared` and are re-exported here to keep
 // existing `tool_inputs::Apply*` import paths working.
 pub use crate::apply_edits_shared::{

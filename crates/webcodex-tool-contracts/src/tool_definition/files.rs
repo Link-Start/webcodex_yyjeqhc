@@ -1,4 +1,4 @@
-use super::AgentCapability::{FileRead, Shell};
+use super::RunnerCapabilityRequirement::{FileRead, Shell};
 use super::ToolVisibility::ModelVisible;
 use super::{
     adaptive_runtime_direct, context_recovery_only, def, model_spec, ToolDefinition,
@@ -7,7 +7,7 @@ use super::{
 use crate::metadata::{
     ToolPathHint::{None as NoPath, SinglePath},
     ToolRisk::Read,
-    PROJECT_READ, TOOL_PROVIDER_AGENT,
+    PROJECT_READ, TOOL_PROVIDER_RUNNER,
 };
 use crate::registry::input_schemas::{
     list_project_files_input_schema, list_project_tracked_files_input_schema,
@@ -22,7 +22,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             ModelVisible,
             TOOL_CATEGORY_PROJECT,
             Some(FileRead),
-            TOOL_PROVIDER_AGENT,
+            TOOL_PROVIDER_RUNNER,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Observe,
                 risk: Read,
@@ -44,7 +44,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(FileRead),
-            TOOL_PROVIDER_AGENT,
+            TOOL_PROVIDER_RUNNER,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Observe,
                 risk: Read,
@@ -57,7 +57,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             false,
             false,
         ),
-        "List files in an agent-registered project directory (bounded, read-only). Returns project-relative paths plus a file/dir kind. Routed to the owning registered agent; the server never reads the agent project path directly.",
+        "List files in a Runner-registered project directory (bounded, read-only). Returns project-relative paths plus a file/dir kind. Routed to the owning registered Runner; the server never reads the Runner project path directly.",
         list_project_files_input_schema,
     )),
     context_recovery_only(model_spec(
@@ -65,10 +65,10 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             "list_project_tracked_files",
             ModelVisible,
             TOOL_CATEGORY_FILE,
-            // Runs `git ls-files` on the agent, so the shell capability is what
-            // the agent must actually hold — not FileRead's directory op.
+            // Runs `git ls-files` on the Runner, so the shell capability is what
+            // the Runner must actually hold — not FileRead's directory op.
             Some(Shell),
-            TOOL_PROVIDER_AGENT,
+            TOOL_PROVIDER_RUNNER,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Observe,
                 risk: Read,
@@ -90,7 +90,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(Shell),
-            TOOL_PROVIDER_AGENT,
+            TOOL_PROVIDER_RUNNER,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Observe,
                 risk: Read,
@@ -113,7 +113,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
                 ModelVisible,
                 TOOL_CATEGORY_FILE,
                 Some(Shell),
-                TOOL_PROVIDER_AGENT,
+                TOOL_PROVIDER_RUNNER,
                 super::ToolSemanticContract {
                     effect: super::ToolEffect::Observe,
                     risk: Read,
@@ -140,7 +140,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
             ModelVisible,
             TOOL_CATEGORY_FILE,
             Some(FileRead),
-            TOOL_PROVIDER_AGENT,
+            TOOL_PROVIDER_RUNNER,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Observe,
                 risk: Read,
@@ -163,7 +163,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
                 ModelVisible,
                 TOOL_CATEGORY_FILE,
                 Some(FileRead),
-                TOOL_PROVIDER_AGENT,
+                TOOL_PROVIDER_RUNNER,
                 super::ToolSemanticContract {
                     effect: super::ToolEffect::Observe,
                     risk: Read,

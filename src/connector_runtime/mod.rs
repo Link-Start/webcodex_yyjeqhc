@@ -1,7 +1,7 @@
 //! Project-bound application layer for hosted chat connectors.
 //!
 //! The connector exposes a deliberately small coding workflow while reusing
-//! ToolRuntime for execution policy, agent ownership, and permission gates.
+//! ToolRuntime for execution policy, Runner ownership, and permission gates.
 //! It owns project/task context, so model-visible calls never carry the legacy
 //! executor project id or workflow-session state.
 
@@ -295,7 +295,7 @@ impl ConnectorRuntime {
             return Some(self.observed_readiness(RemoteProbe::ProjectMissing));
         };
         let access = crate::shell_client::runner_access_from_auth(Some(auth));
-        let Some(agent) = self
+        let Some(runner) = self
             .tools
             .shell_clients
             .get_client_semantic_view_for_auth(client_id, access.as_ref())
@@ -303,10 +303,10 @@ impl ConnectorRuntime {
         else {
             return Some(self.observed_readiness(RemoteProbe::RunnerOffline));
         };
-        if agent.view.status != "online" || !agent.view.connected {
+        if runner.view.status != "online" || !runner.view.connected {
             return Some(self.observed_readiness(RemoteProbe::RunnerOffline));
         }
-        if !agent
+        if !runner
             .view
             .projects
             .iter()
@@ -314,16 +314,16 @@ impl ConnectorRuntime {
         {
             return Some(self.observed_readiness(RemoteProbe::ProjectMissing));
         }
-        if !(agent.supports(RunnerFeature::Shell)
-            && agent.supports(RunnerFeature::FileRead)
-            && agent.supports(RunnerFeature::FileWrite)
-            && agent.supports(RunnerFeature::Jobs)
-            && agent.supports(RunnerFeature::AsyncJobs)
-            && agent.supports(RunnerFeature::AsyncShellJobs))
+        if !(runner.supports(RunnerFeature::Shell)
+            && runner.supports(RunnerFeature::FileRead)
+            && runner.supports(RunnerFeature::FileWrite)
+            && runner.supports(RunnerFeature::Jobs)
+            && runner.supports(RunnerFeature::AsyncJobs)
+            && runner.supports(RunnerFeature::AsyncShellJobs))
         {
             return Some(self.observed_readiness(RemoteProbe::RequiredCapabilityMissing));
         }
-        if !agent.supports(RunnerFeature::StructuredValidationArgv) {
+        if !runner.supports(RunnerFeature::StructuredValidationArgv) {
             return Some(self.observed_readiness(RemoteProbe::StructuredValidationMissing));
         }
         Some(self.observed_readiness(RemoteProbe::Ready))
@@ -2102,10 +2102,10 @@ impl ConnectorRuntime {
                     return ConnectorCallOutcome::error_for_task(
                         409,
                         "structured_validation_unavailable",
-                        "the selected local Agent does not support structured validation jobs",
+                        "the selected local Runner does not support structured validation jobs",
                         false,
                         true,
-                        Some("Upgrade and reconnect the WebCodex Agent, then retry checks_run."),
+                        Some("Upgrade and reconnect the WebCodex Runner, then retry checks_run."),
                         &task,
                         json!({
                             "required_capability":
@@ -2131,10 +2131,10 @@ impl ConnectorRuntime {
                         return ConnectorCallOutcome::error_for_task(
                             409,
                             "structured_go_test_json_unavailable",
-                            "the selected local Agent does not support machine-readable Go test validation",
+                            "the selected local Runner does not support machine-readable Go test validation",
                             false,
                             true,
-                            Some("Upgrade and reconnect the WebCodex Agent, then retry checks_run."),
+                            Some("Upgrade and reconnect the WebCodex Runner, then retry checks_run."),
                             &task,
                             json!({
                                 "required_capability":
@@ -3425,20 +3425,20 @@ impl ConnectorRuntime {
             json!("Human guidance from the project owner — adjust course before continuing.");
     }
 
-    /// Host-side entry: the read-only devices view. Reuses the list_agents
+    /// Host-side entry: the read-only devices view. Reuses the list_runners
     /// projection (connection, transport, last_seen, capabilities, provider
     /// health) under the caller's own visibility rules.
-    /// Agent clients this caller may see, or `None` for principals entitled to
+    /// Runner clients this caller may see, or `None` for principals entitled to
     /// host-global visibility.
     ///
     /// Shares its source with [`Self::host_devices`] on purpose: the devices
-    /// panel and the activity ledger must never disagree about which agents
+    /// panel and the activity ledger must never disagree about which Runners
     /// exist for a given caller.
     /// What this caller may read from the activity ledger: the durable scope
-    /// its rows must carry, plus the agent clients it can currently see.
+    /// its rows must carry, plus the Runner clients it can currently see.
     ///
     /// The client list shares its source with [`Self::host_devices`] so the
-    /// devices panel and the ledger agree about which agents exist. It is a
+    /// devices panel and the ledger agree about which Runners exist. It is a
     /// display filter within the scope, though — never the authorization
     /// boundary, which is the grant recorded on each row.
     pub(crate) async fn activity_visibility<'a>(
@@ -3470,7 +3470,7 @@ impl ConnectorRuntime {
     }
 
     pub(crate) async fn host_devices(&self, auth: &AuthContext) -> crate::tool_runtime::ToolResult {
-        self.tools.list_agents(Some(auth)).await
+        self.tools.list_runners(Some(auth)).await
     }
 
     /// Host-side entry: record a human guidance message on a task. Delivered

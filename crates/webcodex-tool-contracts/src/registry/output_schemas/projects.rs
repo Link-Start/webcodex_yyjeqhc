@@ -19,42 +19,42 @@ fn register_project_fields() -> Vec<(&'static str, Value)> {
             "id",
             schema_type(
                 "string",
-                "Project onboarding result metadata for registration or create-and-register responses. Runtime project id assigned after the agent registers the project. The schema does not bypass authorization, permission, allowed-root, or agent path policy and does not expose environment, token, or secret values.",
+                "Project onboarding result metadata for registration or create-and-register responses. Runtime Project id assigned after the Runner registers the Project. The schema does not bypass authorization, permission, allowed-root, or Runner path policy and does not expose environment, token, or secret values.",
             ),
         ),
         (
             "agent_project_id",
             schema_type(
                 "string",
-                "Project onboarding result metadata for registration or create-and-register responses. Agent-local project id written into the project registry.",
+                "Project onboarding result metadata for registration or create-and-register responses. Runner-local project id written into the project registry.",
             ),
         ),
         (
             "client_id",
             schema_type(
                 "string",
-                "Project onboarding result metadata for registration or create-and-register responses. Agent client id that handled the request.",
+                "Project onboarding result metadata for registration or create-and-register responses. Runner client id that handled the request.",
             ),
         ),
         (
             "name",
             schema_type(
                 "string",
-                "Project onboarding result metadata for registration or create-and-register responses. Project display name returned by the agent.",
+                "Project onboarding result metadata for registration or create-and-register responses. Project display name returned by the Runner.",
             ),
         ),
         (
             "path",
             schema_type(
                 "string",
-                "Project onboarding result metadata path for the registered project directory; not file content, not a permission grant, and not a bypass of agent path policy.",
+                "Project onboarding result metadata path for the registered Project directory; not file content, not a permission grant, and not a bypass of Runner path policy.",
             ),
         ),
         (
             "description",
             nullable_schema(
                 "string",
-                "Project onboarding result metadata for registration or create-and-register responses. Optional project description returned by the agent, or null.",
+                "Project onboarding result metadata for registration or create-and-register responses. Optional project description returned by the Runner, or null.",
             ),
         ),
         (
@@ -89,7 +89,7 @@ fn register_project_fields() -> Vec<(&'static str, Value)> {
             "allow_patch",
             schema_type(
                 "boolean",
-                "Project onboarding result metadata for registration or create-and-register responses. Patch permission flag recorded in the agent project config; this schema does not change permission behavior or allow arbitrary project writes and does not include file content.",
+                "Project onboarding result metadata for registration or create-and-register responses. Patch permission flag recorded in the Runner project config; this schema does not change permission behavior or allow arbitrary project writes and does not include file content.",
             ),
         ),
     ]
