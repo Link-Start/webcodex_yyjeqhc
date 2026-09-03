@@ -1,11 +1,14 @@
-use super::workspace::{LocalResultDecision, WorkspaceManager};
-use super::{ConnectorContext, ConnectorRuntime};
-use crate::db::{ConnectorBinding, ConnectorTaskStoreError, NewConnectorResult, NewConnectorTask};
-use crate::Database;
+use crate::workspace::{LocalResultDecision, WorkspaceManager};
+use crate::{ConnectorContext, ConnectorRuntime};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
+use webcodex_runner_registry::RunnerRegistry;
+use webcodex_store::{
+    ConnectorBinding, ConnectorTaskResult, ConnectorTaskStoreError, Database, NewConnectorResult,
+    NewConnectorTask,
+};
 
 const TASK_ID: &str = "wc_task_f123456789abcdef0123456789abcdef";
 const RESULT_ID: &str = "wc_result_f123456789abcdef";
@@ -23,7 +26,7 @@ impl Fixture {
         result_id: Option<&str>,
         decision: LocalResultDecision,
         now: i64,
-    ) -> Result<crate::db::ConnectorTaskResult, ConnectorTaskStoreError> {
+    ) -> Result<ConnectorTaskResult, ConnectorTaskStoreError> {
         decide(&self.db, &self.context, result_id, decision, now)
     }
 }
@@ -134,7 +137,7 @@ fn decide(
     result_id: Option<&str>,
     decision: LocalResultDecision,
     now: i64,
-) -> Result<crate::db::ConnectorTaskResult, ConnectorTaskStoreError> {
+) -> Result<ConnectorTaskResult, ConnectorTaskStoreError> {
     WorkspaceManager::decide_connector_result_local(
         db,
         &context.project_id,
@@ -149,7 +152,7 @@ fn decide(
 }
 
 fn assert_decision_error(
-    result: Result<crate::db::ConnectorTaskResult, ConnectorTaskStoreError>,
+    result: Result<ConnectorTaskResult, ConnectorTaskStoreError>,
     expected: &str,
 ) {
     assert!(matches!(
@@ -176,15 +179,7 @@ fn reopen_runtime(
     context: ConnectorContext,
     db: Arc<Database>,
 ) -> Result<ConnectorRuntime, String> {
-    let registry = Arc::new(crate::shell_client::ShellClientRegistry::default());
-    let tools =
-        Arc::new(crate::tool_runtime::ToolRuntime::new_for_tests_with_shell_clients(registry));
-    let credential = crate::auth::ProjectCredentialVerifier::new(
-        context.project_grant_id.clone(),
-        "webcodex_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    )
-    .unwrap();
-    ConnectorRuntime::new(tools, db, context, credential)
+    ConnectorRuntime::new(Arc::new(RunnerRegistry::default()), db, context)
 }
 
 #[test]
@@ -709,7 +704,7 @@ fn rejected_cleanup_can_be_retried() {
 
 #[test]
 fn validate_path_rejects_parent_traversal() {
-    use super::validate_path;
+    use crate::projections::validate_path;
 
     // Leading `/` and NUL were already rejected. Parent traversal was not, so a
     // connector-surface path could resolve outside the granted project once the

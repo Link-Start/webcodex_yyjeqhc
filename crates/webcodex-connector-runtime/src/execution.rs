@@ -3,19 +3,19 @@
 mod monitor;
 
 use super::workspace;
-use crate::auth::AuthContext;
-use crate::db::{
-    ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionObservation,
-    ConnectorExecutionReservation, ConnectorTaskSnapshot, ConnectorTaskStoreError,
-};
-use crate::shell_protocol::ShellJobValidationStep;
-use crate::tool_runtime::ToolRuntime;
-use crate::Database;
+use crate::{ConnectorExecutionHost, ConnectorJobHostError, ConnectorJobRequest};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
+use webcodex_core::shell_protocol::ShellJobValidationStep;
+use webcodex_runner_registry::{RunnerAccess, RunnerRegistry};
+use webcodex_store::Database;
+use webcodex_store::{
+    ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionObservation,
+    ConnectorExecutionReservation, ConnectorTaskSnapshot, ConnectorTaskStoreError,
+};
 
 const DEFAULT_YIELD_MS: u64 = 8_000;
 const CANCEL_YIELD_MS: u64 = 5_000;
@@ -75,7 +75,7 @@ impl ExecutionAttachGate {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionService {
-    tools: Arc<ToolRuntime>,
+    runner_registry: Arc<RunnerRegistry>,
     db: Arc<Database>,
     workspace: workspace::WorkspaceManager,
     yield_ms: u64,
@@ -96,12 +96,12 @@ pub(crate) struct ReviewState {
 
 impl ExecutionService {
     pub(crate) fn new(
-        tools: Arc<ToolRuntime>,
+        runner_registry: Arc<RunnerRegistry>,
         db: Arc<Database>,
         workspace: workspace::WorkspaceManager,
     ) -> Self {
         Self {
-            tools,
+            runner_registry,
             db,
             workspace,
             yield_ms: DEFAULT_YIELD_MS,
@@ -190,13 +190,19 @@ impl ExecutionService {
         command: String,
         cwd: Option<String>,
         timeout_secs: u64,
-        auth: AuthContext,
+        host: Arc<dyn ConnectorExecutionHost>,
+        runner_access: RunnerAccess,
         validation_steps: Vec<ShellJobValidationStep>,
     ) -> Result<ConnectorExecution, ConnectorTaskStoreError> {
         let execution = match reservation {
             ConnectorExecutionReservation::Existing(execution) => {
                 if execution.is_active() && execution.executor_reference.is_some() {
-                    self.spawn_monitor(task.clone(), execution.execution_id.clone(), auth.clone());
+                    self.spawn_monitor(
+                        task.clone(),
+                        execution.execution_id.clone(),
+                        host.clone(),
+                        runner_access.clone(),
+                    );
                 }
                 return self
                     .wait_for_terminal_or_arm_continuation(&execution.execution_id, self.yield_ms)
@@ -212,33 +218,39 @@ impl ExecutionService {
         if execution.state != "starting" {
             return Ok(execution);
         }
-        let result = self
-            .tools
-            .run_job_for_auth(
-                task.execution_executor_ref.clone(),
+        let submission = match host
+            .start_execution_job(ConnectorJobRequest {
+                project: task.execution_executor_ref.clone(),
                 command,
-                None,
-                Some(timeout_secs as i64),
+                timeout_secs,
                 cwd,
                 validation_steps,
-                Some(&auth),
-            )
-            .await;
-        if !result.success {
-            return self.db.finish_connector_execution(
-                &execution.execution_id,
-                ConnectorExecutionFailure::Submission("executor_rejected"),
-                chrono::Utc::now().timestamp(),
-            );
-        }
-        let Some(job_id) = result.output["job_id"].as_str() else {
-            return self.db.finish_connector_execution(
-                &execution.execution_id,
-                ConnectorExecutionFailure::Submission("execution_adapter_error"),
-                chrono::Utc::now().timestamp(),
-            );
+            })
+            .await
+        {
+            Ok(submission) => submission,
+            Err(ConnectorJobHostError::Rejected(_)) => {
+                return self.db.finish_connector_execution(
+                    &execution.execution_id,
+                    ConnectorExecutionFailure::Submission("executor_rejected"),
+                    chrono::Utc::now().timestamp(),
+                )
+            }
+            Err(ConnectorJobHostError::Adapter(_)) => {
+                return self.db.finish_connector_execution(
+                    &execution.execution_id,
+                    ConnectorExecutionFailure::Submission("execution_adapter_error"),
+                    chrono::Utc::now().timestamp(),
+                )
+            }
+            Err(ConnectorJobHostError::OutcomeUnknown(_)) => {
+                return self.db.finish_connector_execution(
+                    &execution.execution_id,
+                    ConnectorExecutionFailure::Unknown("submission_transport_unknown"),
+                    chrono::Utc::now().timestamp(),
+                )
+            }
         };
-        let status = result.output["status"].as_str().unwrap_or("queued");
         #[cfg(test)]
         if let Some(gate) = &self.attach_gate {
             gate.created.wait().await;
@@ -246,12 +258,12 @@ impl ExecutionService {
         }
         let attached = self.db.attach_connector_executor(
             &execution.execution_id,
-            job_id,
-            status,
+            &submission.job_id,
+            &submission.status,
             chrono::Utc::now().timestamp(),
         )?;
         if attached.state == "cancel_requested"
-            && self.dispatch_cancel(&task, &attached, &auth).await == CancelDispatch::Failed
+            && self.dispatch_cancel(&task, &attached, host.as_ref()).await == CancelDispatch::Failed
         {
             return self.db.finish_connector_execution(
                 &execution.execution_id,
@@ -262,7 +274,7 @@ impl ExecutionService {
         if attached.is_terminal() {
             return Ok(attached);
         }
-        self.spawn_monitor(task, execution.execution_id.clone(), auth);
+        self.spawn_monitor(task, execution.execution_id.clone(), host, runner_access);
         self.wait_for_terminal_or_arm_continuation(&execution.execution_id, self.yield_ms)
             .await
     }
@@ -271,7 +283,8 @@ impl ExecutionService {
         &self,
         task: ConnectorTaskSnapshot,
         reason: Option<&str>,
-        auth: AuthContext,
+        host: Arc<dyn ConnectorExecutionHost>,
+        runner_access: RunnerAccess,
     ) -> Result<Option<ConnectorExecution>, ConnectorTaskStoreError> {
         let requested = self.db.request_connector_execution_cancel(
             &task,
@@ -286,10 +299,12 @@ impl ExecutionService {
             self.release_cancelled_workspace(task).await;
             return Ok(Some(execution));
         }
-        match self.dispatch_cancel(&task, &execution, &auth).await {
+        match self.dispatch_cancel(&task, &execution, host.as_ref()).await {
             CancelDispatch::ReferencePending => return Ok(Some(execution)),
             CancelDispatch::Failed => {
-                if let Some(output_tail) = self.bounded_output_tail(&execution, &auth).await {
+                if let Some(output_tail) =
+                    self.bounded_output_tail(&execution, &runner_access).await
+                {
                     let _ = self.db.record_connector_mcp_task_output_tail(
                         &execution.execution_id,
                         &output_tail,
@@ -302,7 +317,12 @@ impl ExecutionService {
                 )?;
             }
             CancelDispatch::Sent => {
-                self.spawn_monitor(task.clone(), execution.execution_id.clone(), auth);
+                self.spawn_monitor(
+                    task.clone(),
+                    execution.execution_id.clone(),
+                    host,
+                    runner_access,
+                );
                 execution = self
                     .wait_for_terminal(&execution.execution_id, CANCEL_YIELD_MS)
                     .await?;
@@ -443,13 +463,19 @@ impl ExecutionService {
     pub(super) async fn bounded_output_tail(
         &self,
         execution: &ConnectorExecution,
-        auth: &AuthContext,
+        runner_access: &RunnerAccess,
     ) -> Option<Value> {
         let job_id = execution.executor_reference.as_deref()?;
-        let access = crate::shell_client::runner_access_from_auth(Some(auth));
-        self.tools
-            .shell_clients
-            .job_log_for_auth(access.as_ref(), job_id, None, None, Some(200), None, None)
+        self.runner_registry
+            .job_log_for_auth(
+                Some(runner_access),
+                job_id,
+                None,
+                None,
+                Some(200),
+                None,
+                None,
+            )
             .await
             .ok()
             .map(|(_, stdout, stderr, _, _, _)| {
@@ -464,11 +490,11 @@ impl ExecutionService {
     pub(crate) async fn projection(
         &self,
         execution: &ConnectorExecution,
-        auth: &AuthContext,
+        runner_access: &RunnerAccess,
         include_output_tail: bool,
     ) -> Value {
         let output_tail = if include_output_tail {
-            self.bounded_output_tail(execution, auth).await
+            self.bounded_output_tail(execution, runner_access).await
         } else {
             None
         };
@@ -576,78 +602,6 @@ fn recipe_projection(execution: &ConnectorExecution) -> Value {
     })
 }
 
-pub(super) fn durable_assertion_evidence(
-    check: &str,
-    recipe_identity: Option<&Value>,
-    exit_code: Option<i32>,
-    stdout: &str,
-    stderr: &str,
-) -> Value {
-    use crate::tool_runtime::validation_parser::{PARSER_KIND, PARSER_VERSION};
-    use crate::tool_runtime::validation_profile::{
-        validation_adapter_for_tool, ValidationFailureEvidence,
-    };
-
-    let tool = recipe_identity.and_then(|identity| {
-        let checks = identity.get("semantic_checks")?.as_array()?;
-        let index = checks.iter().position(|candidate| candidate == check)?;
-        identity
-            .get("tool_identities")?
-            .as_array()?
-            .get(index)?
-            .as_str()
-    });
-    let (failure_kind, diagnostics) = tool
-        .and_then(validation_adapter_for_tool)
-        .map(|adapter| {
-            let diagnostics = adapter.parse(stdout, stderr, true);
-            let failure_kind = adapter.map_failure_kind(ValidationFailureEvidence {
-                success: false,
-                reported_failure_kind: Some("command_exit_nonzero"),
-                exit_code: exit_code.map(i64::from),
-                diagnostics: Some(&diagnostics),
-                stdout_excerpt: stdout,
-                stderr_excerpt: stderr,
-            });
-            (failure_kind, Some(diagnostics))
-        })
-        .unwrap_or(("process_exit", None));
-    let parser = diagnostics.as_ref().map(|_| PARSER_KIND);
-    let parser_version = diagnostics.as_ref().map(|_| PARSER_VERSION);
-    let mut evidence = json!({
-        "failed_check": check,
-        "failure_kind": failure_kind,
-        "exit_code": exit_code,
-        "parser": parser,
-        "parser_version": parser_version,
-        "diagnostics": diagnostics
-    });
-    sanitize_evidence(&mut evidence);
-    if serde_json::to_vec(&evidence)
-        .is_ok_and(|bytes| bytes.len() <= crate::db::MAX_ASSERTION_EVIDENCE_BYTES)
-    {
-        evidence
-    } else {
-        json!({
-            "failed_check": check,
-            "failure_kind": failure_kind,
-            "exit_code": exit_code,
-            "parser": parser,
-            "parser_version": parser_version,
-            "diagnostics": null
-        })
-    }
-}
-
-fn sanitize_evidence(value: &mut Value) {
-    match value {
-        Value::String(text) => *text = crate::validation_bridge::sanitize_bridge_text(text),
-        Value::Array(items) => items.iter_mut().for_each(sanitize_evidence),
-        Value::Object(fields) => fields.values_mut().for_each(sanitize_evidence),
-        _ => {}
-    }
-}
-
 fn assertion_status(execution: &ConnectorExecution) -> &'static str {
     if execution.kind != "check" {
         return "not_run";
@@ -722,4 +676,343 @@ fn execution_signature(
             execution.first_status_failure_at,
         )
     })
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::{
+        ConnectorHostFuture, ConnectorJobSubmission, ConnectorProjectRegistration,
+        ConnectorToolFailure, ConnectorToolRequest, ConnectorValidationEvidenceRequest,
+        ConnectorValidationPlan, ConnectorValidationPlanError, ConnectorValidationPlanRequest,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use webcodex_store::{ConnectorBinding, NewConnectorTask};
+
+    #[derive(Default)]
+    struct TestHost {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        stop_unknown: AtomicBool,
+    }
+
+    impl ConnectorExecutionHost for TestHost {
+        fn invoke_tool(
+            &self,
+            _request: ConnectorToolRequest,
+        ) -> ConnectorHostFuture<'_, Result<Value, ConnectorToolFailure>> {
+            Box::pin(async { Ok(json!({})) })
+        }
+
+        fn register_isolated_project(
+            &self,
+            _request: ConnectorProjectRegistration,
+        ) -> ConnectorHostFuture<'_, Result<(), ConnectorJobHostError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start_execution_job(
+            &self,
+            _request: ConnectorJobRequest,
+        ) -> ConnectorHostFuture<'_, Result<ConnectorJobSubmission, ConnectorJobHostError>>
+        {
+            let number = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                Ok(ConnectorJobSubmission {
+                    job_id: format!("job-{number}"),
+                    status: "running".to_string(),
+                })
+            })
+        }
+
+        fn stop_execution_job(
+            &self,
+            _project: String,
+            _job_id: String,
+        ) -> ConnectorHostFuture<'_, Result<(), ConnectorJobHostError>> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            let unknown = self.stop_unknown.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if unknown {
+                    Err(ConnectorJobHostError::OutcomeUnknown(Some(
+                        "transport uncertain".to_string(),
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn plan_validation(
+            &self,
+            _request: ConnectorValidationPlanRequest,
+        ) -> Result<ConnectorValidationPlan, ConnectorValidationPlanError> {
+            Err(ConnectorValidationPlanError {
+                code: "not_used".to_string(),
+                details: None,
+            })
+        }
+
+        fn validation_failure_evidence(
+            &self,
+            _request: ConnectorValidationEvidenceRequest,
+        ) -> Value {
+            Value::Null
+        }
+    }
+
+    struct ServiceFixture {
+        _temp: tempfile::TempDir,
+        db: Arc<Database>,
+        task: ConnectorTaskSnapshot,
+        service: ExecutionService,
+        access: RunnerAccess,
+    }
+
+    fn fixture() -> ServiceFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let db = Arc::new(Database::open(&temp.path().join("connector.db")).unwrap());
+        db.ensure_connector_binding(ConnectorBinding {
+            project_id: "wc_proj_1234567890",
+            project_name: "project",
+            workspace_id: "wc_ws_1234567890",
+            executor_ref: "agent:hosted:project",
+            subject_id: "project:wc_pgrant_1111111111111111",
+            profile: "personal",
+            now: 1,
+        })
+        .unwrap();
+        let root = project.to_string_lossy().into_owned();
+        let task = db
+            .start_connector_task(NewConnectorTask {
+                task_id: "wc_task_0123456789abcdef0123456789abcdef",
+                run_id: "wc_run_0123456789abcdef0123456789abcdef",
+                project_id: "wc_proj_1234567890",
+                workspace_id: "wc_ws_1234567890",
+                subject_id: "project:wc_pgrant_1111111111111111",
+                goal: "execution test",
+                mode: "read_only",
+                target_executor_ref: "agent:hosted:project",
+                execution_executor_ref: "agent:hosted:project",
+                target_root: &root,
+                execution_root: &root,
+                baseline_commit: None,
+                baseline_tree: None,
+                isolated: false,
+                now: 2,
+            })
+            .unwrap();
+        let context = crate::ConnectorContext {
+            project_id: "wc_proj_1234567890".to_string(),
+            project_name: "project".to_string(),
+            workspace_id: "wc_ws_1234567890".to_string(),
+            executor_project: "agent:hosted:project".to_string(),
+            executor_root: root,
+            runs_root: temp.path().join("runs").to_string_lossy().into_owned(),
+            results_root: temp.path().join("results").to_string_lossy().into_owned(),
+            project_registry_dir: temp
+                .path()
+                .join("agent/project-registry")
+                .to_string_lossy()
+                .into_owned(),
+            profile: "personal".to_string(),
+            project_grant_id: "wc_pgrant_1111111111111111".to_string(),
+        };
+        let workspace = workspace::WorkspaceManager::new(&context).unwrap();
+        let service =
+            ExecutionService::new(Arc::new(RunnerRegistry::default()), db.clone(), workspace);
+        ServiceFixture {
+            _temp: temp,
+            db,
+            task,
+            service,
+            access: RunnerAccess {
+                global_visibility: false,
+                owner_bypass: false,
+                username: Some("owner".to_string()),
+                group: None,
+            },
+        }
+    }
+
+    fn reserve(fx: &ServiceFixture, operation_id: &str) -> ConnectorExecutionReservation {
+        fx.service
+            .reserve(
+                &fx.task,
+                "command",
+                operation_id,
+                &format!("hash-{operation_id}"),
+                &[],
+                None,
+                None,
+                30,
+                3,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_before_executor_reference_stays_reference_pending() {
+        let fx = fixture();
+        let reservation = reserve(&fx, "pending-cancel");
+        let execution = match reservation {
+            ConnectorExecutionReservation::Created(execution) => fx
+                .db
+                .start_connector_execution(&execution.execution_id, 4)
+                .unwrap(),
+            _ => panic!("fresh operation must create"),
+        };
+        assert!(execution.executor_reference.is_none());
+        let host = Arc::new(TestHost::default());
+        let cancelled = fx
+            .service
+            .cancel_task(fx.task.clone(), None, host.clone(), fx.access.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, "cancel_requested");
+        assert!(cancelled.executor_reference.is_none());
+        assert_eq!(host.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn late_attach_after_cancel_dispatches_exact_compensating_stop() {
+        let mut fx = fixture();
+        let gate = Arc::new(ExecutionAttachGate::new());
+        fx.service = fx
+            .service
+            .clone()
+            .with_yield_ms(5)
+            .with_monitor_timing(100, 5)
+            .with_attach_gate(gate.clone());
+        let host = Arc::new(TestHost::default());
+        let reservation = reserve(&fx, "late-attach");
+        let service = fx.service.clone();
+        let task = fx.task.clone();
+        let access = fx.access.clone();
+        let host_for_execute = host.clone();
+        let execute = tokio::spawn(async move {
+            service
+                .execute(
+                    reservation,
+                    task,
+                    "echo hi".to_string(),
+                    None,
+                    30,
+                    host_for_execute,
+                    access,
+                    Vec::new(),
+                )
+                .await
+        });
+        gate.wait_until_job_created().await;
+        let pending = fx
+            .service
+            .cancel_task(fx.task.clone(), None, host.clone(), fx.access.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, "cancel_requested");
+        assert!(pending.executor_reference.is_none());
+        assert_eq!(host.stops.load(Ordering::SeqCst), 0);
+        gate.release_attach().await;
+        let returned = execute.await.unwrap().unwrap();
+        let durable = fx.db.connector_execution(&returned.execution_id).unwrap();
+        assert_eq!(durable.executor_reference.as_deref(), Some("job-1"));
+        assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+        assert!((1..=2).contains(&host.stops.load(Ordering::SeqCst)));
+        assert_eq!(fx.service.monitor_start_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_of_active_execution_does_not_start_a_second_monitor_or_job() {
+        let mut fx = fixture();
+        fx.service = fx
+            .service
+            .clone()
+            .with_yield_ms(5)
+            .with_monitor_timing(500, 5);
+        let host = Arc::new(TestHost::default());
+        let first = fx
+            .service
+            .execute(
+                reserve(&fx, "one-monitor"),
+                fx.task.clone(),
+                "echo hi".to_string(),
+                None,
+                30,
+                host.clone(),
+                fx.access.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(first.is_active());
+        assert_eq!(fx.service.monitor_start_count(), 1);
+        let retry = fx
+            .service
+            .reserve(
+                &fx.task,
+                "command",
+                "one-monitor",
+                "hash-one-monitor",
+                &[],
+                None,
+                None,
+                30,
+                5,
+            )
+            .unwrap();
+        let _ = fx
+            .service
+            .execute(
+                retry,
+                fx.task.clone(),
+                "echo hi".to_string(),
+                None,
+                30,
+                host.clone(),
+                fx.access.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fx.service.monitor_start_count(), 1);
+        assert_eq!(fx.service.active_monitor_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_transport_uncertainty_becomes_unknown_not_success() {
+        let fx = fixture();
+        let reservation = reserve(&fx, "stop-unknown");
+        let execution = match reservation {
+            ConnectorExecutionReservation::Created(execution) => fx
+                .db
+                .start_connector_execution(&execution.execution_id, 4)
+                .unwrap(),
+            _ => panic!("fresh operation must create"),
+        };
+        let attached = fx
+            .db
+            .attach_connector_executor(&execution.execution_id, "job-stop", "running", 5)
+            .unwrap();
+        assert_eq!(attached.state, "running");
+        let host = Arc::new(TestHost::default());
+        host.stop_unknown.store(true, Ordering::SeqCst);
+        let cancelled = fx
+            .service
+            .cancel_task(fx.task.clone(), None, host, fx.access.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, "unknown");
+        assert_eq!(
+            cancelled.failure_code.as_deref(),
+            Some("cancel_transport_unknown")
+        );
+        assert!(cancelled.blocks_finish());
+    }
 }

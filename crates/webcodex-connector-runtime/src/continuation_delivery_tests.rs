@@ -1,7 +1,8 @@
 use super::execution::execution_projection;
-use super::{ConnectorBinding, ConnectorExecutionReservation, NewConnectorTask};
-use crate::db::ConnectorExecutionObservation;
-use crate::Database;
+use webcodex_store::{
+    ConnectorBinding, ConnectorExecutionObservation, ConnectorExecutionReservation, Database,
+    NewConnectorTask,
+};
 
 #[test]
 fn model_execution_projection_never_exposes_terminal_continuation_claim_fence() {
