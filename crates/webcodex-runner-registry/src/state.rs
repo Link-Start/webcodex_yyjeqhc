@@ -1,19 +1,20 @@
-use super::auth::ShellClientAuthGroup;
-use super::{AcceptedRunnerProtocol, AgentTransport, RunnerFeature, RunnerFeatureSet};
-use crate::mcp_gateway::McpGatewayResponse;
-use crate::shell_protocol::{
-    AgentBuildInfo, AgentHostContext, AgentPolicySummary, PersistentShellResult,
-    ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientView, ShellCommandExecutionState,
-    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobValidationProgress,
-    ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
-};
+use super::{AgentTransport, RunnerFeature, RunnerFeatureSet};
+use crate::protocol::AcceptedRunnerProtocol;
+use crate::RunnerAccessGroup;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch, Notify};
 use webcodex_core::coding_agent::{
     CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
+};
+use webcodex_core::mcp_gateway::McpGatewayResponse;
+use webcodex_core::shell_protocol::{
+    AgentBuildInfo, AgentHostContext, AgentPolicySummary, PersistentShellResult,
+    ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientView, ShellCommandExecutionState,
+    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobValidationProgress,
+    ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
 };
 
 #[derive(Debug, Clone)]
@@ -74,7 +75,7 @@ pub(super) struct ShellClientRecord {
     pub(super) policy: Option<AgentPolicySummary>,
     /// Lightweight quick-start isolation group captured at registration. This
     /// is intentionally not exposed in `ShellClientView`.
-    pub(super) auth_group: Option<ShellClientAuthGroup>,
+    pub(super) auth_group: Option<RunnerAccessGroup>,
     /// When the current agent instance first registered under this client_id.
     /// Preserved across same-instance re-registrations (transport reconnects).
     pub(super) registered_at: i64,
@@ -115,18 +116,18 @@ pub(super) struct ShellClientRecord {
 /// feature decisions use the canonical set cloned from the same registry lock.
 /// This type is never serialized or exposed through the wire protocol.
 #[derive(Debug, Clone)]
-pub(crate) struct ShellClientSemanticView {
-    pub(crate) view: ShellClientView,
+pub struct ShellClientSemanticView {
+    pub view: ShellClientView,
     pub(super) runner_features: RunnerFeatureSet,
 }
 
 impl ShellClientSemanticView {
-    pub(crate) fn supports(&self, feature: RunnerFeature) -> bool {
+    pub fn supports(&self, feature: RunnerFeature) -> bool {
         self.runner_features.supports(feature)
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_public_view_for_test(view: ShellClientView) -> Self {
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn from_public_view_for_test(view: ShellClientView) -> Self {
         let runner_features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
         Self {
             view,
@@ -238,7 +239,7 @@ pub(super) struct CodingAgentDispatchFence {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ShellJobVisibility {
+pub enum ShellJobVisibility {
     #[default]
     Public,
     HiddenUntilHandoff,
@@ -270,7 +271,7 @@ pub(super) struct ShellJobRecord {
     /// Shared-key runners store only the existing key hash group, never the
     /// plaintext key. Keeping this on the Job preserves authorization after
     /// the originating client registration is removed.
-    pub(super) auth_group: Option<ShellClientAuthGroup>,
+    pub(super) auth_group: Option<RunnerAccessGroup>,
     /// Internal lease owner. Never exposed through public job tools.
     pub(super) agent_instance_id: String,
     pub(super) kind: String,
@@ -304,7 +305,7 @@ pub(super) struct ShellJobRecord {
     pub(super) structured_execution: Option<ShellJobStructuredExecutionMetadata>,
     pub(super) codex: Option<ShellJobCodexMetadata>,
     pub(super) validation_steps: Vec<String>,
-    pub(super) validation: Option<crate::shell_protocol::ShellJobValidationMetadata>,
+    pub(super) validation: Option<webcodex_core::shell_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
     pub(super) visibility: ShellJobVisibility,
     pub(super) last_update_seq: u64,

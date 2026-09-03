@@ -30,11 +30,18 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
     let managed_pat = auth_context(Some("alice"), false);
     let open = open_auth_context();
     let bootstrap = auth_context(None, true);
+    let shared_a_access = runner_access_from_auth(Some(&shared_a)).unwrap();
+    let shared_b_access = runner_access_from_auth(Some(&shared_b)).unwrap();
+    let bridge_a_access = runner_access_from_auth(Some(&bridge_a)).unwrap();
+    let managed_oauth_access = runner_access_from_auth(Some(&managed_oauth)).unwrap();
+    let managed_pat_access = runner_access_from_auth(Some(&managed_pat)).unwrap();
+    let open_access = runner_access_from_auth(Some(&open)).unwrap();
+    let bootstrap_access = runner_access_from_auth(Some(&bootstrap)).unwrap();
 
     for (client_id, auth) in [
-        ("shared-a", &shared_a),
-        ("shared-b", &shared_b),
-        ("open", &open),
+        ("shared-a", &shared_a_access),
+        ("shared-b", &shared_b_access),
+        ("open", &open_access),
     ] {
         registry
             .register_with_auth(
@@ -95,67 +102,69 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
     }
 
     let visible_to_a: Vec<String> = registry
-        .list_clients_for_auth(Some(&shared_a))
+        .list_clients_for_auth(Some(&shared_a_access))
         .await
         .into_iter()
         .map(|c| c.client_id)
         .collect();
     assert_eq!(visible_to_a, vec!["shared-a"]);
     let visible_to_bridge_a: Vec<String> = registry
-        .list_clients_for_auth(Some(&bridge_a))
+        .list_clients_for_auth(Some(&bridge_a_access))
         .await
         .into_iter()
         .map(|c| c.client_id)
         .collect();
     assert_eq!(visible_to_bridge_a, vec!["shared-a"]);
     assert!(registry
-        .assert_client_access(Some(&shared_a), "shared-a")
+        .assert_client_access(Some(&shared_a_access), "shared-a")
         .await
         .is_ok());
     assert!(registry
-        .assert_client_access(Some(&bridge_a), "shared-a")
+        .assert_client_access(Some(&bridge_a_access), "shared-a")
         .await
         .is_ok());
     assert!(registry
-        .assert_client_access(Some(&shared_a), "shared-b")
+        .assert_client_access(Some(&shared_a_access), "shared-b")
         .await
         .unwrap_err()
         .contains("unknown shell client"));
     assert!(registry
-        .assert_client_access(Some(&shared_a), "open")
+        .assert_client_access(Some(&shared_a_access), "open")
         .await
         .unwrap_err()
         .contains("unknown shell client"));
     assert!(registry
-        .assert_client_access(Some(&bridge_a), "shared-b")
+        .assert_client_access(Some(&bridge_a_access), "shared-b")
         .await
         .unwrap_err()
         .contains("unknown shell client"));
     assert!(registry
-        .assert_client_access(Some(&bridge_a), "open")
+        .assert_client_access(Some(&bridge_a_access), "open")
         .await
         .unwrap_err()
         .contains("unknown shell client"));
 
     let visible_to_open: Vec<String> = registry
-        .list_clients_for_auth(Some(&open))
+        .list_clients_for_auth(Some(&open_access))
         .await
         .into_iter()
         .map(|c| c.client_id)
         .collect();
     assert_eq!(visible_to_open, vec!["open"]);
     assert_eq!(
-        ShellClientAuthGroup::from_auth(&open),
-        Some(ShellClientAuthGroup::OpenAnonymous)
+        open_access.group,
+        Some(webcodex_runner_registry::RunnerAccessGroup::OpenAnonymous)
     );
     assert_eq!(
-        ShellClientAuthGroup::from_auth(&bridge_a),
-        Some(ShellClientAuthGroup::SharedKey(shared_hash))
+        bridge_a_access.group,
+        Some(webcodex_runner_registry::RunnerAccessGroup::SharedKey(
+            shared_hash
+        ))
     );
     assert!(bridge_a.is_oauth_shared_key_subject());
-    assert_eq!(ShellClientAuthGroup::from_auth(&managed_oauth), None);
+    assert_eq!(managed_oauth_access.group, None);
     assert!(!managed_oauth.is_oauth_shared_key_subject());
-    for managed_auth in [&managed_oauth, &managed_pat] {
+    for managed_auth in [&managed_oauth_access, &managed_pat_access] {
         let visible: Vec<String> = registry
             .list_clients_for_auth(Some(managed_auth))
             .await
@@ -180,7 +189,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
     }
 
     let visible_to_bootstrap: Vec<String> = registry
-        .list_clients_for_auth(Some(&bootstrap))
+        .list_clients_for_auth(Some(&bootstrap_access))
         .await
         .into_iter()
         .map(|c| c.client_id)
@@ -199,11 +208,69 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
 }
 
 #[tokio::test]
+async fn non_bootstrap_admin_keeps_global_visibility_without_owner_bypass() {
+    let registry = ShellClientRegistry::default();
+    registry
+        .register(ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            client_id: "bob-runner".to_string(),
+            agent_instance_id: "inst-bob".to_string(),
+            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: Some("bob".to_string()),
+            hostname: None,
+            host_context: None,
+            capabilities: async_job_capabilities(),
+            policy: None,
+        })
+        .await
+        .unwrap();
+
+    let mut admin = auth_context(Some("alice"), false);
+    admin.scopes.push(crate::auth::SCOPE_ADMIN.to_string());
+    let admin_access = runner_access_from_auth(Some(&admin)).unwrap();
+    assert!(admin_access.global_visibility);
+    assert!(!admin_access.owner_bypass);
+    assert_eq!(
+        registry
+            .list_clients_for_auth(Some(&admin_access))
+            .await
+            .into_iter()
+            .map(|client| client.client_id)
+            .collect::<Vec<_>>(),
+        vec!["bob-runner"]
+    );
+    let error = registry
+        .assert_client_access(Some(&admin_access), "bob-runner")
+        .await
+        .unwrap_err();
+    assert!(error.contains("owned by bob"), "{error}");
+    assert!(error.contains("belongs to alice"), "{error}");
+
+    let bootstrap = auth_context(None, true);
+    let bootstrap_access = runner_access_from_auth(Some(&bootstrap)).unwrap();
+    assert!(bootstrap_access.global_visibility);
+    assert!(bootstrap_access.owner_bypass);
+    assert!(registry
+        .assert_client_access(Some(&bootstrap_access), "bob-runner")
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
 async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
     let registry = ShellClientRegistry::default();
     let alice = auth_context(Some("alice"), false);
     let bob = auth_context(Some("bob"), false);
     let bootstrap = auth_context(None, true);
+    let alice_access = runner_access_from_auth(Some(&alice)).unwrap();
+    let bob_access = runner_access_from_auth(Some(&bob)).unwrap();
+    let bootstrap_access = runner_access_from_auth(Some(&bootstrap)).unwrap();
 
     for (client_id, owner, run_id) in [
         ("alice-runner", "alice", "wc_agent_run_alice"),
@@ -261,23 +328,27 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
     }
 
     assert!(registry
-        .coding_agent_run_for_client_for_auth(Some(&alice), "alice-runner", "wc_agent_run_alice",)
+        .coding_agent_run_for_client_for_auth(
+            Some(&alice_access),
+            "alice-runner",
+            "wc_agent_run_alice",
+        )
         .await
         .is_some());
     assert!(registry
-        .coding_agent_run_for_client_for_auth(Some(&alice), "bob-runner", "wc_agent_run_bob")
+        .coding_agent_run_for_client_for_auth(Some(&alice_access), "bob-runner", "wc_agent_run_bob")
         .await
         .is_none());
     assert!(registry
-        .coding_agent_run_for_auth(Some(&alice), "wc_agent_run_bob")
+        .coding_agent_run_for_auth(Some(&alice_access), "wc_agent_run_bob")
         .await
         .is_none());
     assert!(registry
-        .coding_agent_run_for_auth(Some(&bob), "wc_agent_run_alice")
+        .coding_agent_run_for_auth(Some(&bob_access), "wc_agent_run_alice")
         .await
         .is_none());
     assert!(registry
-        .coding_agent_run_for_auth(Some(&bootstrap), "wc_agent_run_bob")
+        .coding_agent_run_for_auth(Some(&bootstrap_access), "wc_agent_run_bob")
         .await
         .is_some());
 }
@@ -289,6 +360,8 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
     let registry = ShellClientRegistry::default();
     let grant_a = crate::auth::shared_key::project_credential_context("wc_pgrant_aaaaaaaaaaaaaaaa");
     let grant_b = crate::auth::shared_key::project_credential_context("wc_pgrant_bbbbbbbbbbbbbbbb");
+    let grant_a_access = runner_access_from_auth(Some(&grant_a)).unwrap();
+    let grant_b_access = runner_access_from_auth(Some(&grant_b)).unwrap();
     let registration = |hostname: &str| ShellClientRegisterRequest {
         process_started_at: None,
         build: None,
@@ -307,7 +380,7 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
         policy: None,
     };
     registry
-        .register_with_auth(registration("grant-a-host"), Some(&grant_a))
+        .register_with_auth(registration("grant-a-host"), Some(&grant_a_access))
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
@@ -319,18 +392,18 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
     .await;
 
     let error = registry
-        .register_with_auth(registration("grant-b-host"), Some(&grant_b))
+        .register_with_auth(registration("grant-b-host"), Some(&grant_b_access))
         .await
         .unwrap_err();
     assert!(!error.contains("grant-a-host"));
     assert!(!error.contains("grant-a-project"));
     let original = registry
-        .get_client_view_for_auth("same-project-agent", Some(&grant_a))
+        .get_client_view_for_auth("same-project-agent", Some(&grant_a_access))
         .await
         .expect("the original grant must retain its lease");
     assert_eq!(original.hostname.as_deref(), Some("grant-a-host"));
     assert!(registry
-        .get_client_view_for_auth("same-project-agent", Some(&grant_b))
+        .get_client_view_for_auth("same-project-agent", Some(&grant_b_access))
         .await
         .is_none());
 }
@@ -351,6 +424,10 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
         ],
     );
     let bootstrap = auth_context(None, true);
+    let shared_a_access = runner_access_from_auth(Some(&shared_a)).unwrap();
+    let shared_b_access = runner_access_from_auth(Some(&shared_b)).unwrap();
+    let managed_access = runner_access_from_auth(Some(&managed)).unwrap();
+    let bootstrap_access = runner_access_from_auth(Some(&bootstrap)).unwrap();
     let registration = |client_id: &str, instance: &str, hostname: &str, owner: Option<&str>| {
         ShellClientRegisterRequest {
             process_started_at: None,
@@ -374,7 +451,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     registry
         .register_streaming_session(
             registration("shared-client", "shared-instance", "host-a", None),
-            Some(&shared_a),
+            Some(&shared_a_access),
             "connection-a",
             AgentTransport::WebSocket,
             Arc::new(Notify::new()),
@@ -389,7 +466,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
                 "managed-host",
                 Some("managed"),
             ),
-            Some(&managed),
+            Some(&managed_access),
             "managed-connection",
             AgentTransport::WebSocket,
             Arc::new(Notify::new()),
@@ -400,7 +477,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     let collision = registry
         .register_streaming_session(
             registration("shared-client", "shared-instance", "host-b", None),
-            Some(&shared_b),
+            Some(&shared_b_access),
             "connection-b",
             AgentTransport::WebSocket,
             Arc::new(Notify::new()),
@@ -411,7 +488,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     assert!(!collision.contains("host-a"));
     assert_eq!(
         registry
-            .get_client_view_for_auth("shared-client", Some(&shared_a))
+            .get_client_view_for_auth("shared-client", Some(&shared_a_access))
             .await
             .unwrap()
             .hostname
@@ -420,19 +497,19 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
         "cross-group collision must not refresh or replace the original record"
     );
     assert!(registry
-        .get_client_view_for_auth("shared-client", Some(&shared_b))
+        .get_client_view_for_auth("shared-client", Some(&shared_b_access))
         .await
         .is_none());
     assert!(registry
-        .get_client_view_for_auth("shared-client", Some(&managed))
+        .get_client_view_for_auth("shared-client", Some(&managed_access))
         .await
         .is_none());
     assert!(registry
-        .get_client_view_for_auth("managed-client", Some(&shared_a))
+        .get_client_view_for_auth("managed-client", Some(&shared_a_access))
         .await
         .is_none());
     assert!(registry
-        .get_client_view_for_auth("shared-client", Some(&bootstrap))
+        .get_client_view_for_auth("shared-client", Some(&bootstrap_access))
         .await
         .is_some());
 
@@ -441,7 +518,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     registry
         .register_streaming_session(
             registration("shared-client", "shared-instance", "host-a-new", None),
-            Some(&shared_a),
+            Some(&shared_a_access),
             "connection-new",
             AgentTransport::WebSocket,
             Arc::new(Notify::new()),

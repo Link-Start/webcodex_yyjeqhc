@@ -1,17 +1,20 @@
-use super::auth::assert_shell_client_access;
+use super::access_control::assert_runner_access as assert_shell_client_access;
 use super::project_inventory::reconcile_dynamic_projection;
-#[cfg(test)]
+#[cfg(any(test, feature = "root-test-support"))]
 use super::validation::validate_id;
 use super::validation::validate_project_summary;
-use super::{RunnerFeatureSet, ShellClientRegistry};
-use crate::shell_protocol::ShellAgentProjectSummary;
+use super::{RunnerFeatureSet, RunnerRegistry};
+#[cfg(test)]
 use std::fmt;
+use webcodex_core::shell_protocol::ShellAgentProjectSummary;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShellClientLookupError {
     UnknownClient { client_id: String },
 }
 
+#[cfg(test)]
 impl fmt::Display for ShellClientLookupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -22,6 +25,7 @@ impl fmt::Display for ShellClientLookupError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for ShellClientLookupError {}
 
 fn upsert_project_summary(
@@ -37,23 +41,20 @@ fn upsert_project_summary(
     }
 }
 
-impl ShellClientRegistry {
+impl RunnerRegistry {
     /// Return an immutable clone of the canonical feature truth for one
     /// registered Runner. This is an internal semantic query, never a wire
     /// projection.
-    pub(crate) async fn get_client_feature_set(
+    pub async fn get_client_feature_set(
         &self,
         client_id: &str,
-    ) -> Result<RunnerFeatureSet, ShellClientLookupError> {
+    ) -> Result<RunnerFeatureSet, String> {
         self.prune_expired_shared_key_clients().await;
         let inner = self.inner.lock().await;
-        let client =
-            inner
-                .clients
-                .get(client_id)
-                .ok_or_else(|| ShellClientLookupError::UnknownClient {
-                    client_id: client_id.to_string(),
-                })?;
+        let client = inner
+            .clients
+            .get(client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
         Ok(client.runner_features.clone())
     }
 
@@ -87,11 +88,11 @@ impl ShellClientRegistry {
         Ok(client.runner_features.supports_wire_name(capability))
     }
 
-    pub(crate) async fn client_supports_for_auth(
+    pub async fn client_supports_for_auth(
         &self,
         client_id: &str,
         capability: &str,
-        auth: Option<&crate::auth::AuthContext>,
+        auth: Option<&crate::RunnerAccess>,
     ) -> Result<bool, String> {
         self.prune_expired_shared_key_clients().await;
         let inner = self.inner.lock().await;
@@ -104,7 +105,7 @@ impl ShellClientRegistry {
     }
 
     /// Test-only accessor for projects registered to a shell client.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "root-test-support"))]
     pub async fn list_client_projects(
         &self,
         client_id: &str,
@@ -143,7 +144,7 @@ impl ShellClientRegistry {
             ));
         }
         upsert_project_summary(&mut client.projects, project);
-        reconcile_dynamic_projection(client, super::now_ts());
+        reconcile_dynamic_projection(client, crate::registry::now_ts());
         Ok(())
     }
 
@@ -166,7 +167,7 @@ impl ShellClientRegistry {
         let before = client.projects.len();
         client.projects.retain(|project| project.id != project_id);
         let changed = client.projects.len() != before;
-        reconcile_dynamic_projection(client, super::now_ts());
+        reconcile_dynamic_projection(client, crate::registry::now_ts());
         Ok(changed)
     }
 

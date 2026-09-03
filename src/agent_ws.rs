@@ -117,11 +117,12 @@ async fn handle_agent_ws(
 
     // 2. Commit the complete streaming session in one registry transaction.
     //    Transport identity comes from this handler, not the raw protocol label.
+    let access = crate::shell_client::runner_access_from_auth(auth.as_ref());
     let notify = Arc::new(Notify::new());
     let (view, cancel) = match registry
         .register_streaming_session_with_cancel(
             register_payload,
-            auth.as_ref(),
+            access.as_ref(),
             &connection_id,
             AgentTransport::WebSocket,
             notify.clone(),
@@ -577,11 +578,17 @@ mod tests {
         let auth_a = crate::auth::shared_key::shared_key_context("shared-key-a");
         let auth_b = crate::auth::shared_key::shared_key_context("shared-key-b");
         assert!(registry
-            .get_client_view_for_auth("shared-a", Some(&auth_a))
+            .get_client_view_for_auth(
+                "shared-a",
+                Some(&crate::test_support::runner_access(&auth_a))
+            )
             .await
             .is_some());
         assert!(registry
-            .get_client_view_for_auth("shared-a", Some(&auth_b))
+            .get_client_view_for_auth(
+                "shared-a",
+                Some(&crate::test_support::runner_access(&auth_b))
+            )
             .await
             .is_none());
 

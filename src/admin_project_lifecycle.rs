@@ -250,6 +250,7 @@ impl AdminProjectLifecycleService {
     ) -> Result<ServiceResponse, ServiceResponse> {
         validate_revision(expected_revision)?;
         let (client_id, project_id) = parse_runtime_project(target)?;
+        let access = crate::shell_client::runner_access_from_auth(auth);
         // Authenticated ordinary-runtime callers keep the explicit Runner owner/access
         // fence used by the HTTP unregister path. `auth=None` is the trusted in-process
         // / open-runtime path: visibility is intentionally unfiltered there, matching
@@ -258,13 +259,13 @@ impl AdminProjectLifecycleService {
         if require_owner_access && auth.is_some() {
             runtime
                 .shell_clients
-                .assert_client_access(auth, &client_id)
+                .assert_client_access(access.as_ref(), &client_id)
                 .await
                 .map_err(|_| api_error(503, "agent_unavailable"))?;
         }
         let client = runtime
             .shell_clients
-            .get_client_semantic_view_for_auth(&client_id, auth)
+            .get_client_semantic_view_for_auth(&client_id, access.as_ref())
             .await
             .ok_or_else(|| api_error(503, "agent_unavailable"))?;
         if !client.view.connected || client.view.status != "online" {
@@ -280,7 +281,7 @@ impl AdminProjectLifecycleService {
         let (active_jobs, _unregister_fence) = if action == "unregister" {
             let active = runtime
                 .shell_clients
-                .begin_project_unregister(auth, target)
+                .begin_project_unregister(access.as_ref(), target)
                 .await
                 .map_err(|_| api_error(500, "operation_failed"))?;
             if active > 0 {
@@ -300,7 +301,7 @@ impl AdminProjectLifecycleService {
             (
                 runtime
                     .shell_clients
-                    .count_active_jobs_for_project(auth, target)
+                    .count_active_jobs_for_project(access.as_ref(), target)
                     .await,
                 None,
             )
@@ -610,9 +611,10 @@ async fn require_online_client(
     auth: &AuthContext,
     client_id: &str,
 ) -> Result<(), ServiceResponse> {
+    let access = crate::shell_client::runner_access_from_auth(Some(auth));
     let client = runtime
         .shell_clients
-        .get_client_view_for_auth(client_id, Some(auth))
+        .get_client_view_for_auth(client_id, access.as_ref())
         .await
         .ok_or_else(|| api_error(503, "agent_unavailable"))?;
     if !client.connected || client.status != "online" {
@@ -914,26 +916,29 @@ mod tests {
 
         let alice = user_auth("alice");
         let bob = user_auth("bob");
+        let alice_access = crate::test_support::runner_access(&alice);
+        let bob_access = crate::test_support::runner_access(&bob);
         registry
-            .start_job_with_metadata_for_auth(
+            .start_job_with_metadata_for_access(
                 active_job_request("owned-runner", "sleep 60"),
                 "alice".to_string(),
                 ShellJobStartMetadata {
                     project_id: Some(target.to_string()),
                     ..Default::default()
                 },
-                Some(&alice),
+                Some(&alice_access),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(
             registry
-                .count_active_jobs_for_project(Some(&alice), target)
+                .count_active_jobs_for_project(Some(&alice_access), target)
                 .await,
             1
         );
         assert_eq!(
-            registry.count_active_jobs_for_project(Some(&bob), target).await,
+            registry.count_active_jobs_for_project(Some(&bob_access), target).await,
             0,
             "the regression requires the cross-owner principal to be unable to see the owner's active Job"
         );
@@ -955,20 +960,21 @@ mod tests {
         assert_eq!(response.body["error"]["code"], "agent_unavailable");
 
         registry
-            .start_job_with_metadata_for_auth(
+            .start_job_with_metadata_for_access(
                 active_job_request("owned-runner", "echo still-allowed"),
                 "alice".to_string(),
                 ShellJobStartMetadata {
                     project_id: Some(target.to_string()),
                     ..Default::default()
                 },
-                Some(&alice),
+                Some(&alice_access),
+                None,
             )
             .await
             .expect("rejected cross-owner unregister must not leave an unregister fence behind");
         assert_eq!(
             registry
-                .begin_project_unregister(Some(&alice), target)
+                .begin_project_unregister(Some(&alice_access), target)
                 .await
                 .unwrap(),
             2,

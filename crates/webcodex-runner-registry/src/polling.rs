@@ -4,25 +4,25 @@ use super::jobs::{
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
 use super::validation::{validate_agent_instance_id, validate_id};
-use super::{now_ts, RunnerFeature, ShellClientRegistry};
-use crate::mcp_gateway::{
-    validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayResponse,
-};
-use crate::shell_protocol::{
-    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
-    ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
-};
+use super::{now_ts, RunnerFeature, RunnerRegistry};
 use webcodex_core::coding_agent::{
     validate_response_for_request as validate_coding_agent_response, CodingAgentDispatchState,
     CodingAgentResponse,
 };
+use webcodex_core::mcp_gateway::{
+    validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayResponse,
+};
+use webcodex_core::shell_protocol::{
+    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
+    ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
+};
 
-impl ShellClientRegistry {
+impl RunnerRegistry {
     /// Polling-transport entry point. Polling registrations do not carry a
     /// server-internal `connection_id`, so this requires only the public
     /// `client_id` / `agent_instance_id` lease. The HTTP `/poll` handler uses
     /// this path; long-lived transports (WebSocket/QUIC) use
-    /// [`ShellClientRegistry::poll_for_connection`] instead so an older
+    /// [`RunnerRegistry::poll_for_connection`] instead so an older
     /// same-instance connection cannot steal requests from the current lease.
     pub async fn poll(
         &self,
@@ -36,7 +36,7 @@ impl ShellClientRegistry {
     /// so a stale same-instance connection (whose lease was replaced by a
     /// reconnect) is rejected before it can dequeue a request that belongs to
     /// the new connection.
-    pub(crate) async fn poll_for_connection(
+    pub async fn poll_for_connection(
         &self,
         body: ShellAgentPollRequest,
         connection_id: &str,
@@ -402,7 +402,7 @@ impl ShellClientRegistry {
     /// agent instance and is gated by request/job ownership — but it must
     /// not refresh the new connection's `last_seen` liveness. Only the
     /// connection that currently holds the lease refreshes liveness.
-    pub(crate) async fn complete_for_connection(
+    pub async fn complete_for_connection(
         &self,
         payload: ShellAgentResultPayload,
         connection_id: &str,
@@ -453,7 +453,8 @@ impl ShellClientRegistry {
         if pending.request.mcp_gateway.is_none() && payload.mcp_gateway.is_some() {
             return Err("unexpected MCP gateway result for non-bridge request".to_string());
         }
-        crate::tool_request_trace::capture_runner_result(&body.request_id, &payload);
+        self.telemetry
+            .runner_result_accepted(&body.request_id, &payload);
         let trace_request_id = body.request_id.clone();
         let ShellAgentResultPayload {
             result: body,
@@ -498,7 +499,7 @@ impl ShellClientRegistry {
             if let Some(waiter) = waiter {
                 let _ = waiter.send(response);
             }
-            crate::tool_request_trace::finalize_runner_result_correlation(&trace_request_id);
+            self.telemetry.runner_result_finalized(&trace_request_id);
             return Ok(());
         }
         if pending.request.coding_agent.is_some() {
@@ -544,7 +545,7 @@ impl ShellClientRegistry {
             if let Some(waiter) = waiter {
                 let _ = waiter.send(response);
             }
-            crate::tool_request_trace::finalize_runner_result_correlation(&trace_request_id);
+            self.telemetry.runner_result_finalized(&trace_request_id);
             return Ok(());
         }
         let request_id = body.request_id.clone();
@@ -553,7 +554,7 @@ impl ShellClientRegistry {
         let stdout = if is_large_native_image_request(&pending.request) {
             truncate_output_to(
                 body.stdout,
-                crate::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
+                webcodex_core::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
             )
         } else {
             truncate_output(body.stdout)
@@ -603,12 +604,10 @@ impl ShellClientRegistry {
             let _ = waiter.send(response);
         }
         if let Some(job_id) = terminal_job_id.as_deref() {
-            crate::tool_request_trace::finalize_runner_job_correlation(
-                Some(&trace_request_id),
-                job_id,
-            );
+            self.telemetry
+                .runner_job_finalized(Some(&trace_request_id), job_id);
         } else {
-            crate::tool_request_trace::finalize_runner_result_correlation(&trace_request_id);
+            self.telemetry.runner_result_finalized(&trace_request_id);
         }
         Ok(())
     }
@@ -620,7 +619,7 @@ impl ShellClientRegistry {
         self.complete_persistent_shell_checked(body, None).await
     }
 
-    pub(crate) async fn complete_persistent_shell_for_connection(
+    pub async fn complete_persistent_shell_for_connection(
         &self,
         body: ShellAgentPersistentShellResultRequest,
         connection_id: &str,
@@ -681,7 +680,7 @@ impl ShellClientRegistry {
 }
 
 fn normalize_persistent_shell_result(
-    result: &mut crate::shell_protocol::PersistentShellResult,
+    result: &mut webcodex_core::shell_protocol::PersistentShellResult,
 ) -> Result<(), String> {
     validate_id(&result.shell_id, "shell_id")?;
     validate_id(&result.workflow_session_id, "workflow_session_id")?;
@@ -724,10 +723,10 @@ fn normalize_persistent_shell_result(
 }
 
 fn truncate_persistent_shell_stream(value: &mut String) -> bool {
-    if value.len() <= super::MAX_OUTPUT_BYTES {
+    if value.len() <= crate::registry::MAX_OUTPUT_BYTES {
         return false;
     }
-    let mut start = value.len() - super::MAX_OUTPUT_BYTES;
+    let mut start = value.len() - crate::registry::MAX_OUTPUT_BYTES;
     while start < value.len() && !value.is_char_boundary(start) {
         start += 1;
     }

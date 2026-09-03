@@ -1,4 +1,3 @@
-use super::auth::ShellClientAuthGroup;
 use super::jobs::{
     command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
     notify_job_update, observe_job_terminal, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
@@ -7,14 +6,15 @@ use super::state::{
     ShellClientRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility,
 };
 use super::validation::validate_id;
-use super::{job_recovery_grace_secs, ShellClientRegistry};
-use crate::shell_protocol::{
+use super::{job_recovery_grace_secs, RunnerRegistry};
+use crate::RunnerAccessGroup;
+use std::collections::HashSet;
+use webcodex_core::shell_protocol::{
     ShellAgentProjectSummary, ShellCommandExecutionState, ShellJobInventory, ShellJobSnapshot,
     ShellJobStreamSnapshot, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS,
     JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
 };
-use std::collections::HashSet;
 
 const MAX_CONTEXT_FIELD_CHARS: usize = 1_024;
 const MAX_SNAPSHOT_ERROR_CHARS: usize = 4_096;
@@ -136,7 +136,7 @@ fn validate_context(
         .workflow_session_id
         .as_deref()
         .is_some_and(|session_id| {
-            !crate::tool_runtime::sessions::is_valid_session_id(session_id)
+            !webcodex_workflow_session::is_valid_session_id(session_id)
                 || session_id.chars().count() > 128
         })
     {
@@ -557,7 +557,7 @@ fn remove_job_control_requests(
 fn record_from_snapshot(
     client_id: &str,
     agent_instance_id: &str,
-    auth_group: Option<ShellClientAuthGroup>,
+    auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
     snapshot: &ShellJobSnapshot,
     now: i64,
@@ -669,7 +669,7 @@ fn prune_projected_structured_terminal_suppressions_locked(
     }
 }
 
-impl ShellClientRegistry {
+impl RunnerRegistry {
     fn prune_expired_terminal_jobs_locked(
         &self,
         inner: &mut ShellClientRegistryInner,
@@ -846,9 +846,9 @@ pub(super) fn expire_recovering_jobs_locked(
 /// otherwise leave it in `recovering` forever. Pure in-memory: holds the
 /// registry mutex only for bounded HashMap work (capped by
 /// [`RECOVERY_SWEEP_PASS_CAP`]) and never awaits under it.
-pub(crate) async fn recovery_timeout_sweep(registry: &ShellClientRegistry) {
+pub async fn recovery_timeout_sweep(registry: &RunnerRegistry) {
     registry.process_hidden_cleanup_intents().await;
-    let now = crate::shell_client::now_ts();
+    let now = crate::registry::now_ts();
     let mut inner = registry.inner.lock().await;
     registry.prune_expired_shared_key_clients_locked(&mut inner, now);
     prune_projected_structured_terminal_suppressions_locked(&mut inner, now);
@@ -870,7 +870,7 @@ pub(super) fn reconcile_inventory_locked(
     inner: &mut ShellClientRegistryInner,
     client_id: &str,
     agent_instance_id: &str,
-    auth_group: Option<ShellClientAuthGroup>,
+    auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
     inventory: &ShellJobInventory,
     now: i64,
