@@ -2713,6 +2713,238 @@ fn current_evidence_validation_started_before_new_attempt_does_not_enter_new_att
 }
 
 #[test]
+fn validation_job_terminal_inherits_public_failure_expectation() {
+    let store = SessionStore::default();
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), None);
+    let job_id = "job_expected_negative_validation";
+    let target = "target:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_check",
+        &json!({
+            "project": project,
+            "result_expectation": "failure"
+        }),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "job_id": job_id,
+            "job_status": "running",
+            "promoted_to_job": true,
+            "execution_state": "running",
+            "command_started": true,
+            "command_completed": false,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_truncated": false,
+            "stderr_truncated": false
+        }),
+        None,
+        None,
+    );
+
+    assert!(store.record_validation_job_terminal(
+        &session.session_id,
+        job_id,
+        &[job_id],
+        "cargo_check",
+        Some(project.to_string()),
+        target,
+        None,
+        "failed",
+        Some(101),
+        Some(false),
+        Some(100),
+        Some(110),
+        Some(10_000),
+        None,
+    ));
+
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    let terminal = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "validation_job_terminal")
+        .expect("materialized terminal validation event");
+    assert_eq!(terminal.status.as_deref(), Some("failed"));
+    assert_eq!(terminal.exit_code, Some(101));
+    assert_eq!(terminal.result_expectation.as_deref(), Some("failure"));
+    assert_eq!(
+        terminal.failure_expectation_result.as_deref(),
+        Some("matched_expected_failure")
+    );
+
+    let validation = validation_summary_for_session(&summary);
+    assert_eq!(validation["status"], "expected");
+    assert_eq!(validation["latest_status"], "expected");
+    assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], false);
+    assert_eq!(validation["latest"]["expectation_satisfied"], true);
+    assert_eq!(validation["expected_results"], 1);
+    assert_eq!(validation["latest"]["exit_code"], 101);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+}
+
+#[test]
+fn validation_job_terminal_inherits_expectation_beyond_default_summary_window() {
+    let store = SessionStore::default();
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), None);
+    let job_id = "job_expected_negative_validation_deep_history";
+    let target = "target:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let start = store.record_tool_call_started(
+        Some(&session.session_id),
+        SessionTransport::Api,
+        "cargo_check",
+        &json!({
+            "project": project,
+            "result_expectation": "failure"
+        }),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "job_id": job_id,
+            "job_status": "running",
+            "promoted_to_job": true,
+            "execution_state": "running",
+            "command_started": true,
+            "command_completed": false,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_truncated": false,
+            "stderr_truncated": false
+        }),
+        None,
+        None,
+    );
+
+    // Keep the Job admission inside the retained 200-event ledger while
+    // pushing it outside the public/default 50-event Session summary window.
+    for index in 0..30 {
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "read_file",
+            json!({"project": project, "path": format!("src/noise-{index}.rs")}),
+            true,
+            json!({}),
+        );
+    }
+
+    assert!(store.record_validation_job_terminal(
+        &session.session_id,
+        job_id,
+        &[job_id],
+        "cargo_check",
+        Some(project.to_string()),
+        target,
+        None,
+        "failed",
+        Some(101),
+        Some(false),
+        Some(100),
+        Some(110),
+        Some(10_000),
+        None,
+    ));
+
+    let summary = store.summary(&session.session_id, Some(200)).unwrap();
+    let terminal = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "validation_job_terminal")
+        .expect("materialized terminal validation event");
+    assert_eq!(terminal.result_expectation.as_deref(), Some("failure"));
+    assert_eq!(
+        terminal.failure_expectation_result.as_deref(),
+        Some("matched_expected_failure")
+    );
+    let validation = validation_summary_for_session(&summary);
+    assert_eq!(validation["status"], "expected");
+    assert_eq!(validation["latest_status"], "expected");
+    assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], false);
+    assert_eq!(validation["latest"]["expectation_satisfied"], true);
+    assert_eq!(validation["expected_results"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+}
+
+#[test]
+fn expected_observation_failure_does_not_resolve_prior_same_identity_validation_failure() {
+    let store = SessionStore::default();
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), None);
+    let assertion_name = "same regression remains failing";
+    let failed_output = json!({
+        "exit_code": 1,
+        "failure_kind": "command_exit_nonzero",
+        "command_started": true,
+        "command_completed": true,
+        "execution_state": "completed"
+    });
+
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "run_process",
+        json!({
+            "project": project,
+            "purpose": "test",
+            "assertion_name": assertion_name
+        }),
+        false,
+        failed_output.clone(),
+    );
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "run_process",
+        json!({
+            "project": project,
+            "purpose": "test",
+            "assertion_name": assertion_name,
+            "result_expectation": "observe"
+        }),
+        false,
+        failed_output,
+    );
+
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&summary);
+    assert_eq!(validation["events_total"], 2);
+    assert_eq!(validation["successes"], 0);
+    assert_eq!(validation["failures"], 1);
+    assert_eq!(validation["expected_results"], 1);
+    assert_eq!(validation["status"], "failed");
+    assert_eq!(validation["latest_status"], "expected");
+    assert_eq!(validation["historical_failures"]["count"], 1);
+    assert_eq!(validation["historical_failures"]["resolved"], false);
+    assert_eq!(validation["historical_failures"]["unresolved"], true);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+    assert_eq!(validation["current_evidence"]["status"], "failed");
+    assert_eq!(
+        validation["current_evidence"]["unresolved_failure_count"],
+        1
+    );
+    assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], false);
+    assert_eq!(validation["latest"]["expectation_satisfied"], true);
+}
+
+#[test]
 fn current_evidence_validation_job_started_before_content_change_is_stale() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);

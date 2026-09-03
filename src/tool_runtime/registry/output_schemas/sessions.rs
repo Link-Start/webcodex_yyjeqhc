@@ -501,34 +501,34 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "tool_failures",
-                open_object_schema("Expected/unexpected tool failure classification from the session ledger. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Never includes raw input payloads, command text, stdout/stderr, tails, or excerpts."),
+                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Never includes raw input payloads, command text, stdout/stderr, tails, or excerpts."),
             ),
             (
                 "expected_failed_tool_calls",
                 array_schema(
-                    open_object_schema("Bounded expected failed tool call summary: event_id, tool_name, project, assertion_name, expected_failure_kind, actual_failure_kind, status, success, created_at."),
-                    "Expected failed tool calls whose expectation matched.",
+                    open_object_schema("Bounded matched-result tool call summary: event_id, tool_name, project, assertion_name, result_expectation, accepted_exit_codes, exit_code, expected_failure_kind, actual_failure_kind, status, success, created_at."),
+                    "Failed tool calls whose pre-declared failure/observation or accepted-exit expectation matched.",
                 ),
             ),
             (
                 "unexpected_failed_tool_calls",
                 array_schema(
-                    open_object_schema("Bounded unexpected failed tool call summary: event_id, tool_name, project, assertion_name, expected_failure_kind, actual_failure_kind, status, success, created_at."),
+                    open_object_schema("Bounded unexpected failed tool call summary: event_id, tool_name, project, assertion_name, result_expectation, accepted_exit_codes, exit_code, expected_failure_kind, actual_failure_kind, status, success, created_at."),
                     "Raw bounded unexpected failed tool-call history. Entries may be historical non-actionable evidence; use tool_failures.actionable_unexpected_count for the current blocker projection.",
                 ),
             ),
             (
                 "expectation_mismatches",
                 array_schema(
-                    open_object_schema("Bounded expectation mismatch summary: event_id, tool_name, project, assertion_name, expected_failure_kind, actual_failure_kind, status, success, created_at."),
-                    "Expected failures whose actual failure kind did not match.",
+                    open_object_schema("Bounded expectation mismatch summary: event_id, tool_name, project, assertion_name, result_expectation, accepted_exit_codes, exit_code, expected_failure_kind, actual_failure_kind, status, success, created_at."),
+                    "Pre-declared result expectations whose completed result did not match (for example an exit code outside accepted_exit_codes).",
                 ),
             ),
             (
                 "unexpected_success_tool_calls",
                 array_schema(
-                    open_object_schema("Bounded unexpected success summary: event_id, tool_name, project, assertion_name, expected_failure_kind, actual_failure_kind, status, success, created_at."),
-                    "Calls marked expected_failure=true that succeeded.",
+                    open_object_schema("Bounded unexpected success summary: event_id, tool_name, project, assertion_name, result_expectation, accepted_exit_codes, exit_code, expected_failure_kind, actual_failure_kind, status, success, created_at."),
+                    "Calls whose pre-declared failure expectation unexpectedly succeeded.",
                 ),
             ),
             (
@@ -549,7 +549,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "validation",
-                open_object_schema("Ledger-derived validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, or unknown. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
+                open_object_schema("Ledger-derived validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, expected, or unknown. `expected` means a pre-declared negative/observation result matched without proving validator pass. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
             ),
             (
                 "review_evidence",
@@ -625,12 +625,13 @@ fn validation_evidence_schema() -> Value {
             "description": "Current workspace validation evidence for the current attempt after the latest trusted material workspace-content change. Historical ledger failures remain separately visible and are not erased by this projection.",
             "additionalProperties": false,
             "properties": {
-                "status": {"type": "string", "enum": ["passed", "failed", "stale", "not_run", "unknown"]},
+                "status": {"type": "string", "enum": ["passed", "failed", "expected", "stale", "not_run", "unknown"]},
                 "reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                "latest_status": {"type": "string", "enum": ["passed", "failed", "not_run", "unknown"]},
+                "latest_status": {"type": "string", "enum": ["passed", "failed", "expected", "not_run", "unknown"]},
                 "events_total": {"type": "integer", "minimum": 0},
                 "successes": {"type": "integer", "minimum": 0},
                 "failures": {"type": "integer", "minimum": 0},
+                "expected_results": {"type": "integer", "minimum": 0},
                 "resolved_failure_count": {"type": "integer", "minimum": 0},
                 "unresolved_failure_count": {"type": "integer", "minimum": 0},
                 "stale_failure_count": {"type": "integer", "minimum": 0},
@@ -639,7 +640,7 @@ fn validation_evidence_schema() -> Value {
             },
             "required": [
                 "status", "reason", "latest_status", "events_total", "successes", "failures",
-                "resolved_failure_count", "unresolved_failure_count", "stale_failure_count",
+                "expected_results", "resolved_failure_count", "unresolved_failure_count", "stale_failure_count",
                 "evidence_after_latest_content_change", "boundary_reason"
             ]
         })
@@ -651,10 +652,10 @@ fn validation_evidence_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "available": schema_type("boolean", "True when validation-like ledger events exist."),
-            "status": { "type": "string", "enum": ["not_run", "passed", "failed", "mixed", "unknown"] },
+            "status": { "type": "string", "enum": ["not_run", "passed", "failed", "mixed", "expected", "unknown"] },
             "reason": { "anyOf": [{"type": "string"}, {"type": "null"}] },
             "latest": { "anyOf": [event.clone(), {"type": "null"}] },
-            "latest_status": { "type": "string", "enum": ["not_run", "passed", "failed", "unknown"] },
+            "latest_status": { "type": "string", "enum": ["not_run", "passed", "failed", "expected", "unknown"] },
             "current_evidence": current_validation_evidence_schema(),
             "historical_failures": validation_historical_failures_schema(),
             "resolved_failures": validation_failure_set_schema(),
@@ -663,6 +664,7 @@ fn validation_evidence_schema() -> Value {
             "events_total": { "type": "integer", "minimum": 0 },
             "successes": { "type": "integer", "minimum": 0 },
             "failures": { "type": "integer", "minimum": 0 },
+            "expected_results": { "type": "integer", "minimum": 0 },
             "latest_success": event.clone(),
             "latest_failure": event.clone(),
             "events": {
@@ -745,7 +747,9 @@ fn validation_event_schema() -> Value {
             "assertion_name": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS },
             "purpose": { "type": "string", "enum": ["validation", "test", "build", "format", "release"] },
             "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation"] },
-            "success": { "type": "boolean" },
+            "success": { "type": "boolean", "description": "True only when the validator/execution itself passed; pre-declared expected failures never rewrite this fact." },
+            "execution_success": { "type": "boolean" },
+            "expectation_satisfied": { "type": "boolean", "description": "Present for public result expectations; true when the pre-declared expectation matched. This is separate from validation success." },
             "failure_kind": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
             "failure_category": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
             "unresolved_failure": { "type": "boolean" },

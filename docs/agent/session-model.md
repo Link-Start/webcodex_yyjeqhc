@@ -123,7 +123,7 @@ The fence and completion key are different identity domains: the fence proves th
 
 Each Workflow Session also keeps a durable monotonic `context_revision` as a model-knowledge checkpoint watermark, not as a raw tool-result counter. Per-tool `ToolDefinition` policy decides whether a finished model-facing result advances the checkpoint. Consequential results such as edits, process execution, and Job observation allocate the next Session-local revision atomically with their finished event; concurrent checkpoint results therefore receive unique ordered revisions. Re-observable read/search/discovery/review results and `work_on_project` remain recorded in the Session ledger but do not consume a revision. Generic background/system/Job bookkeeping likewise does not advance this watermark. Retention may evict older checkpoint-annotated events without decreasing the durable high-water, and a capable caller whose ACK predates retained checkpoint history receives `history_lost=true` rather than invented history.
 
-The context ACK protocol is request-scoped and surface-capability-scoped. Stateless MCP 2026 Full Operator `tools/call` explicitly supports `ack_session_context_revision`; the adapter marks that request internally even when the ACK is omitted or malformed. ACK-capable recovery-only tools still accept the current checkpoint ACK, but an exact ACK with no newly allocated checkpoint is intentionally sparse: the response omits `session_context_revision`, `session_continuity`, and `session_recovery`, and the caller keeps its last acknowledged revision. A checkpoint-advancing result exposes its newly allocated revision. A valid known-behind ACK recovers the continuous retained checkpoint results strictly after that revision and before the current ToolResult; if another checkpoint-capable model-facing call completes after request admission but before this result, that intervening checkpoint participates in the same delta. Recovery-only results between checkpoints remain re-observable ledger evidence and are not replayed as extra revisions. Missing, malformed, or future ACKs prove no caller-held prefix, so they do not replay retained history from revision zero: recovery instead projects a bounded `current_handoff` of the current Session state. A known-behind ACK whose continuous checkpoint delta is incomplete because of retention, `history_lost`, or the recovery event/byte cap also receives `current_handoff` before the newest revision is exposed. All ACK states remain nonblocking for the original tool effect. The ACK is evidence about the caller's model view only: it grants no authority, is not a delivery/read receipt, is not persisted as caller state, and is never inferred from connection identity, `Mcp-Session-Id`, credentials, Project identity, or hidden window state.
+The context ACK protocol is request-scoped and surface-capability-scoped. Stateless MCP 2026 Full Operator `tools/call` explicitly supports `ack_session_context_revision`; the adapter marks that request internally even when the ACK is omitted or malformed. ACK-capable recovery-only tools still accept the current checkpoint ACK, but an exact ACK with no newly allocated checkpoint is intentionally sparse: the response omits `session_context_revision`, `session_continuity`, and `session_recovery`, and the caller keeps its last acknowledged revision. A checkpoint-advancing result exposes its newly allocated revision. A valid known-behind ACK recovers the continuous retained checkpoint results strictly after that revision and before the current ToolResult; if another checkpoint-capable model-facing call completes after request admission but before this result, that intervening checkpoint participates in the same delta. Recovery-only results between checkpoints remain re-observable ledger evidence and are not replayed as extra revisions. Missing, malformed, or future ACKs prove no caller-held prefix, so they do not replay retained history from revision zero: recovery instead projects a bounded `current_handoff` of the current Session state. Its `validation` block is a compact recovery projection: it retains current validation status/counts and a bounded set of actionable unresolved failure identities, not the full validation event/history/evidence bodies. A known-behind ACK whose continuous checkpoint delta is incomplete because of retention, `history_lost`, or the recovery event/byte cap also receives `current_handoff` before the newest revision is exposed. All ACK states remain nonblocking for the original tool effect. The ACK is evidence about the caller's model view only: it grants no authority, is not a delivery/read receipt, is not persisted as caller state, and is never inferred from connection identity, `Mcp-Session-Id`, credentials, Project identity, or hidden window state.
 
 Surfaces that do not expose this ACK protocol (including legacy MCP, generic REST/GPT Actions/OpenAPI, and ProjectConnector) still contribute checkpoint-capable model-facing results to the same durable `context_revision` history, so a later capable Stateless caller can recover intervening consequential work. Their recovery-only model-facing results remain ordinary bounded Session evidence without advancing the watermark. Those non-capable responses preserve their existing contract and do not expose `session_context_revision`, `session_continuity`, or `session_recovery`; absence of an impossible ACK is not interpreted as model-context loss. Capability is supplied explicitly by the adapter, never inferred from host identity, elapsed time, transport heuristics, tool purpose, credentials, or Session age.
 
@@ -237,6 +237,33 @@ auditable when explicitly used, but model-facing ToolSpecs and flattened Action
 arguments do not advertise it. Read-only mismatches may continue with a factual
 warning and without inheriting Session context; write/shell boundaries that
 require the escape fail closed on ordinary model paths.
+
+### Pre-declared execution result expectations
+
+Execution intent (`purpose=diagnostic`, `test`, and so on) is evidence metadata, not
+proof that a failed process is harmless. A started shell/process failure therefore
+remains actionable by default. Model-facing execution and structured-validation tools
+may instead declare a bounded `result_expectation` **before** execution: the omitted
+`success` default requires ordinary success; `failure` expects a completed known
+business failure; and `observe` accepts either completed known business result. The
+legacy internal `expected_failure` / `expected_failure_kind` recorder fields remain a
+separate compatibility/testing mechanism and are not exposed as the normal model
+contract.
+
+`run_process` additionally accepts a bounded `accepted_exit_codes` set for commands
+whose exit status is itself a result (for example a boolean Git predicate). Matching
+expectations change only ledger expectation/actionability classification. Validation
+evidence keeps three facts separate: the real execution/validator outcome, whether the
+pre-declared expectation was satisfied, and whether validation itself passed. A matched
+negative/observation failure is neutral expected-result evidence: it does not become a
+validation pass and cannot resolve an earlier real validation failure with the same
+identity. ToolResult, exit code, effect evidence, authorization decision, and execution
+state are never rewritten. Pre-start rejection, permission/guard denial, transport failure,
+malformed result, timeout/cancellation, and unknown/lost outcomes remain fail-closed.
+A Job admission is not a terminal match: structured validation Jobs inherit the
+pre-declared expectation and classify it only when terminal evidence is materialized.
+If the originating expectation evidence is no longer retained, terminal projection
+falls back to the normal success-required behavior rather than guessing.
 
 ### Explicit persistent shell
 

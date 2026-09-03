@@ -74,7 +74,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "tool_failures",
-                open_object_schema("Expected/unexpected tool failure classification from the session ledger. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Compact output includes counts only."),
+                open_object_schema("Pre-declared result-expectation classification from the session ledger. Default success remains fail-closed; matched negative/observation outcomes are expected evidence. unexpected_count remains raw historical evidence; historical_non_actionable_count identifies resolved validation or structurally proven fail-closed attempts; actionable_unexpected_count is the conservative current blocker projection. Expectation mismatches and unexpected successes remain separate integrity evidence. Compact output includes counts only."),
             ),
             (
                 "hygiene",
@@ -671,7 +671,7 @@ fn startup_validation_schema() -> Value {
         "properties": {
             "latest_status": {
                 "type": "string",
-                "enum": ["passed", "failed", "not_run", "unknown", "unavailable"]
+                "enum": ["passed", "failed", "expected", "not_run", "unknown", "unavailable"]
             },
             "open_failures": bounded_list_schema(startup_failure_schema(), 10),
             "delta": {
