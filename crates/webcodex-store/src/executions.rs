@@ -5,16 +5,21 @@ use super::execution_model::{
     execution_event_kind, latest_execution, latest_execution_by_kind, load_execution,
     load_execution_by_operation, observed_state, ConnectorExecution,
     ConnectorExecutionContinuationIntent, ConnectorExecutionFailure, ConnectorExecutionObservation,
-    ConnectorExecutionReservation, ConnectorTerminalContinuationClaim,
-    ConnectorTerminalContinuationDeliveryState, EXECUTION_COLUMNS, MAX_MCP_TASK_OUTPUT_TAIL_BYTES,
+    ConnectorExecutionReservation, ConnectorTerminalContinuationDeliveryState,
+    MAX_MCP_TASK_OUTPUT_TAIL_BYTES,
 };
+#[cfg(any(test, feature = "root-test-support"))]
+use super::execution_model::{ConnectorTerminalContinuationClaim, EXECUTION_COLUMNS};
 use super::task_kernel::{
     expire_task_approvals, insert_event, load_task, require_running, touch_task,
 };
 use super::{ConnectorTaskSnapshot, ConnectorTaskStoreError, Database};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Transaction};
+#[cfg(any(test, feature = "root-test-support"))]
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
+#[cfg(any(test, feature = "root-test-support"))]
 const TERMINAL_CONTINUATION_READY_PREDICATE: &str =
     "terminal_continuation_intent = 'armed_for_terminal' \
      AND state NOT IN ('accepted','queued','starting','running','cancel_requested') \
@@ -41,7 +46,7 @@ fn serialize_mcp_task_output_tail(
 }
 
 impl Database {
-    pub(crate) fn reserve_connector_execution(
+    pub fn reserve_connector_execution(
         &self,
         task: &ConnectorTaskSnapshot,
         kind: &str,
@@ -123,7 +128,7 @@ impl Database {
         Ok(ConnectorExecutionReservation::Created(execution))
     }
 
-    pub(crate) fn start_connector_execution(
+    pub fn start_connector_execution(
         &self,
         execution_id: &str,
         now: i64,
@@ -145,7 +150,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn connector_execution(
+    pub fn connector_execution(
         &self,
         execution_id: &str,
     ) -> Result<ConnectorExecution, ConnectorTaskStoreError> {
@@ -153,7 +158,7 @@ impl Database {
         load_execution(&conn, execution_id)?.ok_or(ConnectorTaskStoreError::NotFound)
     }
 
-    pub(crate) fn connector_execution_for_subject(
+    pub fn connector_execution_for_subject(
         &self,
         execution_id: &str,
         project_id: &str,
@@ -167,7 +172,7 @@ impl Database {
         Ok((task, execution))
     }
 
-    pub(crate) fn materialize_connector_execution_mcp_task_for_subject(
+    pub fn materialize_connector_execution_mcp_task_for_subject(
         &self,
         execution_id: &str,
         project_id: &str,
@@ -201,7 +206,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn record_connector_mcp_task_output_tail(
+    pub fn record_connector_mcp_task_output_tail(
         &self,
         execution_id: &str,
         output_tail: &serde_json::Value,
@@ -231,7 +236,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn connector_execution_event_cursor(
+    pub fn connector_execution_event_cursor(
         &self,
         execution: &ConnectorExecution,
     ) -> Result<i64, ConnectorTaskStoreError> {
@@ -253,7 +258,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn arm_connector_terminal_continuation(
+    pub fn arm_connector_terminal_continuation(
         &self,
         execution_id: &str,
         now: i64,
@@ -285,8 +290,8 @@ impl Database {
 
     // Ready remains derived: A1 intent + terminal execution truth + unclaimed
     // delivery state. No second durable ready bit exists.
-    #[allow(dead_code)]
-    pub(crate) fn terminal_ready_connector_executions(
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn terminal_ready_connector_executions(
         &self,
     ) -> Result<Vec<ConnectorExecution>, ConnectorTaskStoreError> {
         let conn = self.conn.lock().unwrap();
@@ -301,8 +306,8 @@ impl Database {
         Ok(executions)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn claim_next_terminal_continuation(
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn claim_next_terminal_continuation(
         &self,
     ) -> Result<Option<ConnectorTerminalContinuationClaim>, ConnectorTaskStoreError> {
         let mut conn = self.conn.lock().unwrap();
@@ -470,7 +475,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn latest_connector_execution(
+    pub fn latest_connector_execution(
         &self,
         task_id: &str,
         project_id: &str,
@@ -489,7 +494,7 @@ impl Database {
         .map_err(ConnectorTaskStoreError::from)
     }
 
-    pub(crate) fn latest_connector_execution_by_kind(
+    pub fn latest_connector_execution_by_kind(
         &self,
         task_id: &str,
         project_id: &str,
@@ -502,7 +507,7 @@ impl Database {
         latest_execution_by_kind(&conn, task_id, kind).map_err(ConnectorTaskStoreError::from)
     }
 
-    pub(crate) fn attach_connector_executor(
+    pub fn attach_connector_executor(
         &self,
         execution_id: &str,
         executor_reference: &str,
@@ -561,7 +566,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn record_connector_execution_status_failure(
+    pub fn record_connector_execution_status_failure(
         &self,
         execution_id: &str,
         failure_code: &str,
@@ -586,7 +591,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn observe_connector_execution(
+    pub fn observe_connector_execution(
         &self,
         execution_id: &str,
         observation: ConnectorExecutionObservation<'_>,
@@ -778,7 +783,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn request_connector_execution_cancel(
+    pub fn request_connector_execution_cancel(
         &self,
         task: &ConnectorTaskSnapshot,
         reason: Option<&str>,
@@ -861,7 +866,7 @@ impl Database {
         Ok(None)
     }
 
-    pub(crate) fn request_connector_queue_timeout(
+    pub fn request_connector_queue_timeout(
         &self,
         execution_id: &str,
         now: i64,
@@ -886,7 +891,7 @@ impl Database {
         commit_execution(tx, execution_id)
     }
 
-    pub(crate) fn connector_finish_blocker(
+    pub fn connector_finish_blocker(
         &self,
         task_id: &str,
     ) -> Result<Option<ConnectorExecution>, ConnectorTaskStoreError> {
@@ -894,7 +899,7 @@ impl Database {
         Ok(latest_execution(&conn, task_id)?.filter(ConnectorExecution::blocks_finish))
     }
 
-    pub(crate) fn reconcile_connector_startup(
+    pub fn reconcile_connector_startup(
         &self,
         project_id: &str,
         now: i64,
@@ -902,8 +907,8 @@ impl Database {
         self.reconcile_connector_executions_inner(project_id, now, true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn reconcile_connector_executions(
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn reconcile_connector_executions(
         &self,
         project_id: &str,
         now: i64,
@@ -995,7 +1000,7 @@ impl Database {
         Ok((recoveries.len(), executions_interrupted))
     }
 
-    pub(crate) fn finish_connector_execution(
+    pub fn finish_connector_execution(
         &self,
         execution_id: &str,
         failure: ConnectorExecutionFailure,

@@ -8,6 +8,7 @@ members = [
     "crates/webcodex-persistent-shell",
     "crates/webcodex-process",
     "crates/webcodex-runner",
+    "crates/webcodex-store",
     "crates/webcodex-workspace",
     "crates/webcodex-workflow-session",
     "crates/webcodex-tool-contracts",
@@ -36,12 +37,12 @@ webcodex-core = { path = "crates/webcodex-core" }
 webcodex-tool-contracts = { path = "crates/webcodex-tool-contracts" }
 webcodex-workflow-session = { path = "crates/webcodex-workflow-session" }
 webcodex-persistent-shell = { path = "crates/webcodex-persistent-shell" }
+webcodex-store = { path = "crates/webcodex-store" }
 webcodex-workspace = { path = "crates/webcodex-workspace" }
 salvo = { version = "0.93", features = ["oapi", "cors", "affix-state", "websocket", "timeout"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_urlencoded = "0.7"
@@ -50,7 +51,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-fs2 = "0.4"
 toml = "0.8"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -111,6 +111,8 @@ codegen-units = 16
 incremental = true
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+webcodex-store = { path = "crates/webcodex-store", features = ["root-test-support"] }
 webcodex-tool-contracts = { path = "crates/webcodex-tool-contracts", features = ["root-test-support"] }
 webcodex-workflow-session = { path = "crates/webcodex-workflow-session", features = ["root-test-support"] }
 urlencoding = "2"
