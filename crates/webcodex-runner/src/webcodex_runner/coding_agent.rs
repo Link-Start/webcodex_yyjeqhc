@@ -2981,6 +2981,7 @@ for line in sys.stdin:
   else:
    v=m['params']['value']; opts=[{'id':'mode','name':'Mode','type':'select','currentValue':v,'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   send({'jsonrpc':'2.0','id':rid,'result':{'configOptions':opts}})
+  if scenario=='slow_configs': log({'config_applied':k})
  elif method=='session/prompt':
   if scenario=='crash_after_prompt': sys.exit(7)
   if scenario=='spawn_descendant':
@@ -4299,14 +4300,15 @@ for line in sys.stdin:
                 .and_then(|t| t.error_code.as_deref()),
             Some("coding_agent_setup_timeout")
         );
-        let methods = received_methods(&wire_log(&temp));
+        let log = wire_log(&temp);
+        let methods = received_methods(&log);
+        let completed_configs = log
+            .iter()
+            .filter(|entry| entry.get("config_applied").is_some())
+            .count();
         assert!(
-            methods
-                .iter()
-                .filter(|m| m.as_str() == "session/set_config_option")
-                .count()
-                >= 3,
-            "expected cumulative config setup before total deadline: {methods:?}"
+            completed_configs < 4,
+            "the total run deadline must expire before all slow config responses complete: {log:?}"
         );
         assert_eq!(
             methods
