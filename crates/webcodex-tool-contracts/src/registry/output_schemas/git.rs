@@ -6,6 +6,24 @@ use super::common::{
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "git_commit_paths" => Some(wrapped_output_schema(vec![
+            ("committed", nullable_schema("boolean", "True only when the exact-path commit is known to have completed; null when dispatch outcome is unknown.")),
+            ("expected_head", schema_type("string", "Exact caller-supplied HEAD fence.")),
+            ("previous_head", nullable_schema("string", "Known parent HEAD used by the successful commit, or null before it is proven.")),
+            ("actual_head", nullable_schema("string", "Observed HEAD when a deterministic precondition failure can report it.")),
+            ("new_head", nullable_schema("string", "New exact commit SHA when known.")),
+            (
+                "committed_paths",
+                array_schema(
+                    schema_type("string", "Exact project-relative path committed."),
+                    "Exact requested paths committed on known success; empty otherwise.",
+                ),
+            ),
+            ("state_changed", nullable_schema("boolean", "Whether repository HEAD is known to have changed.")),
+            ("outcome_unknown", schema_type("boolean", "True only when Runner dispatch may have executed but no trustworthy terminal result was received.")),
+            ("failure_kind", nullable_schema("string", "Stable bounded commit rejection/failure kind.")),
+            ("hook_policy", schema_type("string", "Always bypassed_exact_tree: commit-tree is used so hooks cannot add unrelated paths.")),
+        ])),
         "git_status" | "git_diff" => Some(wrapped_output_schema(vec![
             (
                 "exit_code",
@@ -451,9 +469,25 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                                     "diff_byte_budget"
                                 ]
                             }
+                        },
+                        "suggested_call": {
+                            "type": "object",
+                            "description": "Ready-to-call worktree git_diff_hunks arguments. paths is currently empty to preserve whole-worktree coverage because show_changes does not publish authoritative per-hunk line-truncation provenance.",
+                            "additionalProperties": false,
+                            "properties": {
+                                "project": {"type": "string"},
+                                "cached": {"type": "boolean", "const": false},
+                                "paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                "max_hunks": {"type": "integer"},
+                                "max_hunk_lines": {"type": "integer"}
+                            },
+                            "required": ["project", "cached", "paths", "max_hunks", "max_hunk_lines"]
                         }
                     },
-                    "required": ["tool", "scope", "reason", "truncation_reasons"]
+                    "required": ["tool", "scope", "reason", "truncation_reasons", "suggested_call"]
                 }),
             ),
             (

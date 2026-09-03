@@ -1332,6 +1332,69 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
 }
 
 #[tokio::test]
+async fn tool_manifest_exact_persistent_shell_tool_surfaces_its_reuse_flow() {
+    let runtime = test_runtime();
+    let result = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("open_session_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: true,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    let flows = result.output["recommended_flows"]
+        .as_array()
+        .expect("exact persistent-shell recommended flows");
+    let flow = flows
+        .iter()
+        .find(|flow| flow["name"] == "persistent_shell")
+        .expect("persistent_shell flow");
+    let purpose = flow["purpose"].as_str().expect("persistent_shell purpose");
+    assert!(purpose.contains("repeated local or named-SSH commands"));
+    for tool in [
+        "open_session_shell",
+        "session_shell_exec",
+        "session_shell_status",
+        "close_session_shell",
+        "run_process",
+    ] {
+        assert!(purpose.contains(tool), "persistent_shell purpose: {tool}");
+    }
+    // Exact manifests keep their returned tool set bounded to the requested tool,
+    // while the flow purpose names the sibling tools needed to complete the route.
+    assert_eq!(flow["tools"], json!(["open_session_shell"]));
+}
+
+#[tokio::test]
+async fn tool_manifest_exact_fleet_tool_surfaces_exact_runner_targeting_route() {
+    let runtime = test_runtime();
+    let result = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("list_runners".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: true,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    let flow = result.output["recommended_flows"]
+        .as_array()
+        .expect("exact fleet recommended flows")
+        .iter()
+        .find(|flow| flow["name"] == "discovery")
+        .expect("discovery flow");
+    let purpose = flow["purpose"].as_str().expect("discovery purpose");
+    assert!(purpose.contains("runtime_status(client_id=...)"));
+    assert!(purpose.contains("list_projects(client_id=...)"));
+    assert!(purpose.contains("list_runners"));
+    assert!(!purpose.contains("list_agents"));
+    assert_eq!(flow["tools"], json!(["list_runners"]));
+}
+
+#[tokio::test]
 async fn tool_manifest_projects_canonical_semantic_contracts() {
     let runtime = test_runtime();
     for (tool_name, effect, risk, approval, idempotency, read_only) in [

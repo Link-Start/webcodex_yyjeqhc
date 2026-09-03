@@ -9,6 +9,7 @@ use super::helpers::{
     SYNC_VALIDATION_WAIT_SECS,
 };
 use super::shell::{command_execution_state_name, ProjectCommandOutput};
+use super::structured_execution::structured_job_observation;
 use super::tool_result::ToolResult;
 use super::validation_parser::parse_complete_cargo_test_summary_counts;
 use super::validation_profile::{
@@ -97,6 +98,7 @@ pub(crate) struct CargoTestRunMetadata {
     pub(crate) tests_passed: Option<u64>,
     pub(crate) tests_failed: Option<u64>,
     pub(crate) zero_tests_run: Option<bool>,
+    pub(crate) count_evidence_reason: &'static str,
 }
 
 pub(crate) fn parse_cargo_test_run_metadata(text: &str) -> CargoTestRunMetadata {
@@ -152,6 +154,7 @@ pub(crate) fn parse_cargo_test_run_metadata(text: &str) -> CargoTestRunMetadata 
             tests_passed: Some(tests_passed),
             tests_failed: Some(tests_failed),
             zero_tests_run: Some(tests_run_count == 0),
+            count_evidence_reason: "complete_summary",
         }
     } else {
         CargoTestRunMetadata {
@@ -160,6 +163,11 @@ pub(crate) fn parse_cargo_test_run_metadata(text: &str) -> CargoTestRunMetadata 
             tests_passed: None,
             tests_failed: None,
             zero_tests_run: None,
+            count_evidence_reason: if incomplete_summary_found {
+                "partial_harness_summary"
+            } else {
+                "no_complete_summary"
+            },
         }
     }
 }
@@ -1061,7 +1069,30 @@ impl ToolRuntime {
             guard.disarm();
             return result;
         }
-        let observation_token = match promoted.observation_token {
+        let observation = match structured_job_observation(
+            &self.shell_clients,
+            handoff.auth.as_ref(),
+            &job_id,
+        )
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                return ToolResult::err(command_rejected_message(
+                    error,
+                    "observe the returned Job from list_jobs before deciding whether any retry is safe.",
+                ));
+            }
+        };
+        let latest_status = observation.job.status.clone();
+        if crate::tool_runtime::jobs::is_terminal_job_status(&latest_status) {
+            let result = self
+                .validation_terminal_result(job_id, adapter, &latest_status, handoff)
+                .await;
+            guard.disarm();
+            return result;
+        }
+        let observation_token = match observation.job.observation_token.clone() {
             Some(token) => token,
             None => {
                 return ToolResult::err(
@@ -1069,11 +1100,18 @@ impl ToolRuntime {
                 );
             }
         };
-        let queued = matches!(
+        let (execution_state, command_started) = validation_handoff_execution_state(
             latest_status.as_str(),
-            "queued" | "agent_queued" | "started"
+            observation.job.started_at.is_some(),
         );
-        let execution_state = if queued { "queued" } else { "running" };
+        let detected_summary = crate::tool_runtime::jobs::detected_job_summary(
+            Some(&handoff.command_summary),
+            Some(&handoff.purpose),
+            &latest_status,
+            observation.job.exit_code.map(i64::from),
+            &observation.stdout_tail,
+            &observation.stderr_tail,
+        );
         let payload = json!({
             "execution_source": handoff.execution_source,
             "purpose": handoff.purpose,
@@ -1082,7 +1120,7 @@ impl ToolRuntime {
             "job_status": latest_status,
             "observation_token": observation_token,
             "promoted_to_job": true,
-            "command_started": !queued,
+            "command_started": command_started,
             "command_completed": false,
             "effective_timeout_secs": handoff.effective_timeout_secs,
             "sync_wait_secs": handoff.sync_wait_secs,
@@ -1091,12 +1129,13 @@ impl ToolRuntime {
             "shell": handoff.shell,
             "executor": handoff.executor,
             "command_summary": handoff.command_summary,
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "stdout_lines": 0,
-            "stderr_lines": 0,
-            "stdout_truncated": false,
-            "stderr_truncated": false,
+            "stdout_tail": observation.stdout_tail,
+            "stderr_tail": observation.stderr_tail,
+            "stdout_lines": observation.stdout_lines,
+            "stderr_lines": observation.stderr_lines,
+            "stdout_truncated": observation.stdout_truncated,
+            "stderr_truncated": observation.stderr_truncated,
+            "detected_summary": detected_summary,
             "terminal": false,
         });
         guard.disarm();
@@ -1636,6 +1675,40 @@ impl Drop for ValidationCleanupGuard {
                 clients.process_hidden_cleanup_intents().await;
             });
         }
+    }
+}
+
+fn validation_handoff_execution_state(status: &str, started: bool) -> (&'static str, bool) {
+    let pending_status = matches!(status, "queued" | "agent_queued" | "started");
+    let command_started = !pending_status || started;
+    (
+        if command_started { "running" } else { "queued" },
+        command_started,
+    )
+}
+
+#[cfg(test)]
+mod validation_handoff_projection_tests {
+    use super::validation_handoff_execution_state;
+
+    #[test]
+    fn fresh_started_evidence_prevents_false_queued_validation_handoff() {
+        assert_eq!(
+            validation_handoff_execution_state("agent_queued", false),
+            ("queued", false)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("agent_queued", true),
+            ("running", true)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("started", true),
+            ("running", true)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("running", true),
+            ("running", true)
+        );
     }
 }
 

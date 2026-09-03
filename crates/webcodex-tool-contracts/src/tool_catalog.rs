@@ -121,6 +121,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
     ToolDiscoveryGroup {
         name: TOOL_DISCOVERY_GROUP_GIT,
         tools: &[
+            "git_commit_paths",
             "git_status",
             "git_diff",
             "git_diff_summary",
@@ -275,10 +276,12 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
 pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: use search_project_text for bounded code search after list_projects/project_overview. Prefer run_process for native argv and run_script for typed scripts; run_shell with rg or git grep remains the diagnostic escape hatch.",
+        summary: "Discovery: if the user gives an exact Runner client_id, query runtime_status/list_projects for that Runner before treating it as absent from a fleet snapshot. Otherwise use bounded runtime/project discovery, then structured search; run_shell remains the diagnostic escape hatch.",
         manifest_purpose:
-            "Resolve the project, inspect bounded structure, then search code with search_project_text or search_project_texts.",
+            "Exact Runner targeting: with client_id use runtime_status(client_id=...) or list_projects(client_id=...); use list_runners only for broad fleet discovery, then inspect/search the resolved project.",
         tools: &[
+            "runtime_status",
+            "list_runners",
             "list_projects",
             "project_overview",
             "read_file",
@@ -288,6 +291,19 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "run_process",
             "run_script",
             "run_shell",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "persistent_shell",
+        summary: "Persistent shell: for repeated commands in one Workflow Session, especially on a named SSH resource, open_session_shell once and reuse session_shell_exec. Keep run_process for isolated one-shot native commands; inspect status or close the shell when needed.",
+        manifest_purpose:
+            "Persistent shell route: open_session_shell once, reuse session_shell_exec for repeated local or named-SSH commands, inspect with session_shell_status, close with close_session_shell; keep run_process for isolated one-shot native execution.",
+        tools: &[
+            "open_session_shell",
+            "session_shell_exec",
+            "session_shell_status",
+            "close_session_shell",
+            "run_process",
         ],
     },
     ToolRecommendedFlow {
@@ -363,6 +379,13 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
             "computer_list_windows",
             "computer_activate_window",
         ],
+    },
+    ToolRecommendedFlow {
+        name: "commit",
+        summary: "Commit: inspect git_status/show_changes, copy show_changes.head.commit into git_commit_paths.expected_head, and pass explicit changed file paths. It rejects pre-existing staged state and never pushes; keep run_process for unusual Git operations outside this narrow contract.",
+        manifest_purpose:
+            "Commit route: inspect with show_changes, copy head.commit to expected_head, then call git_commit_paths with explicit paths. Requires project:write + job:run because clean filters may run; isolated exact-tree commit bypasses hooks, rejects staged state, never pushes.",
+        tools: &["git_status", "show_changes", "git_commit_paths"],
     },
     ToolRecommendedFlow {
         name: "review",

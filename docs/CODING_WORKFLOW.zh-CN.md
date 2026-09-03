@@ -137,6 +137,17 @@ test，或使用 `min_tests: N` 声明更大的 bounded minimum；两者同时�
 返回 `tests_run_count: 0` 与 `zero_tests_run: true`。显式 count assertion 只有在完整 parser
 evidence 能证明达到 minimum 时才通过；evidence 缺失或被截断时 validation contract 会失败，
 但不会改写真实 process exit code。count assertion 不能与 `no_run: true` 同时使用。
+当 count assertion 无法证明时，`test_count_assertion.evidence_reason_code` 会进一步区分
+输出被截断、harness summary 不完整、或完全没有完整 summary；这些诊断不会放松 fail-closed
+的 test-count 证明要求。
+
+对于日常的精确路径提交，优先使用受控的 `git_commit_paths`：传入当前精确 40 位
+`show_changes.head.commit` 作为 `expected_head`，再传入明确的变更文件路径和 commit message。它会拒绝已有 staged state、冲突、
+过期 HEAD、目录、敏感路径以及没有变化的目标文件，并且永远不会 push。staging 使用隔离的
+临时 index，因此正常 Git clean filter 仍可能执行，所以该工具同时要求 `project:write` 与
+`job:run`。最终提交通过 exact-tree `commit-tree` 与原子的 `update-ref` HEAD fence 完成；为了
+保证 hook 不能偷偷加入无关文件，普通 commit hook 会被有意绕过。如果 dispatch 结果不确定，
+必须先重新观察 HEAD/status，不能盲目重试提交。
 
 **在执行前声明非默认结果。** 支持该契约的执行与 structured-validation 工具接受
 `result_expectation`：省略（或 `success`）保持默认的 fail-closed 成功要求；`failure` 用于
