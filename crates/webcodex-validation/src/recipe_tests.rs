@@ -16,7 +16,7 @@ fn resolve(
     recipe: Option<RecipeId>,
     checks: &[SemanticCheck],
     test_filter: Option<&str>,
-) -> Result<super::recipe::ResolvedValidationRecipe, RecipeError> {
+) -> Result<super::ResolvedValidationRecipe, RecipeError> {
     resolve_validation_recipe(root, cwd, recipe, checks, test_filter)
 }
 
@@ -556,8 +556,8 @@ fn cwd_symlink_escape_is_rejected() {
 
 #[test]
 fn manifestless_explicit_python_uses_stable_unittest_plan() {
-    use crate::runner_protocol::ShellJobValidationStep;
     use sha2::{Digest, Sha256};
+    use webcodex_core::runner_protocol::ShellJobValidationStep;
 
     let temp = tempfile::tempdir().unwrap();
     write(
