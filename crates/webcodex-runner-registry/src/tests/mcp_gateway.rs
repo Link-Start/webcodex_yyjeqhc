@@ -3,9 +3,9 @@ use crate::mcp_gateway::{
     McpGatewayDispatchState, McpGatewayProvider, McpGatewayRequest, McpGatewayResponse,
     McpGatewayResponsePayload,
 };
-use crate::shell_protocol::{
-    AgentPolicySummary, ShellAgentPollRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientRegisterRequest,
+use crate::runner_protocol::{
+    RunnerPolicySummary, RunnerPollRequest, RunnerRegisterRequest, RunnerResultPayload,
+    RunnerResultRequest,
 };
 
 fn bridge_provider(provider_instance_id: &str) -> McpGatewayProvider {
@@ -16,20 +16,20 @@ fn bridge_provider(provider_instance_id: &str) -> McpGatewayProvider {
     }
 }
 
-async fn register_bridge_runner(registry: &ShellClientRegistry) {
+async fn register_bridge_runner(registry: &RunnerRegistry) {
     registry
-        .register(ShellClientRegisterRequest {
+        .register(RunnerRegisterRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "bridge-instance".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "bridge-instance".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             host_context: None,
-            policy: Some(AgentPolicySummary {
+            policy: Some(RunnerPolicySummary {
                 mcp_gateway_providers: Some(vec![bridge_provider("provider-instance")]),
                 ..Default::default()
             }),
@@ -53,19 +53,19 @@ fn list_request(provider_instance_id: &str) -> McpGatewayRequest {
 
 fn bridge_registration(
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     providers: Option<Vec<McpGatewayProvider>>,
-) -> ShellClientRegisterRequest {
-    current_runner_registration(ShellClientRegisterRequest {
+) -> RunnerRegisterRequest {
+    current_runner_registration(RunnerRegisterRequest {
         client_id: client_id.to_string(),
-        agent_instance_id: agent_instance_id.to_string(),
-        agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+        runner_instance_id: runner_instance_id.to_string(),
+        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
         display_name: None,
         owner: Some("alice".to_string()),
         hostname: None,
-        capabilities: ShellClientCapabilities::default(),
+        capabilities: RunnerCapabilities::default(),
         host_context: None,
-        policy: providers.map(|providers| AgentPolicySummary {
+        policy: providers.map(|providers| RunnerPolicySummary {
             mcp_gateway_providers: Some(providers),
             ..Default::default()
         }),
@@ -80,7 +80,7 @@ fn bridge_registration(
 
 #[tokio::test]
 async fn bridge_registration_inventory_is_bounded_and_exact() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
         .register(bridge_registration(
             "valid-bridge-runner",
@@ -90,7 +90,7 @@ async fn bridge_registration_inventory_is_bounded_and_exact() {
         .await
         .unwrap();
     let view = registry
-        .get_client_view("valid-bridge-runner")
+        .get_runner_view("valid-bridge-runner")
         .await
         .unwrap();
     assert_eq!(
@@ -177,7 +177,7 @@ async fn bridge_registration_inventory_is_bounded_and_exact() {
 
 #[tokio::test]
 async fn bridge_enqueue_rechecks_owner_and_exact_runner_instance() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_bridge_runner(&registry).await;
 
     let bob = auth_context(Some("bob"), false);
@@ -225,7 +225,7 @@ async fn bridge_enqueue_rechecks_owner_and_exact_runner_instance() {
 
 #[tokio::test]
 async fn bridge_dequeue_rechecks_exact_runner_instance_after_replacement() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_bridge_runner(&registry).await;
     let alice = auth_context(Some("alice"), false);
     let (_request_id, receiver) = registry
@@ -246,15 +246,15 @@ async fn bridge_dequeue_rechecks_exact_runner_instance_after_replacement() {
     {
         let mut inner = registry.inner.lock().await;
         inner
-            .clients
+            .runners
             .get_mut("bridge-runner")
             .unwrap()
-            .agent_instance_id = "replacement-instance".to_string();
+            .runner_instance_id = "replacement-instance".to_string();
     }
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "replacement-instance".to_string(),
+            runner_instance_id: "replacement-instance".to_string(),
         })
         .await
         .unwrap();
@@ -269,7 +269,7 @@ async fn bridge_dequeue_rechecks_exact_runner_instance_after_replacement() {
 
 #[tokio::test]
 async fn bridge_dequeue_rechecks_exact_provider_instance_after_inventory_change() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_bridge_runner(&registry).await;
     let alice = auth_context(Some("alice"), false);
     let (_request_id, receiver) = registry
@@ -286,7 +286,7 @@ async fn bridge_dequeue_rechecks_exact_provider_instance_after_inventory_change(
     {
         let mut inner = registry.inner.lock().await;
         inner
-            .clients
+            .runners
             .get_mut("bridge-runner")
             .unwrap()
             .policy
@@ -295,9 +295,9 @@ async fn bridge_dequeue_rechecks_exact_provider_instance_after_inventory_change(
             .mcp_gateway_providers = Some(vec![bridge_provider("replacement-provider-instance")]);
     }
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "bridge-instance".to_string(),
+            runner_instance_id: "bridge-instance".to_string(),
         })
         .await
         .unwrap();
@@ -312,7 +312,7 @@ async fn bridge_dequeue_rechecks_exact_provider_instance_after_inventory_change(
 
 #[tokio::test]
 async fn dispatched_bridge_disconnect_is_outcome_unknown_and_not_replayed() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_bridge_runner(&registry).await;
     let alice = auth_context(Some("alice"), false);
     let (request_id, receiver) = registry
@@ -336,9 +336,9 @@ async fn dispatched_bridge_disconnect_is_outcome_unknown_and_not_replayed() {
         .await
         .unwrap();
     let request = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "bridge-instance".to_string(),
+            runner_instance_id: "bridge-instance".to_string(),
         })
         .await
         .unwrap()
@@ -360,14 +360,14 @@ async fn dispatched_bridge_disconnect_is_outcome_unknown_and_not_replayed() {
     assert!(inner.pending_by_id.is_empty());
     assert!(inner.mcp_gateway_waiters.is_empty());
     assert!(inner
-        .queues_by_client
+        .queues_by_runner
         .get("bridge-runner")
         .is_none_or(|queue| queue.is_empty()));
 }
 
 #[tokio::test]
 async fn typed_bridge_result_is_correlated_once() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_bridge_runner(&registry).await;
     let alice = auth_context(Some("alice"), false);
     let (request_id, receiver) = registry
@@ -381,17 +381,17 @@ async fn typed_bridge_result_is_correlated_once() {
         .await
         .unwrap();
     registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "bridge-instance".to_string(),
+            runner_instance_id: "bridge-instance".to_string(),
         })
         .await
         .unwrap()
         .unwrap();
-    let payload = ShellAgentResultPayload {
-        result: ShellAgentResultRequest {
+    let payload = RunnerResultPayload {
+        result: RunnerResultRequest {
             client_id: "bridge-runner".to_string(),
-            agent_instance_id: "bridge-instance".to_string(),
+            runner_instance_id: "bridge-instance".to_string(),
             request_id: request_id.clone(),
             exit_code: None,
             stdout: None,

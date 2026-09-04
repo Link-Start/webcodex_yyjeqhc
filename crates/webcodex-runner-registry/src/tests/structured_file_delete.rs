@@ -1,8 +1,8 @@
 use super::*;
 
-async fn register_structured_delete_client(registry: &ShellClientRegistry, client_id: &str) {
+async fn register_structured_delete_runner(registry: &RunnerRegistry, client_id: &str) {
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -10,13 +10,13 @@ async fn register_structured_delete_client(registry: &ShellClientRegistry, clien
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
-            capabilities: ShellClientCapabilities::default(),
+            capabilities: RunnerCapabilities::default(),
             policy: None,
         }))
         .await
@@ -24,15 +24,15 @@ async fn register_structured_delete_client(registry: &ShellClientRegistry, clien
 }
 
 async fn register_structured_delete_instance(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
     instance: &str,
-) -> Result<ShellClientView, String> {
+) -> Result<RunnerView, String> {
     register_instance_with_capabilities(
         registry,
         client_id,
         instance,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
     )
     .await
 }
@@ -59,8 +59,8 @@ fn structured_delete_request(client_id: &str) -> ShellFileOpRequest {
 
 #[tokio::test]
 async fn enqueue_structured_file_delete_queues_when_capability_advertised() {
-    let registry = ShellClientRegistry::default();
-    register_structured_delete_client(&registry, "structured-delete-on").await;
+    let registry = RunnerRegistry::default();
+    register_structured_delete_runner(&registry, "structured-delete-on").await;
     let (request_id, _rx) = registry
         .enqueue_structured_file_delete(
             structured_delete_request("structured-delete-on"),
@@ -70,9 +70,9 @@ async fn enqueue_structured_file_delete_queues_when_capability_advertised() {
         .expect("capable client should accept the structured delete request");
 
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "structured-delete-on".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -85,8 +85,8 @@ async fn enqueue_structured_file_delete_queues_when_capability_advertised() {
 }
 
 #[tokio::test]
-async fn enqueue_structured_file_delete_unknown_client_fails_closed() {
-    let registry = ShellClientRegistry::default();
+async fn enqueue_structured_file_delete_unknown_runner_fails_closed() {
+    let registry = RunnerRegistry::default();
     let error = registry
         .enqueue_structured_file_delete(
             structured_delete_request("structured-delete-ghost"),
@@ -95,13 +95,13 @@ async fn enqueue_structured_file_delete_unknown_client_fails_closed() {
         .await
         .unwrap_err();
     assert_eq!(error, "unknown shell client: structured-delete-ghost");
-    assert_structured_delete_client_idle(&registry, "structured-delete-ghost").await;
+    assert_structured_delete_runner_idle(&registry, "structured-delete-ghost").await;
 }
 
 #[tokio::test]
-async fn enqueue_structured_file_delete_offline_client_fails_closed() {
-    let registry = ShellClientRegistry::default();
-    register_structured_delete_client(&registry, "structured-delete-offline").await;
+async fn enqueue_structured_file_delete_offline_runner_fails_closed() {
+    let registry = RunnerRegistry::default();
+    register_structured_delete_runner(&registry, "structured-delete-offline").await;
     registry
         .set_last_seen_for_test(
             "structured-delete-offline",
@@ -116,13 +116,13 @@ async fn enqueue_structured_file_delete_offline_client_fails_closed() {
         .await
         .unwrap_err();
     assert!(error.contains("offline"), "error was: {error}");
-    assert_structured_delete_client_idle(&registry, "structured-delete-offline").await;
+    assert_structured_delete_runner_idle(&registry, "structured-delete-offline").await;
 }
 
 #[tokio::test]
 async fn enqueue_structured_file_delete_rejects_other_ops_before_registry() {
-    let registry = ShellClientRegistry::default();
-    register_structured_delete_client(&registry, "structured-delete-op").await;
+    let registry = RunnerRegistry::default();
+    register_structured_delete_runner(&registry, "structured-delete-op").await;
     let mut req = structured_delete_request("structured-delete-op");
     req.op = "write".to_string();
     let error = registry
@@ -133,13 +133,13 @@ async fn enqueue_structured_file_delete_rejects_other_ops_before_registry() {
         error.contains("op=delete_project_files"),
         "error was: {error}"
     );
-    assert_structured_delete_client_idle(&registry, "structured-delete-op").await;
+    assert_structured_delete_runner_idle(&registry, "structured-delete-op").await;
 }
 
 #[tokio::test]
 async fn enqueue_structured_file_delete_validates_request_before_locking() {
-    let registry = ShellClientRegistry::default();
-    register_structured_delete_client(&registry, "structured-delete-invalid").await;
+    let registry = RunnerRegistry::default();
+    register_structured_delete_runner(&registry, "structured-delete-invalid").await;
     let mut req = structured_delete_request("structured-delete-invalid");
     req.path = "".to_string();
     let error = registry
@@ -147,12 +147,12 @@ async fn enqueue_structured_file_delete_validates_request_before_locking() {
         .await
         .unwrap_err();
     assert_eq!(error, "path cannot be empty");
-    assert_structured_delete_client_idle(&registry, "structured-delete-invalid").await;
+    assert_structured_delete_runner_idle(&registry, "structured-delete-invalid").await;
 }
 
 #[tokio::test]
 async fn same_instance_structured_file_delete_reconnect_allowed() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_structured_delete_instance(&registry, "monotonic-reconnect", "inst-a")
         .await
         .unwrap();
@@ -160,16 +160,16 @@ async fn same_instance_structured_file_delete_reconnect_allowed() {
         .await
         .unwrap();
     let view = registry
-        .get_client_view("monotonic-reconnect")
+        .get_runner_view("monotonic-reconnect")
         .await
         .unwrap();
-    assert_eq!(view.agent_instance_id, "inst-a");
+    assert_eq!(view.runner_instance_id, "inst-a");
     assert!(view.capabilities.structured_file_delete);
 }
 
 #[tokio::test]
 async fn same_instance_reconnect_keeps_queued_structured_delete_dispatchable() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_structured_delete_instance(&registry, "reconnect-keeps", "inst-a")
         .await
         .unwrap();
@@ -188,9 +188,9 @@ async fn same_instance_reconnect_keeps_queued_structured_delete_dispatchable() {
         .await
         .unwrap();
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "reconnect-keeps".to_string(),
-            agent_instance_id: "inst-a".to_string(),
+            runner_instance_id: "inst-a".to_string(),
         })
         .await
         .unwrap()
@@ -201,7 +201,7 @@ async fn same_instance_reconnect_keeps_queued_structured_delete_dispatchable() {
 
 #[tokio::test]
 async fn instance_replacement_drains_sync_requests_before_installing_new_lease() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_structured_delete_instance(&registry, "replace-drain", "inst-a")
         .await
         .unwrap();
@@ -244,9 +244,9 @@ async fn instance_replacement_drains_sync_requests_before_installing_new_lease()
 
     // The replacement Runner polls no inherited file_delete_project_files.
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "replace-drain".to_string(),
-            agent_instance_id: "inst-b".to_string(),
+            runner_instance_id: "inst-b".to_string(),
         })
         .await
         .unwrap();
@@ -256,17 +256,17 @@ async fn instance_replacement_drains_sync_requests_before_installing_new_lease()
     );
 
     // No pending request or queue leak remains for the client.
-    assert_structured_delete_client_idle(&registry, "replace-drain").await;
+    assert_structured_delete_runner_idle(&registry, "replace-drain").await;
 }
 
 #[tokio::test]
 async fn instance_replacement_keeps_job_reconciliation_contract_unchanged() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_instance_with_capabilities(
         &registry,
         "replace-job-sync",
         "inst-a",
-        ShellClientCapabilities {
+        RunnerCapabilities {
             jobs: true,
             async_jobs: true,
             async_shell_jobs: true,
@@ -310,7 +310,7 @@ async fn instance_replacement_keeps_job_reconciliation_contract_unchanged() {
         &registry,
         "replace-job-sync",
         "inst-b",
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
     )
     .await
     .unwrap();
@@ -334,12 +334,12 @@ async fn instance_replacement_keeps_job_reconciliation_contract_unchanged() {
     );
     // The replacement polls no inherited structured delete and nothing leaks.
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "replace-job-sync".to_string(),
-            agent_instance_id: "inst-b".to_string(),
+            runner_instance_id: "inst-b".to_string(),
         })
         .await
         .unwrap();
     assert!(polled.is_none());
-    assert_structured_delete_client_idle(&registry, "replace-job-sync").await;
+    assert_structured_delete_runner_idle(&registry, "replace-job-sync").await;
 }

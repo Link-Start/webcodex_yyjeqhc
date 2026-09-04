@@ -5,16 +5,16 @@ use super::super::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use super::super::ToolRuntime;
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellClientRegisterRequest, ShellCommandExecutionState,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerRegisterRequest, RunnerResultPayload,
+    RunnerResultRequest, ShellCommandExecutionState,
 };
 use serde_json::json;
 
 #[tokio::test]
 async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     let runtime = runtime_with_agent_project("telemetry-shell");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -178,7 +178,7 @@ async fn run_shell_via_agent(
     completion: Option<(i32, &str, &str)>,
 ) -> ToolResult {
     let runtime = runtime_with_agent_project(client_id);
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -212,7 +212,7 @@ async fn run_shell_via_agent_lifecycle_error(
     execution_state: ShellCommandExecutionState,
 ) -> ToolResult {
     let runtime = runtime_with_agent_project(client_id);
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -226,11 +226,11 @@ async fn run_shell_via_agent_lifecycle_error(
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id: request.request_id,
                 exit_code: None,
                 stdout: None,
@@ -261,10 +261,10 @@ async fn update_agent_shell_job(
     finished: bool,
 ) {
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: job_id.to_string(),
             request_id: Some(request_id.to_string()),
             update_seq: None,
@@ -481,7 +481,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
         .await;
     assert!(terminal.success, "{:?}", terminal.error);
     assert_eq!(terminal.output["status"], "stopped");
-    assert!(runtime.shell_clients.remove_job_record(&job_id).await);
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
 #[tokio::test]
@@ -493,7 +493,7 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             async_shell_jobs: true,
             ..Default::default()
@@ -535,7 +535,7 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
     assert_eq!(result.output["effective_timeout_secs"], 120);
     assert_eq!(result.output["sync_wait_secs"], 10);
     assert_run_shell_result_matches_schema(&result);
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -546,7 +546,7 @@ async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capabilit
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             async_shell_jobs: true,
             ..Default::default()
@@ -569,7 +569,7 @@ async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capabilit
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -579,9 +579,9 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
     let runtime = test_runtime();
     let auth = open_auth_context();
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
@@ -589,14 +589,14 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         shell: false,
                         async_shell_jobs: true,
                         ..Default::default()
@@ -609,7 +609,7 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         "inst",
         vec![registered_project(
@@ -640,7 +640,7 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
     assert!(probe_patch_agent_request(&runtime, client_id)
         .await
         .is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -652,7 +652,7 @@ async fn long_run_shell_job_timeout_is_terminal_and_never_becomes_fake_outcome_u
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             async_shell_jobs: true,
             ..Default::default()
@@ -723,7 +723,7 @@ async fn long_run_shell_job_timeout_is_terminal_and_never_becomes_fake_outcome_u
     assert!(probe_patch_agent_request(&runtime, client_id)
         .await
         .is_none());
-    assert!(runtime.shell_clients.remove_job_record(&job_id).await);
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
 #[tokio::test]
@@ -755,7 +755,7 @@ async fn run_shell_failure_reports_command_started_and_output_tail() {
 
 #[tokio::test]
 async fn raw_shell_tools_reject_authored_command_above_shared_bound_before_project_resolution() {
-    let command = "x".repeat(crate::shell_protocol::RAW_SHELL_COMMAND_MAX_BYTES + 1);
+    let command = "x".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES + 1);
 
     let run_shell = test_runtime()
         .run_shell(
@@ -998,7 +998,7 @@ async fn run_shell_result_wait_timeout_reports_unknown_outcome() {
 async fn run_shell_runner_timeout_preserves_known_timeout_state() {
     let client_id = "shell-runner-timeout";
     let runtime = runtime_with_agent_project(client_id);
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -1012,11 +1012,11 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id: request.request_id,
                 exit_code: Some(-1),
                 stdout: Some("partial output".to_string()),
@@ -1048,7 +1048,7 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
 async fn run_shell_transport_disconnect_after_dispatch_reports_unknown_outcome() {
     let client_id = "shell-disconnect";
     let runtime = runtime_with_agent_project(client_id);
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -1063,7 +1063,7 @@ async fn run_shell_transport_disconnect_after_dispatch_reports_unknown_outcome()
     wait_for_patch_agent_request(&runtime, client_id).await;
 
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect(client_id, "inst")
         .await;
 
@@ -1364,7 +1364,7 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
     assert!(run.success, "{:?}", run.error);
     let job_id = run.output["job_id"].as_str().unwrap().to_string();
     let start_req =
-        wait_for_agent_request_for_instance(&runtime, "client-stop-pending", "inst").await;
+        wait_for_runner_request_for_instance(&runtime, "client-stop-pending", "inst").await;
     assert_eq!(start_req.kind, "start_job");
 
     let result = runtime
@@ -1494,14 +1494,14 @@ async fn register_job_agent_for_auth(
     project_id: &str,
     auth: &crate::auth::AuthContext,
 ) {
-    let caps = crate::test_support::current_runner_capabilities(ShellClientCapabilities {
+    let caps = crate::test_support::current_runner_capabilities(RunnerCapabilities {
         async_shell_jobs: true,
         ..Default::default()
     });
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
@@ -1509,8 +1509,8 @@ async fn register_job_agent_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
@@ -1523,7 +1523,7 @@ async fn register_job_agent_for_auth(
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         "inst",
         vec![registered_project(
@@ -1551,8 +1551,8 @@ async fn register_managed_job_agent(
     owner: &str,
 ) {
     runtime
-        .shell_clients
-        .register(ShellClientRegisterRequest {
+        .runner_registry
+        .register(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: Some(4),
@@ -1560,24 +1560,22 @@ async fn register_managed_job_agent(
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some(owner.to_string()),
             hostname: None,
             host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities {
-                    async_shell_jobs: true,
-                    ..Default::default()
-                },
-            ),
+            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
+                async_shell_jobs: true,
+                ..Default::default()
+            }),
             policy: None,
         })
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         "inst",
         vec![registered_project(
@@ -1623,13 +1621,13 @@ async fn start_agent_runtime_job_in_session(
 }
 
 async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
-    let request = wait_for_agent_request_for_instance(runtime, client_id, "inst").await;
+    let request = wait_for_runner_request_for_instance(runtime, client_id, "inst").await;
     let job_id = request.job_id.clone().expect("Job request id");
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
             update_seq: None,
@@ -1794,7 +1792,7 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group() {
     let job_b = start_agent_runtime_job(&runtime, "client-b", "proj-b", &shared_b).await;
     let job_open = start_agent_runtime_job(&runtime, "client-open", "proj-open", &open).await;
 
-    let req = wait_for_agent_request_for_instance(&runtime, "client-b", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "client-b", "inst").await;
     complete_patch_agent_request(&runtime, "client-b", &req.request_id, 0, "b-out", "b-err").await;
 
     let list_a = runtime
@@ -2041,7 +2039,8 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
         mark_next_agent_job_running(&runtime, "target-a").await,
         job_a1_running
     );
-    let completed_request = wait_for_agent_request_for_instance(&runtime, "target-a", "inst").await;
+    let completed_request =
+        wait_for_runner_request_for_instance(&runtime, "target-a", "inst").await;
     assert_eq!(
         completed_request.job_id.as_deref(),
         Some(job_a1_completed.as_str())

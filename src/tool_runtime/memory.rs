@@ -110,7 +110,7 @@ struct MemoryInventoryObservation {
 }
 
 fn memory_inventory_observation(
-    views: Option<&[crate::shell_client::ShellClientSemanticView]>,
+    views: Option<&[crate::runner_http::RunnerSemanticView]>,
 ) -> MemoryInventoryObservation {
     let Some(views) = views else {
         return MemoryInventoryObservation::default();
@@ -127,7 +127,7 @@ fn memory_inventory_observation(
         client_inventory_complete.insert(client_id.clone(), complete);
         for project in &semantic.view.projects {
             let runtime_id =
-                super::project_resolution::agent_project_runtime_id(client_id, &project.id);
+                super::project_resolution::runner_project_runtime_id(client_id, &project.id);
             let scope = memory_scope_id_from_parts(&runtime_id, client_id, &project.path);
             if current_projects.insert(scope, runtime_id).is_some() {
                 // A domain collision or duplicated authoritative identity makes
@@ -555,9 +555,9 @@ impl ToolRuntime {
             Err(error) => return memory_lifecycle_store_error(error),
         };
         let views = self
-            .shell_clients
-            .list_bounded_client_semantic_views_for_auth(
-                crate::shell_client::runner_access_from_auth(auth).as_ref(),
+            .runner_registry
+            .list_bounded_runner_semantic_views_for_auth(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
                 MAX_MEMORY_SCOPE_INVENTORY_CLIENTS,
                 MAX_MEMORIES_GLOBAL,
             )
@@ -658,9 +658,9 @@ impl ToolRuntime {
             Err(error) => return memory_lifecycle_store_error(error),
         };
 
-        self.shell_clients
-            .with_bounded_client_semantic_views_for_auth_locked(
-                crate::shell_client::runner_access_from_auth(auth).as_ref(),
+        self.runner_registry
+            .with_bounded_runner_semantic_views_for_auth_locked(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
                 MAX_MEMORY_SCOPE_INVENTORY_CLIENTS,
                 MAX_MEMORIES_GLOBAL,
                 |views| {

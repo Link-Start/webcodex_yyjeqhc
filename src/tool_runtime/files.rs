@@ -32,7 +32,7 @@ use crate::project_overview::{
     normalize_project_overview_path,
 };
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{
+use crate::runner_protocol::{
     ShellCommandExecutionState, ShellFileOpRequest, ShellRunRequest, ShellRunResponse,
     EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
@@ -92,7 +92,7 @@ impl ToolRuntime {
     // Arguments travel as JSON in a native Runner file-op payload; the agent
     // performs validation and returns one JSON object on stdout.
 
-    pub(crate) async fn run_agent_json_file_op(
+    pub(crate) async fn run_runner_json_file_op(
         &self,
         client_id: String,
         cwd: String,
@@ -105,7 +105,7 @@ impl ToolRuntime {
             .map_err(|e| format!("failed to serialize file-op payload: {}", e))?;
         let wait_timeout = 60_u64;
         let (request_id, rx) = self
-            .shell_clients
+            .runner_registry
             .enqueue_file_op(
                 ShellFileOpRequest {
                     op: op.to_string(),
@@ -130,11 +130,11 @@ impl ToolRuntime {
         let resp = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err(format!("Runner {} request was dropped", tool_name));
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err(format!("timed out waiting for Runner {}", tool_name));
             }
         };

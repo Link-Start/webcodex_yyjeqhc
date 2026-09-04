@@ -2,12 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn enqueue_internal_posix_script_is_typed_and_capability_fenced() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_instance_with_capabilities(
         &registry,
         "internal-posix-on",
         "inst",
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             internal_posix_script: true,
             ..Default::default()
@@ -29,9 +29,9 @@ async fn enqueue_internal_posix_script_is_typed_and_capability_fenced() {
         .expect("capable client should accept internal POSIX work");
 
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "internal-posix-on".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -43,7 +43,7 @@ async fn enqueue_internal_posix_script_is_typed_and_capability_fenced() {
     let payload = polled.script.expect("typed internal script payload");
     assert_eq!(
         payload.language,
-        crate::shell_protocol::ShellScriptLanguage::Sh
+        crate::runner_protocol::ShellScriptLanguage::Sh
     );
     assert_eq!(payload.script, script);
     assert!(payload.args.is_empty());
@@ -51,12 +51,12 @@ async fn enqueue_internal_posix_script_is_typed_and_capability_fenced() {
 
 #[tokio::test]
 async fn enqueue_internal_posix_script_preserves_generated_command_wire_bound() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_instance_with_capabilities(
         &registry,
         "internal-posix-bound",
         "inst",
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             internal_posix_script: true,
             ..Default::default()
@@ -68,7 +68,7 @@ async fn enqueue_internal_posix_script_preserves_generated_command_wire_bound() 
         .enqueue_internal_posix_script(
             "internal-posix-bound".to_string(),
             Some("/tmp/proj".to_string()),
-            "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES + 1),
+            "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES + 1),
             30,
             32,
             "test".to_string(),
@@ -76,5 +76,5 @@ async fn enqueue_internal_posix_script_preserves_generated_command_wire_bound() 
         .await
         .unwrap_err();
     assert!(error.contains("Runner wire envelope"), "{error}");
-    assert_structured_delete_client_idle(&registry, "internal-posix-bound").await;
+    assert_structured_delete_runner_idle(&registry, "internal-posix-bound").await;
 }

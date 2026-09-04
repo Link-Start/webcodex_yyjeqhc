@@ -7,7 +7,7 @@ use super::helpers::{bounded_tail, decode_git_quoted_path};
 use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::tool_result::ToolResult;
 use super::ToolRuntime;
-use crate::shell_protocol::{ShellCommandExecutionState, ShellRunRequest, ShellRunResponse};
+use crate::runner_protocol::{ShellCommandExecutionState, ShellRunRequest, ShellRunResponse};
 
 pub(crate) use webcodex_core::runtime_contract::MAX_UNIFIED_DIFF_BYTES;
 const MAX_UNIFIED_DIFF_AFFECTED_FILES: usize = 128;
@@ -529,7 +529,7 @@ impl ToolRuntime {
         diff: String,
     ) -> Result<ShellRunResponse, UnifiedDiffCommandFailure> {
         let (request_id, receiver) = self
-            .shell_clients
+            .runner_registry
             .enqueue_run(
                 ShellRunRequest {
                     client_id,
@@ -553,7 +553,7 @@ impl ToolRuntime {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 let dispatch = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 Err(UnifiedDiffCommandFailure {
@@ -565,7 +565,7 @@ impl ToolRuntime {
             }
             Err(_) => {
                 let dispatch = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 Err(UnifiedDiffCommandFailure {

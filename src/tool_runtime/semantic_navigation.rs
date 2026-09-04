@@ -8,10 +8,10 @@ use super::lsp_tools::runner_local_project_id;
 use super::project_resolution::ResolvedProject;
 use super::ToolRuntime;
 use crate::lsp_bridge::{
-    parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspRequest, LspAvailabilityStatus,
-    LspStatusResult,
+    parse_runner_lsp_result_envelope, LspAvailabilityStatus, LspStatusResult, RunnerLspPayload,
+    RunnerLspRequest,
 };
-use crate::shell_client::{EnqueueLspError, RunnerFeature};
+use crate::runner_http::{EnqueueLspError, RunnerFeature};
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -161,7 +161,7 @@ impl SemanticNavigationStartupSummary {
 
     fn from_enqueue_error(error: &EnqueueLspError) -> Self {
         match error {
-            EnqueueLspError::UnknownClient { .. } | EnqueueLspError::ClientOffline { .. } => {
+            EnqueueLspError::UnknownRunner { .. } | EnqueueLspError::RunnerOffline { .. } => {
                 Self::unsupported(
                     SemanticNavigationStartupStatus::RunnerUnavailable,
                     SemanticNavigationReasonCode::RunnerNotConnected,
@@ -297,8 +297,8 @@ impl ToolRuntime {
     ) -> SemanticNavigationStartupSummary {
         let client_id = resolved.config.client_id.clone();
         let Some(client) = self
-            .shell_clients
-            .get_client_semantic_view(&client_id)
+            .runner_registry
+            .get_runner_semantic_view(&client_id)
             .await
         else {
             return SemanticNavigationStartupSummary::unsupported(
@@ -326,14 +326,14 @@ impl ToolRuntime {
         };
 
         let deadline = Instant::now() + self.semantic_navigation_probe_timeout;
-        let payload = AgentLspPayload {
+        let payload = RunnerLspPayload {
             project_id: agent_project_id.to_string(),
-            request: AgentLspRequest::Status,
+            request: RunnerLspRequest::Status,
         };
         let timeout_secs = self.semantic_navigation_probe_timeout.as_secs().max(1);
         let enqueued = tokio::time::timeout_at(
             deadline,
-            self.shell_clients.enqueue_lsp(
+            self.runner_registry.enqueue_lsp(
                 client_id,
                 payload,
                 "coding_startup_probe".to_string(),
@@ -354,14 +354,14 @@ impl ToolRuntime {
 
         let response = match tokio::time::timeout_at(deadline, receiver).await {
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return SemanticNavigationStartupSummary::supported_failure(
                     SemanticNavigationStartupStatus::ProbeTimeout,
                     SemanticNavigationReasonCode::StatusProbeTimedOut,
                 );
             }
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return SemanticNavigationStartupSummary::supported_failure(
                     SemanticNavigationStartupStatus::ProbeFailed,
                     SemanticNavigationReasonCode::StatusProbeFailed,
@@ -381,7 +381,7 @@ impl ToolRuntime {
                 SemanticNavigationReasonCode::MalformedRunnerResult,
             );
         };
-        let envelope = match parse_agent_lsp_result_envelope(stdout) {
+        let envelope = match parse_runner_lsp_result_envelope(stdout) {
             Ok(envelope) => envelope,
             Err(_) => {
                 return SemanticNavigationStartupSummary::supported_failure(
@@ -548,7 +548,7 @@ mod tests {
     fn enqueue_error_classification_uses_variants_not_display_text() {
         let cases = [
             (
-                EnqueueLspError::UnknownClient {
+                EnqueueLspError::UnknownRunner {
                     client_id: "runner does not support navigation".to_string(),
                 },
                 SemanticNavigationStartupStatus::RunnerUnavailable,
@@ -557,8 +557,7 @@ mod tests {
             (
                 EnqueueLspError::UnsupportedCapability {
                     client_id: "unknown shell client wording".to_string(),
-                    capability:
-                        crate::shell_protocol::SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+                    capability: crate::runner_protocol::RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
                 },
                 SemanticNavigationStartupStatus::RunnerCapabilityUnavailable,
                 SemanticNavigationReasonCode::LspCapabilityNotAdvertised,

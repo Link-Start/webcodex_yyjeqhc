@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::runner_protocol::RunnerCapabilities;
 use serde_json::json;
 
 async fn write_runtime(client_id: &str) -> (ToolRuntime, String) {
@@ -11,7 +11,7 @@ async fn write_runtime(client_id: &str) -> (ToolRuntime, String) {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -100,7 +100,7 @@ async fn write_project_file_dropped_waiter_after_dispatch_is_outcome_unknown() {
     assert!(payload.get("expected_content_prefix").is_none());
     assert_eq!(
         runtime
-            .shell_clients
+            .runner_registry
             .cancel_request_dispatch_state(&request.request_id)
             .await,
         Some(true)

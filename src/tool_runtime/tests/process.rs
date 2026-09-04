@@ -2,9 +2,9 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellCommandExecutionState,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerResultPayload, RunnerResultRequest,
+    ShellCommandExecutionState,
 };
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use serde_json::json;
@@ -44,7 +44,7 @@ async fn register_process_agent(
     root: &std::path::Path,
     structured_process_argv: bool,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         structured_validation_argv: true,
         structured_process_argv,
@@ -58,7 +58,7 @@ async fn register_process_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn register_process_job_agent(
@@ -66,7 +66,7 @@ async fn register_process_job_agent(
     client_id: &str,
     root: &std::path::Path,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
@@ -84,7 +84,7 @@ async fn register_process_job_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn register_detached_process_job_agent(
@@ -93,7 +93,7 @@ async fn register_detached_process_job_agent(
     root: &std::path::Path,
     detached_process_jobs: bool,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
@@ -111,7 +111,7 @@ async fn register_detached_process_job_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 fn detached_process_call_with(
@@ -147,7 +147,7 @@ fn detached_process_call(project: String) -> ToolCall {
 async fn update_process_job(
     runtime: &ToolRuntime,
     client_id: &str,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     status: &str,
     state: Option<ShellCommandExecutionState>,
     exit_code: Option<i32>,
@@ -156,10 +156,10 @@ async fn update_process_job(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
             update_seq: None,
@@ -191,11 +191,11 @@ async fn complete_process_lifecycle(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id,
                 exit_code,
                 stdout: Some(stdout.to_string()),
@@ -218,7 +218,7 @@ async fn dispatch_process_until_request(
     auth: crate::auth::AuthContext,
 ) -> (
     tokio::task::JoinHandle<ToolResult>,
-    crate::shell_protocol::ShellAgentShellRequest,
+    crate::runner_protocol::RunnerRequest,
 ) {
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -306,7 +306,7 @@ async fn run_process_enqueues_only_typed_argv_and_reports_completed_exit_codes()
 async fn detached_process_requires_job_run_and_detach_scopes_before_any_admission() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
@@ -324,7 +324,7 @@ async fn detached_process_requires_job_run_and_detach_scopes_before_any_admissio
         vec![registered_project("demo", &temp.path().to_string_lossy())],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id("detached-scope-gate", "demo");
+    let project = crate::tool_runtime::runner_project_runtime_id("detached-scope-gate", "demo");
 
     for (label, mut auth, key) in [
         (
@@ -377,7 +377,7 @@ async fn detached_process_requires_job_run_and_detach_scopes_before_any_admissio
             outcome.error_status.is_some(),
             "{label} should fail at scope gate"
         );
-        assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+        assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
         assert!(probe_patch_agent_request(&runtime, "detached-scope-gate")
             .await
             .is_none());
@@ -408,7 +408,7 @@ async fn detached_process_requires_job_run_and_detach_scopes_before_any_admissio
         .await;
     assert!(!denied.success);
     assert!(denied.error_status.is_some());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(probe_patch_agent_request(&runtime, "detached-scope-gate")
         .await
         .is_none());
@@ -445,7 +445,7 @@ async fn detached_process_requires_job_run_and_detach_scopes_before_any_admissio
     );
     let result = admitted.result.expect("admitted detached tool result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(runtime.shell_clients.list_jobs(Some(10)).await.len(), 1);
+    assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
     assert_eq!(
         wait_for_patch_agent_request(&runtime, "detached-scope-gate")
             .await
@@ -538,7 +538,7 @@ async fn detached_process_idempotency_replays_same_intent_and_rejects_conflict()
             .is_none(),
         "same-key same-intent replay must not redispatch"
     );
-    assert_eq!(runtime.shell_clients.list_jobs(Some(10)).await.len(), 1);
+    assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
 
     let conflict = runtime
         .dispatch_with_auth(
@@ -561,7 +561,7 @@ async fn detached_process_idempotency_replays_same_intent_and_rejects_conflict()
             .is_none(),
         "conflicting key must fail before redispatch"
     );
-    assert_eq!(runtime.shell_clients.list_jobs(Some(10)).await.len(), 1);
+    assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
     assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
 
     let restarted = test_runtime();
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
@@ -614,14 +614,14 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
         ..Default::default()
     };
     restarted
-        .shell_clients
-        .register(crate::shell_protocol::ShellClientRegisterRequest {
+        .runner_registry
+        .register(crate::runner_protocol::RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
-            job_inventory: Some(crate::shell_protocol::ShellJobInventory {
+            job_inventory: Some(crate::runner_protocol::ShellJobInventory {
                 active_complete: true,
-                jobs: vec![crate::shell_protocol::ShellJobSnapshot {
+                jobs: vec![crate::runner_protocol::ShellJobSnapshot {
                     job_id: job_id.clone(),
                     request_id: request.request_id.clone(),
                     status: "running".to_string(),
@@ -642,8 +642,8 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "detached-restart-recovery".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: None,
             hostname: None,
@@ -654,14 +654,14 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &restarted.shell_clients,
+        &restarted.runner_registry,
         "detached-restart-recovery",
         "inst",
         vec![registered_project("demo", &temp.path().to_string_lossy())],
     )
     .await;
     let restarted_project =
-        crate::tool_runtime::agent_project_runtime_id("detached-restart-recovery", "demo");
+        crate::tool_runtime::runner_project_runtime_id("detached-restart-recovery", "demo");
     let retry = restarted
         .dispatch_with_auth(
             detached_process_call_with(
@@ -836,14 +836,14 @@ async fn run_process_fast_terminal_jobs_project_back_without_visible_duplicates(
         }
         assert!(
             runtime
-                .shell_clients
+                .runner_registry
                 .hidden_job_ids_for_test()
                 .await
                 .is_empty(),
             "a fast terminal execution must not retain its internal Job"
         );
         assert!(
-            runtime.shell_clients.list_jobs(Some(10)).await.is_empty(),
+            runtime.runner_registry.list_jobs(Some(10)).await.is_empty(),
             "a fast terminal execution must not become a public duplicate"
         );
     }
@@ -972,7 +972,7 @@ async fn run_process_fast_terminal_projection_does_not_silently_drop_retained_li
         .map(|line| format!("retained-line-{line:03}\n"))
         .collect::<String>();
     assert!(
-        retained_stdout.len() < crate::shell_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
+        retained_stdout.len() < crate::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
         "fixture must fit the Runner-retained snapshot bound"
     );
     assert!(
@@ -1021,7 +1021,7 @@ async fn run_process_fast_terminal_projection_does_not_silently_drop_retained_li
     assert_eq!(result.output["stdout_lines"], 300);
     assert!(result.output.get("stdout_truncated").is_none());
     assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -1038,7 +1038,7 @@ async fn run_process_fast_prestart_rejection_retains_not_started_through_the_hid
     )
     .await;
     let queued = runtime
-        .shell_clients
+        .runner_registry
         .get_hidden_job_for_auth(
             Some(&crate::test_support::runner_access(&auth)),
             request.job_id.as_deref().unwrap(),
@@ -1071,7 +1071,7 @@ async fn run_process_fast_prestart_rejection_retains_not_started_through_the_hid
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["failure_kind"], "spawn_failed");
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -1295,7 +1295,7 @@ async fn run_process_short_timeout_stays_direct_without_job_headroom() {
     assert!(result.success, "{:?}", result.error);
     assert!(result.output.get("execution_state").is_none());
     assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -1354,7 +1354,7 @@ async fn stop_job_stops_the_promoted_process_without_starting_a_replacement() {
         Some("job stopped"),
     )
     .await;
-    let terminal = runtime.shell_clients.get_job(&job_id).await.unwrap();
+    let terminal = runtime.runner_registry.get_job(&job_id).await.unwrap();
     assert_eq!(terminal.status, "stopped");
     assert_eq!(
         terminal.command_execution_state,
@@ -1401,7 +1401,7 @@ async fn promoted_process_inherits_the_initiating_session_without_a_second_tool_
     .await;
     let handoff = task.await.unwrap();
     let job_id = handoff.output["job_id"].as_str().unwrap();
-    let job = runtime.shell_clients.get_job(job_id).await.unwrap();
+    let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.session_id.as_deref(), Some(session.session_id.as_str()));
     assert_eq!(job.project_id.as_deref(), Some(project.as_str()));
     assert_eq!(job.purpose.as_deref(), Some("diagnostic"));
@@ -1568,7 +1568,7 @@ async fn run_process_transport_uncertainty_and_timeout_preserve_phase_a_truth() 
     });
     wait_for_patch_agent_request(&runtime, "process-lifecycle").await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("process-lifecycle", "inst")
         .await;
     let uncertain = uncertain_task.await.unwrap();

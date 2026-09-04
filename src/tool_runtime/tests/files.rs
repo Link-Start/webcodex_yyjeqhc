@@ -4,9 +4,7 @@ use super::super::files::*;
 use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentResultRequest, ShellAgentShellRequest, ShellClientCapabilities,
-};
+use crate::runner_protocol::{RunnerCapabilities, RunnerRequest, RunnerResultRequest};
 use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -14,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
 async fn write_project_file_with_session_id_records_changed_path_without_content() {
     let runtime = runtime_with_agent_project("telemetry-write");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         file_write: true,
         shell: true,
         git: true,
@@ -173,7 +171,7 @@ async fn delete_project_files_capable_agent_uses_structured_delete_without_outpu
         &runtime,
         "cleanup-delete",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -225,8 +223,8 @@ async fn wait_for_pending_requests(runtime: &ToolRuntime, client_id: &str, expec
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let view = runtime
-            .shell_clients
-            .get_client_view(client_id)
+            .runner_registry
+            .get_runner_view(client_id)
             .await
             .unwrap_or_else(|| panic!("client {client_id} must be registered"));
         let pending = view.pending_requests;
@@ -249,7 +247,7 @@ async fn delete_project_files_replacement_before_poll_reports_not_started() {
         &runtime,
         "cleanup-delete-replace-early",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -270,7 +268,7 @@ async fn delete_project_files_replacement_before_poll_reports_not_started() {
     wait_for_pending_requests(&runtime, "cleanup-delete-replace-early", 1).await;
     // Replace the Runner process before the request was ever polled.
     runtime
-        .shell_clients
+        .runner_registry
         .set_last_seen_for_test(
             "cleanup-delete-replace-early",
             chrono::Utc::now().timestamp() - 120,
@@ -281,7 +279,7 @@ async fn delete_project_files_replacement_before_poll_reports_not_started() {
         "cleanup-delete-replace-early",
         "inst-b",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
     )
     .await;
 
@@ -314,7 +312,7 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
         &runtime,
         "cleanup-delete-replace-late",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -334,11 +332,11 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
     wait_for_pending_requests(&runtime, "cleanup-delete-replace-late", 1).await;
     // Dispatch the structured request to the original instance.
     let req =
-        wait_for_agent_request_for_instance(&runtime, "cleanup-delete-replace-late", "inst").await;
+        wait_for_runner_request_for_instance(&runtime, "cleanup-delete-replace-late", "inst").await;
     assert_eq!(req.kind, "file_delete_project_files");
     // Replace the Runner before it returns its result.
     runtime
-        .shell_clients
+        .runner_registry
         .set_last_seen_for_test(
             "cleanup-delete-replace-late",
             chrono::Utc::now().timestamp() - 120,
@@ -349,7 +347,7 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
         "cleanup-delete-replace-late",
         "inst-b",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
     )
     .await;
 
@@ -371,10 +369,10 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
     // The replacement Runner cannot complete or inherit the dispatched
     // request, and no legacy fallback is emitted.
     let err = runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "cleanup-delete-replace-late".to_string(),
-            agent_instance_id: "inst-b".to_string(),
+            runner_instance_id: "inst-b".to_string(),
             request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(r#"{"deleted_paths":["tmp.txt"]}"#.to_string()),
@@ -403,7 +401,7 @@ async fn delete_project_files_timeout_before_dispatch_reports_not_started() {
         &runtime,
         "cleanup-delete-timeout-early",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -431,8 +429,8 @@ async fn delete_project_files_timeout_before_dispatch_reports_not_started() {
     );
     // The timed-out request was removed: no queue/waiter leak.
     let view = runtime
-        .shell_clients
-        .get_client_view("cleanup-delete-timeout-early")
+        .runner_registry
+        .get_runner_view("cleanup-delete-timeout-early")
         .await
         .unwrap();
     assert_eq!(view.pending_requests, 0);
@@ -445,7 +443,7 @@ async fn delete_project_files_timeout_after_dispatch_reports_outcome_unknown() {
         &runtime,
         "cleanup-delete-timeout-late",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -473,7 +471,7 @@ async fn delete_project_files_timeout_after_dispatch_reports_outcome_unknown() {
     // Dispatch the structured request; the Runner never returns a result, so
     // the wait timeout fires after dispatch may have started deleting.
     let req =
-        wait_for_agent_request_for_instance(&runtime, "cleanup-delete-timeout-late", "inst").await;
+        wait_for_runner_request_for_instance(&runtime, "cleanup-delete-timeout-late", "inst").await;
     assert_eq!(req.kind, "file_delete_project_files");
 
     let result = task.await.unwrap();
@@ -487,8 +485,8 @@ async fn delete_project_files_timeout_after_dispatch_reports_outcome_unknown() {
     );
     // The timed-out request was removed: no queue/waiter leak.
     let view = runtime
-        .shell_clients
-        .get_client_view("cleanup-delete-timeout-late")
+        .runner_registry
+        .get_runner_view("cleanup-delete-timeout-late")
         .await
         .unwrap();
     assert_eq!(view.pending_requests, 0);
@@ -501,7 +499,7 @@ async fn delete_project_files_waiter_dropped_without_undispatch_proof_reports_ou
         &runtime,
         "cleanup-delete-waiter",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -530,9 +528,9 @@ async fn delete_project_files_waiter_dropped_without_undispatch_proof_reports_ou
     // cancellation API: remove the pending record (dropping the oneshot
     // sender) without resolving it, so the tool's receiver observes the
     // channel close. The registry returns the preserved dispatch truth.
-    let req = wait_for_agent_request_for_instance(&runtime, "cleanup-delete-waiter", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "cleanup-delete-waiter", "inst").await;
     let dispatch = runtime
-        .shell_clients
+        .runner_registry
         .cancel_request_dispatch_state(&req.request_id)
         .await;
     assert_eq!(
@@ -554,8 +552,8 @@ async fn delete_project_files_waiter_dropped_without_undispatch_proof_reports_ou
         "error was: {error}"
     );
     let view = runtime
-        .shell_clients
-        .get_client_view("cleanup-delete-waiter")
+        .runner_registry
+        .get_runner_view("cleanup-delete-waiter")
         .await
         .unwrap();
     assert_eq!(view.pending_requests, 0);
@@ -568,7 +566,7 @@ async fn delete_project_files_terminal_failure_reports_outcome_unknown() {
         &runtime,
         "cleanup-delete-terminal",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             structured_file_delete: true,
             ..Default::default()
         },
@@ -590,7 +588,7 @@ async fn delete_project_files_terminal_failure_reports_outcome_unknown() {
     // (non-zero exit). The mutation may already have deleted files, so the
     // failure must never collapse into an ordinary retry-safe error.
     let req =
-        wait_for_agent_request_for_instance(&runtime, "cleanup-delete-terminal", "inst").await;
+        wait_for_runner_request_for_instance(&runtime, "cleanup-delete-terminal", "inst").await;
     complete_patch_agent_request_for_instance(
         &runtime,
         "cleanup-delete-terminal",
@@ -627,7 +625,7 @@ async fn artifact_upload_chunk_session_log_arguments_do_not_store_base64() {
         &runtime,
         "telemetry-artifact-chunk",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -789,7 +787,7 @@ async fn conversation_import_durable_session_events_do_not_store_host_file_refs(
         &runtime,
         "telemetry-conversation-import",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -850,7 +848,7 @@ async fn read_project_artifact_metadata_allow_missing_does_not_count_as_failed()
         &runtime,
         "artifact-missing-session",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -909,7 +907,7 @@ async fn artifact_upload_begin_policy_rejection_is_classified() {
         &runtime,
         "artifact-policy-session",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -1577,7 +1575,7 @@ async fn execute_agent_search(
     client_id: &str,
     project: String,
     request: SearchRequest,
-) -> (ToolResult, ShellAgentShellRequest) {
+) -> (ToolResult, RunnerRequest) {
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2602,7 +2600,7 @@ async fn search_invalid_request_dispatch_returns_structured_error() {
         &runtime,
         "search-invalid",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             ..Default::default()
         },
@@ -2641,7 +2639,7 @@ async fn search_agent_command_timeout_returns_search_timeout() {
     std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-cmd-timeout", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-cmd-timeout", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2664,10 +2662,10 @@ async fn search_agent_command_timeout_returns_search_timeout() {
     assert_eq!(req.timeout_secs, 1);
     // Simulate Runner-side command timeout response (lowercase message + error field).
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "search-cmd-timeout".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(-1),
             stdout: Some(
@@ -2696,7 +2694,7 @@ async fn search_agent_execution_failure_is_structured_and_does_not_leak_diagnost
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-agent-failure", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-agent-failure", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2712,10 +2710,10 @@ async fn search_agent_execution_failure_is_structured_and_does_not_leak_diagnost
     let private_diagnostic =
         "provider private prose at /private/runner/workspace with token=NEVER_RETURN";
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "search-agent-failure".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(9),
             stdout: Some(
@@ -2748,7 +2746,7 @@ async fn search_agent_timeout_without_trusted_marker_cannot_return_partial_succe
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-timeout-no-marker", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "search-timeout-no-marker", "demo", tmp.path())
             .await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -2769,10 +2767,10 @@ async fn search_agent_timeout_without_trusted_marker_cannot_return_partial_succe
     });
     let req = wait_for_patch_agent_request(&runtime, "search-timeout-no-marker").await;
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "search-timeout-no-marker".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(-1),
             stdout: Some("src/a.rs:1:needle\n".to_string()),
@@ -2802,7 +2800,7 @@ async fn search_agent_timeout_with_complete_records_returns_partial_success() {
     std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-ptimeout", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-ptimeout", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2823,10 +2821,10 @@ async fn search_agent_timeout_with_complete_records_returns_partial_success() {
     });
     let req = wait_for_patch_agent_request(&runtime, "search-ptimeout").await;
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "search-ptimeout".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(-1),
             stdout: Some(
@@ -2861,7 +2859,7 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
     std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-outer-timeout", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-outer-timeout", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2900,10 +2898,10 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
     );
     // Request should have been cancelled (no longer pending for completion).
     let complete = runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "search-outer-timeout".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id,
             exit_code: Some(0),
             stdout: Some(String::new()),
@@ -2924,7 +2922,7 @@ async fn search_agent_request_dropped_returns_structured_error() {
     std::fs::write(tmp.path().join("a.rs"), "needle\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-dropped", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-dropped", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -2945,7 +2943,10 @@ async fn search_agent_request_dropped_returns_structured_error() {
     });
     let req = wait_for_patch_agent_request(&runtime, "search-dropped").await;
     // Drop the oneshot waiter without completing — agent disconnect / channel drop.
-    runtime.shell_clients.cancel_request(&req.request_id).await;
+    runtime
+        .runner_registry
+        .cancel_request(&req.request_id)
+        .await;
     let result = task.await.unwrap();
     assert!(!result.success);
     assert_search_output_keys_are_declared(&result.output);
@@ -2979,7 +2980,7 @@ async fn search_timeout_only_without_rg_still_allows_grep_fallback() {
 
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-timeout-fallback", "demo", &root).await;
+        register_runner_project_at_path(&runtime, "search-timeout-fallback", "demo", &root).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -3192,7 +3193,7 @@ async fn search_project_text_include_and_exclude_globs_are_additive() {
     std::fs::write(tmp.path().join("notes.txt"), "SCOPE_NEEDLE\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-globs", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-globs", "demo", tmp.path()).await;
 
     let (result, _) = execute_agent_search(
         &runtime,
@@ -3240,7 +3241,7 @@ async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
     std::fs::write(tmp.path().join("a.rs"), "FILE_NEEDLE\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-files", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-files", "demo", tmp.path()).await;
 
     let (result, _) = execute_agent_search(
         &runtime,
@@ -3286,7 +3287,7 @@ async fn search_project_text_count_distinguishes_complete_and_truncated_totals()
     std::fs::write(tmp.path().join("b.rs"), "COUNT_NEEDLE\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-count", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-count", "demo", tmp.path()).await;
 
     let (truncated, _) = execute_agent_search(
         &runtime,
@@ -3363,7 +3364,7 @@ async fn search_project_text_reports_effective_clamped_timeout() {
     std::fs::write(tmp.path().join("a.rs"), "TIMEOUT_NEEDLE\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-timeout", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-timeout", "demo", tmp.path()).await;
 
     let (low, low_req) = execute_agent_search(
         &runtime,
@@ -3405,7 +3406,7 @@ async fn advanced_search_without_rg_returns_structured_capability_error() {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(root.join("a.rs"), "needle\n").unwrap();
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(&runtime, "search-no-rg", "demo", &root).await;
+    let project = register_runner_project_at_path(&runtime, "search-no-rg", "demo", &root).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -3452,7 +3453,7 @@ async fn search_project_text_no_matches_returns_empty_matches() {
     std::fs::write(tmp.path().join("lib.rs"), "pub fn present() {}\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-empty", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-empty", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -3509,7 +3510,7 @@ async fn search_project_text_excludes_sensitive_and_build_dirs() {
     std::fs::write(tmp.path().join("id.key"), "KEEP_SEARCH_NEEDLE\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "search-excludes", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-excludes", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -3562,7 +3563,7 @@ async fn project_overview_routes_to_owning_agent_and_returns_structured_metadata
     }
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "overview-agent", "demo", temp.path()).await;
+        register_runner_project_at_path(&runtime, "overview-agent", "demo", temp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -3629,7 +3630,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
         &runtime,
         "path-boundary",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             shell: true,
             ..Default::default()
@@ -3793,7 +3794,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
 #[tokio::test]
 async fn search_project_text_requires_shell_capability() {
     let runtime = runtime_with_agent_project("oe");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: false,
         ..Default::default()
     };
@@ -3835,7 +3836,7 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
     )
     .unwrap();
     let project =
-        register_agent_project_at_path(&runtime, "search-native", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "search-native", "demo", tmp.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -3923,7 +3924,7 @@ async fn search_project_text_rejects_empty_pattern() {
         &runtime,
         "oe",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             ..Default::default()
         },
@@ -4427,7 +4428,7 @@ async fn read_file_routes_safe_and_bulk_skipped_explicit_paths_to_agent() {
             &runtime,
             client_id,
             None,
-            ShellClientCapabilities {
+            RunnerCapabilities {
                 file_read: true,
                 ..Default::default()
             },
@@ -4455,7 +4456,7 @@ async fn read_file_refuses_secret_paths_before_reaching_agent() {
     // read_file returned them verbatim. Case variants must be refused too:
     // the old search predicate was case-sensitive.
     let runtime = runtime_with_agent_project("secret-read");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         file_read: true,
         ..Default::default()
     };

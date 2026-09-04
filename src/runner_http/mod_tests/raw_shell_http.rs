@@ -6,14 +6,14 @@ async fn raw_shell_run_wait_timeout_preserves_known_dispatch_evidence() {
     use salvo::Service;
 
     let client_id = "raw-shell-timeout";
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = runner_registration(
         client_id,
         "inst",
         vec![project_summary("webcodex", "/tmp/webcodex")],
     );
     registration.capabilities =
-        crate::test_support::current_runner_capabilities(ShellClientCapabilities {
+        crate::test_support::current_runner_capabilities(RunnerCapabilities {
             shell: true,
             ..Default::default()
         });
@@ -39,9 +39,9 @@ async fn raw_shell_run_wait_timeout_preserves_known_dispatch_evidence() {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(request) = registry
-                .poll(ShellAgentPollRequest {
+                .poll(RunnerPollRequest {
                     client_id: client_id.to_string(),
-                    agent_instance_id: "inst".to_string(),
+                    runner_instance_id: "inst".to_string(),
                 })
                 .await
                 .unwrap()

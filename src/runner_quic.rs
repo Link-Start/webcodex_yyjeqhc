@@ -1,13 +1,13 @@
-//! Server-side custom QUIC agent transport.
+//! Server-side custom QUIC Runner transport.
 //!
-//! This is a **custom QUIC stream transport** for agent connections, NOT
+//! This is a **custom QUIC stream transport** for Runner connections, NOT
 //! HTTP/3. It runs a separate `quinn` UDP listener in parallel with the HTTP
 //! server (which keeps serving GPT Actions over TCP 443 via Nginx unchanged).
 //! Nginx is not involved in QUIC.
 //!
-//! QUIC is an alternative transport for the existing agent envelope protocol.
-//! It uses a length-prefixed JSON `AgentEnvelope` stream over QUIC and is
-//! intended to mirror the WebSocket agent flow, not introduce a separate
+//! QUIC is an alternative transport for the existing Runner envelope protocol.
+//! It uses a length-prefixed JSON `RunnerEnvelope` stream over QUIC and is
+//! intended to mirror the WebSocket Runner flow, not introduce a separate
 //! application protocol.
 //!
 //! Authentication reuses [`crate::auth::authenticate_bearer`], which mirrors
@@ -17,12 +17,12 @@
 
 use crate::auth::authenticate_bearer;
 use crate::config::{Config, QuicRuntimeStatus, QuicServerConfig};
-use crate::shell_client::{AgentTransport, ShellClientRegistry};
-use crate::shell_protocol::{
-    read_quic_frame, read_quic_register_frame, write_quic_frame, AgentEnvelope,
+use crate::runner_http::{RunnerRegistry, RunnerTransport};
+use crate::runner_protocol::{
+    read_quic_frame, read_quic_register_frame, write_quic_frame, RunnerEnvelope,
 };
 #[cfg(test)]
-use crate::shell_protocol::{write_quic_register_frame, QuicRegisterFrame};
+use crate::runner_protocol::{write_quic_register_frame, QuicRegisterFrame};
 use crate::Database;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
@@ -40,7 +40,7 @@ fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
-/// Deadline for the agent to send its first `Register` frame after the QUIC
+/// Deadline for the Runner to send its first `Register` frame after the QUIC
 /// handshake. Mirrors the WebSocket `REGISTER_TIMEOUT`.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum time to keep an error-path QUIC stream open while waiting for the
@@ -98,14 +98,14 @@ fn build_server_crypto(
         .map_err(|e| format!("failed to build quinn server crypto: {}", e))
 }
 
-/// Start the QUIC agent listener. Loads cert/key, binds the UDP endpoint, and
+/// Start the QUIC Runner listener. Loads cert/key, binds the UDP endpoint, and
 /// runs an accept loop in the caller's task. Per-connection errors are logged
 /// and the loop continues; only startup failures (bad cert, bind error) are
 /// returned. Runs forever once started.
-pub(crate) async fn run_quic_agent_listener(
+pub(crate) async fn run_runner_quic_listener(
     config: Arc<Config>,
     db: Option<Arc<Database>>,
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
     quic_cfg: QuicServerConfig,
     quic_status: Option<Arc<std::sync::Mutex<QuicRuntimeStatus>>>,
 ) -> Result<(), String> {
@@ -164,7 +164,7 @@ pub(crate) async fn run_quic_agent_listener(
             .mark_started();
     }
     tracing::info!(
-        "Agent QUIC listener on UDP {} with ALPN {}",
+        "Runner QUIC listener on UDP {} with ALPN {}",
         listen,
         quic_cfg.alpn
     );
@@ -174,13 +174,13 @@ pub(crate) async fn run_quic_agent_listener(
 
 /// Accept loop shared by the production listener and tests. Runs until the
 /// endpoint is closed. Each connection is handled in its own task so a slow or
-/// misbehaving agent cannot block acceptance of others.
+/// misbehaving Runner cannot block acceptance of others.
 async fn serve_quic_endpoint(
     endpoint: quinn::Endpoint,
     alpn: &str,
     config: Arc<Config>,
     db: Option<Arc<Database>>,
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let config = config.clone();
@@ -195,7 +195,7 @@ async fn serve_quic_endpoint(
                 Err(e) => {
                     tracing::warn!(
                         error = ?e,
-                        "quic agent connection handshake failed; check UDP reachability, certificate trust/SAN, and ALPN"
+                        "QUIC Runner connection handshake failed; check UDP reachability, certificate trust/SAN, and ALPN"
                     );
                 }
             }
@@ -203,14 +203,14 @@ async fn serve_quic_endpoint(
     }
 }
 
-/// Drive one QUIC agent connection to completion: register, ack, optional
+/// Drive one QUIC Runner connection to completion: register, ack, optional
 /// request dispatch, keepalive, and inbound result/job_update handling.
 async fn handle_quic_connection(
     conn: quinn::Connection,
     alpn: &str,
     config: Arc<Config>,
     db: Option<Arc<Database>>,
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
 ) {
     // ALPN is enforced by quinn during the TLS handshake: the server crypto
     // only offers the configured `alpn`, so a connection only completes when
@@ -218,14 +218,14 @@ async fn handle_quic_connection(
     // is needed; a mismatch fails the handshake (logged in the accept loop).
     let _ = alpn;
 
-    // The agent opens one bidirectional stream for all frames. Multiplexing
+    // The Runner opens one bidirectional stream for all frames. Multiplexing
     // is intentionally left to a later phase.
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(pair) => pair,
         Err(e) => {
             tracing::debug!(
                 error = ?e,
-                "quic agent accept_bi failed before register frame"
+                "QUIC Runner accept_bi failed before register frame"
             );
             return;
         }
@@ -233,7 +233,7 @@ async fn handle_quic_connection(
 
     // 1. QUIC owns its credential-bearing first-register wire. The codec keeps
     //    the current QUIC-v1 JSON shape for rolling compatibility, but the
-    //    shared AgentEnvelope lifecycle never sees the credential.
+    //    shared RunnerEnvelope lifecycle never sees the credential.
     let register_frame =
         match tokio::time::timeout(REGISTER_TIMEOUT, read_quic_register_frame(&mut recv)).await {
             Ok(Ok(frame)) => frame,
@@ -241,13 +241,13 @@ async fn handle_quic_connection(
                 tracing::debug!(
                     reason_code = "malformed_register",
                     error = %e,
-                    "quic agent first register frame rejected"
+                    "QUIC Runner first register frame rejected"
                 );
                 send_error(&mut send, &mut recv, "expected_register", &e.to_string()).await;
                 return;
             }
             Err(_) => {
-                tracing::debug!("quic agent register timed out waiting for first frame");
+                tracing::debug!("QUIC Runner register timed out waiting for first frame");
                 send_error(
                     &mut send,
                     &mut recv,
@@ -260,7 +260,7 @@ async fn handle_quic_connection(
         };
     let (mut register_payload, auth_token) = register_frame.into_parts();
     let client_id = register_payload.client_id.clone();
-    let agent_instance_id = register_payload.agent_instance_id.clone();
+    let runner_instance_id = register_payload.runner_instance_id.clone();
     let connection_id = uuid::Uuid::new_v4().to_string();
 
     // 2. Authenticate the agent token exactly like the HTTP/WebSocket paths.
@@ -277,7 +277,7 @@ async fn handle_quic_connection(
                 "invalid or missing agent token",
             )
             .await;
-            tracing::warn!(client_id = %client_id, "quic agent register rejected: unauthorized");
+            tracing::warn!(client_id = %client_id, "QUIC Runner register rejected: unauthorized");
             return;
         }
     };
@@ -287,23 +287,23 @@ async fn handle_quic_connection(
     //    the effective owner; it stops before any wire I/O so this handler sends
     //    its own error frame and logs which gate failed.
     if let Err(e) =
-        crate::agent_session::register_session_prelude(Some(&auth), &mut register_payload)
+        crate::runner_session::register_session_prelude(Some(&auth), &mut register_payload)
     {
         let reason = match &e {
-            crate::agent_session::RegisterPreludeError::ForbiddenScope(_) => "forbidden scope",
-            crate::agent_session::RegisterPreludeError::ForbiddenOwner(_) => {
+            crate::runner_session::RegisterPreludeError::ForbiddenScope(_) => "forbidden scope",
+            crate::runner_session::RegisterPreludeError::ForbiddenOwner(_) => {
                 "client_id/owner binding mismatch"
             }
         };
         tracing::warn!(
             client_id = %client_id,
             error = e.message(),
-            "quic agent register rejected: {reason}"
+            "QUIC Runner register rejected: {reason}"
         );
         send_error(
             &mut send,
             &mut recv,
-            crate::agent_session::RegisterPreludeError::CODE,
+            crate::runner_session::RegisterPreludeError::CODE,
             e.message(),
         )
         .await;
@@ -313,14 +313,14 @@ async fn handle_quic_connection(
     // 4. Commit the complete QUIC session in one registry transaction. The
     //    transport credential is already gone; only its non-secret registry
     //    access projection and the registration payload enter shared state.
-    let access = crate::shell_client::runner_access_from_auth(Some(&auth));
+    let access = crate::runner_http::runner_access_from_auth(Some(&auth));
     let notify = Arc::new(Notify::new());
     let (view, cancel) = match registry
         .register_streaming_session_with_cancel(
             register_payload,
             access.as_ref(),
             &connection_id,
-            AgentTransport::Quic,
+            RunnerTransport::Quic,
             notify.clone(),
         )
         .await
@@ -330,7 +330,7 @@ async fn handle_quic_connection(
             tracing::warn!(
                 client_id = %client_id,
                 error = %e,
-                "quic agent register failed in registry"
+                "QUIC Runner register failed in registry"
             );
             send_error(&mut send, &mut recv, "register_failed", &e).await;
             return;
@@ -341,7 +341,7 @@ async fn handle_quic_connection(
     //    ownership of SendStream. Queueing the ack into an mpsc would only prove
     //    local admission, not that the handshake reached the QUIC stream. If the
     //    actual write fails, revoke only this exact connection lease.
-    let ack = AgentEnvelope::Registered {
+    let ack = RunnerEnvelope::Registered {
         success: true,
         client: Some(view),
         error: None,
@@ -350,10 +350,10 @@ async fn handle_quic_connection(
         tracing::debug!(
             client_id = %client_id,
             error = %e,
-            "quic agent registered ack send failed"
+            "QUIC Runner registered ack send failed"
         );
         registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+            .reconcile_disconnect_for_connection(&client_id, &runner_instance_id, &connection_id)
             .await;
         return;
     }
@@ -362,29 +362,29 @@ async fn handle_quic_connection(
     //    task so the request pump and keepalive replies never concurrently hold
     //    SendStream.
     let (out_tx, mut out_rx) =
-        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
+        mpsc::channel::<RunnerEnvelope>(crate::runner_session::OUTGOING_CHANNEL_CAPACITY);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
             if write_quic_frame(&mut send, &env).await.is_err() {
-                return crate::agent_session::WriterExit::TransportFailed;
+                return crate::runner_session::WriterExit::TransportFailed;
             }
         }
         if send.finish().is_err() {
-            crate::agent_session::WriterExit::TransportFailed
+            crate::runner_session::WriterExit::TransportFailed
         } else {
-            crate::agent_session::WriterExit::ChannelClosed
+            crate::runner_session::WriterExit::ChannelClosed
         }
     });
-    tracing::info!(client_id = %client_id, "agent quic connected");
+    tracing::info!(client_id = %client_id, "Runner QUIC connected");
 
     // 7-9. Pump, reader loop, and teardown are shared with the WebSocket
     //      transport. The reader adapter wraps the QUIC receive stream.
     let reader = QuicReader { recv };
-    crate::agent_session::run_agent_session(
-        crate::agent_session::SessionContext {
+    crate::runner_session::run_runner_session(
+        crate::runner_session::SessionContext {
             registry: &registry,
             client_id: &client_id,
-            agent_instance_id: &agent_instance_id,
+            runner_instance_id: &runner_instance_id,
             connection_id: &connection_id,
             notify,
             cancel,
@@ -400,27 +400,27 @@ async fn handle_quic_connection(
     // graceful Goodbye or reader/writer termination does not leave connection
     // lifetime to object-drop timing.
     conn.close(quinn::VarInt::from_u32(0), b"session complete");
-    tracing::info!(client_id = %client_id, "agent quic disconnected");
+    tracing::info!(client_id = %client_id, "Runner QUIC disconnected");
 }
 
 /// Adapter turning a QUIC receive stream into the transport-neutral
-/// [`crate::agent_session::AgentReader`]. A clean stream end stops the reader;
+/// [`crate::runner_session::RunnerReader`]. A clean stream end stops the reader;
 /// framing errors are logged and treated as a closed connection (mirroring the
 /// previous inline reader loop).
 struct QuicReader {
     recv: quinn::RecvStream,
 }
 
-impl crate::agent_session::AgentReader for QuicReader {
-    async fn recv(&mut self) -> crate::agent_session::RecvOutcome {
+impl crate::runner_session::RunnerReader for QuicReader {
+    async fn recv(&mut self) -> crate::runner_session::RecvOutcome {
         match read_quic_frame(&mut self.recv).await {
-            Ok(env) => crate::agent_session::RecvOutcome::Envelope(env),
-            Err(crate::shell_protocol::QuicFrameError::EmptyStream) => {
-                crate::agent_session::RecvOutcome::Closed
+            Ok(env) => crate::runner_session::RecvOutcome::Envelope(env),
+            Err(crate::runner_protocol::QuicFrameError::EmptyStream) => {
+                crate::runner_session::RecvOutcome::Closed
             }
             Err(e) => {
-                tracing::debug!(error = %e, "quic agent stream read ended");
-                crate::agent_session::RecvOutcome::Closed
+                tracing::debug!(error = %e, "QUIC Runner stream read ended");
+                crate::runner_session::RecvOutcome::Closed
             }
         }
     }
@@ -447,7 +447,7 @@ async fn send_error(
     code: &str,
     message: &str,
 ) {
-    let env = AgentEnvelope::Error {
+    let env = RunnerEnvelope::Error {
         code: code.to_string(),
         message: message.to_string(),
     };
@@ -464,24 +464,24 @@ async fn send_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell_protocol::{
-        AgentProtocolGenerationNumber, ShellAgentJobUpdateRequest, ShellAgentResultRequest,
-        ShellClientCapabilities, ShellClientRegisterRequest, ShellJobOpRequest, ShellRunRequest,
-        AGENT_PROTOCOL_GENERATION_V2, AGENT_QUIC_ALPN_V1,
+    use crate::runner_protocol::{
+        RunnerCapabilities, RunnerJobUpdateRequest, RunnerProtocolGenerationNumber,
+        RunnerRegisterRequest, RunnerResultRequest, ShellJobOpRequest, ShellRunRequest,
+        RUNNER_PROTOCOL_GENERATION_V2, RUNNER_QUIC_ALPN_V1,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     /// ALPN used by the QUIC integration tests.
-    const TEST_ALPN: &str = AGENT_QUIC_ALPN_V1;
+    const TEST_ALPN: &str = RUNNER_QUIC_ALPN_V1;
 
     async fn wait_for_quic_client_connected(
-        registry: &ShellClientRegistry,
+        registry: &RunnerRegistry,
         client_id: &str,
         expected: bool,
     ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let view = registry.get_client_view(client_id).await.unwrap();
+            let view = registry.get_runner_view(client_id).await.unwrap();
             if view.connected == expected {
                 return;
             }
@@ -495,11 +495,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_quic_job_status(
-        registry: &ShellClientRegistry,
-        job_id: &str,
-        expected: &str,
-    ) {
+    async fn wait_for_quic_job_status(registry: &RunnerRegistry, job_id: &str, expected: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let job = registry.get_job(job_id).await.unwrap();
@@ -557,71 +553,70 @@ mod tests {
     }
 
     fn register_envelope(client_id: &str, instance: &str) -> QuicRegisterFrame {
-        register_envelope_with_generation(client_id, instance, AGENT_PROTOCOL_GENERATION_V2, None)
+        register_envelope_with_generation(client_id, instance, RUNNER_PROTOCOL_GENERATION_V2, None)
     }
 
     fn register_envelope_with_generation(
         client_id: &str,
         instance: &str,
-        generation: AgentProtocolGenerationNumber,
+        generation: RunnerProtocolGenerationNumber,
         auth_token: Option<String>,
     ) -> QuicRegisterFrame {
-        let capabilities =
-            crate::test_support::current_runner_capabilities(ShellClientCapabilities {
-                shell: true,
-                file_read: true,
-                file_write: true,
-                artifact_export_chunk_read: false,
-                artifact_export_streaming_metadata: false,
-                structured_file_delete: true,
-                apply_text_edit_occurrence: false,
-                apply_text_edit_line_scope: false,
-                apply_patch: false,
-                apply_patch_match_metadata: false,
-                apply_patch_strict_matching: false,
-                git: false,
-                jobs: true,
-                async_jobs: true,
-                async_shell_jobs: true,
-                ssh_shell: false,
-                persistent_shell: false,
-                ssh_persistent_shell: false,
-                structured_validation_argv: true,
-                structured_cargo_test_count_assertion: true,
-                structured_go_test_json: true,
-                structured_go_test_tool: true,
-                structured_go_test_packages: true,
-                structured_process_argv: true,
-                structured_script_payload: false,
-                internal_posix_script: false,
-                structured_execution_jobs: false,
-                detached_process_jobs: false,
-                lsp_read_only_navigation: false,
-                lsp_call_hierarchy: false,
-                project_lifecycle: false,
-                project_path_registration: false,
-                skill_store_read: false,
-                skill_store_manage: false,
-                computer_observe: false,
-                computer_application_discovery: false,
-                computer_application_launch: false,
-                computer_display_observe: false,
-                computer_pointer_control: false,
-                computer_clipboard_read: false,
-                computer_clipboard_write: false,
-                computer_snapshot_region: false,
-                computer_accessibility_observe: false,
-                computer_element_state: false,
-                computer_control: false,
-                computer_scroll_to_element: false,
-                computer_key_input: false,
-                computer_window_activate: false,
-                computer_text_input: false,
-                job_state_reconciliation: false,
-                coding_agent_runs: false,
-            });
+        let capabilities = crate::test_support::current_runner_capabilities(RunnerCapabilities {
+            shell: true,
+            file_read: true,
+            file_write: true,
+            artifact_export_chunk_read: false,
+            artifact_export_streaming_metadata: false,
+            structured_file_delete: true,
+            apply_text_edit_occurrence: false,
+            apply_text_edit_line_scope: false,
+            apply_patch: false,
+            apply_patch_match_metadata: false,
+            apply_patch_strict_matching: false,
+            git: false,
+            jobs: true,
+            async_jobs: true,
+            async_shell_jobs: true,
+            ssh_shell: false,
+            persistent_shell: false,
+            ssh_persistent_shell: false,
+            structured_validation_argv: true,
+            structured_cargo_test_count_assertion: true,
+            structured_go_test_json: true,
+            structured_go_test_tool: true,
+            structured_go_test_packages: true,
+            structured_process_argv: true,
+            structured_script_payload: false,
+            internal_posix_script: false,
+            structured_execution_jobs: false,
+            detached_process_jobs: false,
+            lsp_read_only_navigation: false,
+            lsp_call_hierarchy: false,
+            project_lifecycle: false,
+            project_path_registration: false,
+            skill_store_read: false,
+            skill_store_manage: false,
+            computer_observe: false,
+            computer_application_discovery: false,
+            computer_application_launch: false,
+            computer_display_observe: false,
+            computer_pointer_control: false,
+            computer_clipboard_read: false,
+            computer_clipboard_write: false,
+            computer_snapshot_region: false,
+            computer_accessibility_observe: false,
+            computer_element_state: false,
+            computer_control: false,
+            computer_scroll_to_element: false,
+            computer_key_input: false,
+            computer_window_activate: false,
+            computer_text_input: false,
+            job_state_reconciliation: false,
+            coding_agent_runs: false,
+        });
         QuicRegisterFrame::new(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -629,8 +624,8 @@ mod tests {
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: instance.to_string(),
-                agent_protocol_generation: generation,
+                runner_instance_id: instance.to_string(),
+                runner_protocol_generation: generation,
                 display_name: Some("quic-test".to_string()),
                 owner: Some("tester".to_string()),
                 hostname: None,
@@ -656,7 +651,7 @@ mod tests {
     }
 
     async fn start_quic_server(
-        registry: Arc<ShellClientRegistry>,
+        registry: Arc<RunnerRegistry>,
         config: Arc<Config>,
         cert_der: CertificateDer<'static>,
         key_der: PrivateKeyDer<'static>,
@@ -697,7 +692,7 @@ mod tests {
         let (cert_der, key_der) = self_signed_cert();
         let server_crypto = server_crypto(cert_der.clone(), key_der);
         let (endpoint, addr) = bind_server(server_crypto);
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let config = test_config(None);
 
         let server_task = tokio::spawn(async move {
@@ -708,7 +703,7 @@ mod tests {
 
         let (client_endpoint, conn, mut send, mut recv) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(&mut send, &AgentEnvelope::Ping { ts: 1 })
+        write_quic_frame(&mut send, &RunnerEnvelope::Ping { ts: 1 })
             .await
             .expect("write wrong first frame");
 
@@ -717,7 +712,7 @@ mod tests {
             .expect("error frame timeout")
             .expect("read error frame");
         match error {
-            AgentEnvelope::Error { code, message } => {
+            RunnerEnvelope::Error { code, message } => {
                 assert_eq!(code, "expected_register");
                 assert!(message.contains("register"), "message was: {message}");
                 assert!(
@@ -739,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn quic_register_requires_explicit_protocol_generation() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -766,14 +761,14 @@ mod tests {
             .expect("register error timeout")
             .expect("read register error");
         match error {
-            AgentEnvelope::Error { code, message } => {
+            RunnerEnvelope::Error { code, message } => {
                 assert_eq!(code, "expected_register");
                 assert!(message.contains("agent_protocol_generation"), "{message}");
             }
             other => panic!("expected register_failed, got {:?}", other.kind()),
         }
         assert!(registry
-            .get_client_view("quic-missing-generation")
+            .get_runner_view("quic-missing-generation")
             .await
             .is_none());
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
@@ -783,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn quic_register_rejects_unsupported_protocol_generation() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -796,7 +791,7 @@ mod tests {
         let register = register_envelope_with_generation(
             "quic-unsupported-generation",
             "inst-unsupported",
-            AgentProtocolGenerationNumber::new(3),
+            RunnerProtocolGenerationNumber::new(3),
             None,
         );
         write_quic_register_frame(&mut send, &register)
@@ -808,14 +803,14 @@ mod tests {
             .expect("register error timeout")
             .expect("read register error");
         match error {
-            AgentEnvelope::Error { code, message } => {
+            RunnerEnvelope::Error { code, message } => {
                 assert_eq!(code, "register_failed");
                 assert_eq!(message, "agent_protocol_generation is unsupported");
             }
             other => panic!("expected register_failed, got {:?}", other.kind()),
         }
         assert!(registry
-            .get_client_view("quic-unsupported-generation")
+            .get_runner_view("quic-unsupported-generation")
             .await
             .is_none());
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
@@ -839,7 +834,7 @@ mod tests {
             codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
 
         // Spawn the accept loop.
         let serve_registry = registry.clone();
@@ -871,7 +866,7 @@ mod tests {
             .expect("ack timeout")
             .expect("read ack");
         match ack {
-            AgentEnvelope::Registered {
+            RunnerEnvelope::Registered {
                 success, client, ..
             } => {
                 assert!(success, "register should succeed");
@@ -879,8 +874,8 @@ mod tests {
                 assert_eq!(client.client_id, "quic-rt");
                 assert_eq!(client.transport, "quic");
                 assert_eq!(
-                    client.agent_protocol_generation,
-                    AGENT_PROTOCOL_GENERATION_V2
+                    client.runner_protocol_generation,
+                    RUNNER_PROTOCOL_GENERATION_V2
                 );
                 assert!(client.capabilities.shell);
                 assert!(client.capabilities.file_read);
@@ -894,15 +889,18 @@ mod tests {
             other => panic!("expected registered ack, got {:?}", other.kind()),
         }
 
-        // The registry shows the agent online over QUIC.
+        // The registry shows the Runner online over QUIC.
         let view = registry
-            .get_client_view("quic-rt")
+            .get_runner_view("quic-rt")
             .await
             .expect("client view");
         assert!(view.connected);
         assert_eq!(view.status, "online");
         assert_eq!(view.transport, "quic");
-        assert_eq!(view.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+        assert_eq!(
+            view.runner_protocol_generation,
+            RUNNER_PROTOCOL_GENERATION_V2
+        );
         assert!(view.capabilities.shell);
         assert!(view.capabilities.file_read);
         assert!(view.capabilities.file_write);
@@ -915,16 +913,16 @@ mod tests {
         // Ping -> Pong, and liveness is refreshed.
         let before = view.last_seen;
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        write_quic_frame(&mut send, &AgentEnvelope::Ping { ts: 7 })
+        write_quic_frame(&mut send, &RunnerEnvelope::Ping { ts: 7 })
             .await
             .expect("write ping");
         let pong = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
             .await
             .expect("pong timeout")
             .expect("read pong");
-        assert!(matches!(pong, AgentEnvelope::Pong { ts: 7 }));
+        assert!(matches!(pong, RunnerEnvelope::Pong { ts: 7 }));
         let after = registry
-            .get_client_view("quic-rt")
+            .get_runner_view("quic-rt")
             .await
             .expect("client view")
             .last_seen;
@@ -940,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn quic_request_result_roundtrip() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -956,7 +954,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-gen2-rt",
                 "inst-v2",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -968,7 +966,7 @@ mod tests {
             .expect("ack timeout")
             .expect("read ack");
         match ack {
-            AgentEnvelope::Registered {
+            RunnerEnvelope::Registered {
                 success, client, ..
             } => {
                 assert!(success);
@@ -976,8 +974,8 @@ mod tests {
                 assert_eq!(client.client_id, "quic-gen2-rt");
                 assert_eq!(client.transport, "quic");
                 assert_eq!(
-                    client.agent_protocol_generation,
-                    AGENT_PROTOCOL_GENERATION_V2
+                    client.runner_protocol_generation,
+                    RUNNER_PROTOCOL_GENERATION_V2
                 );
                 assert!(client.capabilities.shell);
                 assert!(client.capabilities.file_read);
@@ -1009,7 +1007,7 @@ mod tests {
             .expect("request timeout")
             .expect("read request");
         match req_env {
-            AgentEnvelope::Request { request } => {
+            RunnerEnvelope::Request { request } => {
                 assert_eq!(request.request_id, request_id);
                 assert_eq!(request.kind, "run_shell");
                 assert_eq!(request.command, "echo hi");
@@ -1019,10 +1017,10 @@ mod tests {
 
         write_quic_frame(
             &mut send,
-            &AgentEnvelope::Result {
-                payload: ShellAgentResultRequest {
+            &RunnerEnvelope::Result {
+                payload: RunnerResultRequest {
                     client_id: "quic-gen2-rt".to_string(),
-                    agent_instance_id: "inst-v2".to_string(),
+                    runner_instance_id: "inst-v2".to_string(),
                     request_id: request_id.clone(),
                     exit_code: Some(0),
                     stdout: Some("hi\n".to_string()),
@@ -1045,7 +1043,7 @@ mod tests {
         assert_eq!(response.exit_code, Some(0));
         assert_eq!(
             registry
-                .get_client_view("quic-gen2-rt")
+                .get_runner_view("quic-gen2-rt")
                 .await
                 .expect("client view")
                 .pending_requests,
@@ -1060,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn quic_v1_job_update_updates_registry() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -1076,7 +1074,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-job",
                 "inst-job",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -1112,7 +1110,7 @@ mod tests {
             .expect("request timeout")
             .expect("read request");
         let request_id = match req_env {
-            AgentEnvelope::Request { request } => {
+            RunnerEnvelope::Request { request } => {
                 assert_eq!(request.kind, "start_job");
                 request.request_id
             }
@@ -1121,10 +1119,10 @@ mod tests {
 
         write_quic_frame(
             &mut send,
-            &AgentEnvelope::JobUpdate {
-                payload: ShellAgentJobUpdateRequest {
+            &RunnerEnvelope::JobUpdate {
+                payload: RunnerJobUpdateRequest {
                     client_id: "quic-job".to_string(),
-                    agent_instance_id: "inst-job".to_string(),
+                    runner_instance_id: "inst-job".to_string(),
                     update_seq: None,
                     job_id: job.job_id.clone(),
                     request_id: Some(request_id),
@@ -1163,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn quic_v1_disconnect_reconciles_jobs_and_notifier() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -1179,7 +1177,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-disc",
                 "inst-disc",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -1222,7 +1220,7 @@ mod tests {
         let lost = registry.get_job(&job.job_id).await.unwrap();
         assert_eq!(lost.status, "lost");
         assert!(lost.error.unwrap().contains("disconnected"));
-        let view = registry.get_client_view("quic-disc").await.unwrap();
+        let view = registry.get_runner_view("quic-disc").await.unwrap();
         assert_eq!(
             view.pending_requests, 0,
             "disconnect must reconcile pending job requests"
@@ -1237,7 +1235,7 @@ mod tests {
         // and asserted pending_requests == 1 as a proxy for "notifier removed
         // so the pump no longer drains the queue". That proxy is no longer
         // valid: enqueue itself must fail fast rather than silently pile up
-        // against a dead agent. Notifier removal still happens in
+        // against a dead Runner. Notifier removal still happens in
         // reconcile_disconnect (covered above by pending cleanup + offline
         // connected flag); this asserts the post-disconnect contract.
         let err = registry
@@ -1253,14 +1251,14 @@ mod tests {
                 "tester".to_string(),
             )
             .await
-            .expect_err("enqueue against a disconnected agent must fail");
+            .expect_err("enqueue against a disconnected Runner must fail");
         assert!(
             err.contains("offline"),
             "post-disconnect enqueue must fail as offline, got: {err}"
         );
         assert_eq!(
             registry
-                .get_client_view("quic-disc")
+                .get_runner_view("quic-disc")
                 .await
                 .unwrap()
                 .pending_requests,
@@ -1272,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn quic_goodbye_releases_lease_for_new_instance() {
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -1288,7 +1286,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-goodbye",
                 "inst-a",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -1300,7 +1298,7 @@ mod tests {
             .unwrap();
         assert!(
             registry
-                .get_client_view("quic-goodbye")
+                .get_runner_view("quic-goodbye")
                 .await
                 .unwrap()
                 .connected
@@ -1308,7 +1306,7 @@ mod tests {
 
         write_quic_frame(
             &mut send_a,
-            &AgentEnvelope::Goodbye {
+            &RunnerEnvelope::Goodbye {
                 reason: Some("test shutdown".to_string()),
             },
         )
@@ -1317,7 +1315,7 @@ mod tests {
         wait_for_quic_client_connected(&registry, "quic-goodbye", false).await;
         assert!(
             !registry
-                .get_client_view("quic-goodbye")
+                .get_runner_view("quic-goodbye")
                 .await
                 .unwrap()
                 .connected
@@ -1330,7 +1328,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-goodbye",
                 "inst-b",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -1342,10 +1340,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ack,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
-        let view = registry.get_client_view("quic-goodbye").await.unwrap();
-        assert_eq!(view.agent_instance_id, "inst-b");
+        let view = registry.get_runner_view("quic-goodbye").await.unwrap();
+        assert_eq!(view.runner_instance_id, "inst-b");
         assert!(view.connected);
 
         let _ = send_a.finish();
@@ -1363,7 +1361,7 @@ mod tests {
         // scope gate. Hold the auth env guard to keep the rejection exact.
         let _env = crate::auth::AuthEnvGuard::auth_required();
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(Some("bootstrap-secret")),
@@ -1379,7 +1377,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-auth-ok",
                 "inst-auth-ok",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 Some("bootstrap-secret".to_string()),
             ),
         )
@@ -1391,7 +1389,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ack,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
         let _ = send.finish();
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
@@ -1404,7 +1402,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-auth-missing",
                 "inst-auth-missing",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 None,
             ),
         )
@@ -1415,11 +1413,11 @@ mod tests {
             .unwrap()
             .unwrap();
         match err {
-            AgentEnvelope::Error { code, .. } => assert_eq!(code, "unauthorized"),
+            RunnerEnvelope::Error { code, .. } => assert_eq!(code, "unauthorized"),
             other => panic!("expected unauthorized error, got {:?}", other.kind()),
         }
         assert!(registry
-            .get_client_view("quic-auth-missing")
+            .get_runner_view("quic-auth-missing")
             .await
             .is_none());
         let _ = missing_send.finish();
@@ -1433,7 +1431,7 @@ mod tests {
             &register_envelope_with_generation(
                 "quic-auth-bad",
                 "inst-auth-bad",
-                AGENT_PROTOCOL_GENERATION_V2,
+                RUNNER_PROTOCOL_GENERATION_V2,
                 Some("wrong-secret".to_string()),
             ),
         )
@@ -1444,10 +1442,10 @@ mod tests {
             .unwrap()
             .unwrap();
         match err {
-            AgentEnvelope::Error { code, .. } => assert_eq!(code, "unauthorized"),
+            RunnerEnvelope::Error { code, .. } => assert_eq!(code, "unauthorized"),
             other => panic!("expected unauthorized error, got {:?}", other.kind()),
         }
-        assert!(registry.get_client_view("quic-auth-bad").await.is_none());
+        assert!(registry.get_runner_view("quic-auth-bad").await.is_none());
         let _ = bad_send.finish();
         bad_endpoint.close(quinn::VarInt::from_u32(0), b"");
         bad_conn.close(quinn::VarInt::from_u32(0), b"done");
@@ -1467,7 +1465,7 @@ mod tests {
             codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let serve_registry = registry.clone();
         let serve_config = config.clone();
         tokio::spawn(async move {
@@ -1487,7 +1485,7 @@ mod tests {
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
 
         // Send a Ping instead of Register.
-        write_quic_frame(&mut send, &AgentEnvelope::Ping { ts: 1 })
+        write_quic_frame(&mut send, &RunnerEnvelope::Ping { ts: 1 })
             .await
             .unwrap();
 
@@ -1497,21 +1495,21 @@ mod tests {
             .expect("timeout")
             .expect("read");
         match env {
-            AgentEnvelope::Error { code, .. } => assert_eq!(code, "expected_register"),
+            RunnerEnvelope::Error { code, .. } => assert_eq!(code, "expected_register"),
             other => panic!("expected error, got {:?}", other.kind()),
         }
 
         // No client was registered.
-        assert!(registry.get_client_view("quic-reject").await.is_none());
-        assert!(registry.list_clients().await.is_empty());
+        assert!(registry.get_runner_view("quic-reject").await.is_none());
+        assert!(registry.list_runners().await.is_empty());
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
         conn.close(quinn::VarInt::from_u32(0), b"done");
     }
 
-    /// A QUIC-registered agent must surface protocol generation 2 and the
-    /// `quic` transport in `list_clients` (used by runtime_status / list_runners).
+    /// A QUIC-registered Runner must surface protocol generation 2 and the
+    /// `quic` transport in `list_runners` (used by runtime_status / list_runners).
     #[tokio::test]
-    async fn quic_agent_surfaces_transport_and_protocol_in_list() {
+    async fn quic_runner_surfaces_transport_and_protocol_in_list() {
         let (cert_der, key_der) = self_signed_cert();
         let server_crypto = server_crypto(cert_der.clone(), key_der);
         let (endpoint, addr) = bind_server(server_crypto);
@@ -1524,7 +1522,7 @@ mod tests {
             codex: crate::CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         });
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let serve_registry = registry.clone();
         let serve_config = config.clone();
         tokio::spawn(async move {
@@ -1550,12 +1548,12 @@ mod tests {
             .expect("ack timeout")
             .expect("read ack");
 
-        let clients = registry.list_clients().await;
+        let clients = registry.list_runners().await;
         assert_eq!(clients.len(), 1);
         let c = &clients[0];
         assert_eq!(c.client_id, "quic-list");
         assert_eq!(c.transport, "quic");
-        assert_eq!(c.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+        assert_eq!(c.runner_protocol_generation, RUNNER_PROTOCOL_GENERATION_V2);
         assert!(c.connected);
         assert!(c.capabilities.shell);
         assert!(c.capabilities.file_read);
@@ -1578,7 +1576,7 @@ mod tests {
         // only — A's pump is bound to the stale connection lease and the
         // connection-scoped poll rejects it, so A never receives the request.
         let (cert_der, key_der) = self_signed_cert();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
             test_config(None),
@@ -1631,7 +1629,7 @@ mod tests {
             .expect("request timeout on B")
             .expect("read request on B");
         match req_env {
-            AgentEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
+            RunnerEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
             other => panic!("expected request on B, got {:?}", other.kind()),
         }
 

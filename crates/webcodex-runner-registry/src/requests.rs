@@ -1,19 +1,18 @@
-use super::access_control::assert_runner_access as assert_shell_client_access;
+use super::access_control::assert_runner_access;
 use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
     request_preview, PendingRequestEnqueueError,
 };
 #[cfg(test)]
-use super::projects::ShellClientLookupError;
+use super::projects::RunnerLookupError;
 use super::state::{
-    CodingAgentDispatchFence, PendingShellRequest, ShellClientRegistryInner,
-    SkillStoreDispatchFence,
+    CodingAgentDispatchFence, PendingShellRequest, RunnerRegistryInner, SkillStoreDispatchFence,
 };
 use super::validation::{
     validate_file_request, validate_id, validate_process_request, validate_run_request,
     validate_script_enqueue_request,
 };
-use super::{now_ts, RunnerFeature, RunnerRegistry, CLIENT_ONLINE_WINDOW_SECS};
+use super::{now_ts, RunnerFeature, RunnerRegistry, RUNNER_ONLINE_WINDOW_SECS};
 use std::fmt;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -21,26 +20,23 @@ use webcodex_core::coding_agent::{
     validate_request as validate_coding_agent_request, CodingAgentDispatchState,
     CodingAgentRequest, CodingAgentResponse,
 };
-use webcodex_core::lsp_bridge::{AgentLspPayload, AgentLspRequest, AGENT_LSP_REQUEST_KIND};
+use webcodex_core::lsp_bridge::{RunnerLspPayload, RunnerLspRequest, AGENT_LSP_REQUEST_KIND};
 use webcodex_core::mcp_gateway::{
     validate_request as validate_mcp_gateway_request, McpGatewayDispatchState, McpGatewayRequest,
     McpGatewayResponse,
 };
-use webcodex_core::shell_protocol::{
+use webcodex_core::runner_protocol::{
     shell_computer_request_payload_max_bytes, PersistentShellRequest, PersistentShellResult,
-    ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellProcessArgv, ShellRunRequest,
+    RunnerRequest, ShellFileOpRequest, ShellJobContext, ShellProcessArgv, ShellRunRequest,
     ShellRunResponse, ShellScriptPayload, RAW_SHELL_COMMAND_MAX_BYTES,
-    SHELL_CLIENT_CAPABILITY_APPLY_PATCH, SHELL_CLIENT_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
-    SHELL_CLIENT_CAPABILITY_APPLY_PATCH_STRICT_MATCHING,
-    SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
-    SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
-    SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
-    SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA, SHELL_CLIENT_CAPABILITY_FILE_READ,
-    SHELL_CLIENT_CAPABILITY_FILE_WRITE, SHELL_CLIENT_CAPABILITY_INTERNAL_POSIX_SCRIPT,
-    SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL, SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL,
-    SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE,
-    SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV,
-    SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CAPABILITY_APPLY_PATCH, RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
+    RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING, RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE, RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
+    RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA, RUNNER_CAPABILITY_FILE_READ,
+    RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
+    RUNNER_CAPABILITY_PERSISTENT_SHELL, RUNNER_CAPABILITY_SSH_PERSISTENT_SHELL,
+    RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 use webcodex_core::skill_store::SkillStoreRequest;
 
@@ -49,10 +45,10 @@ pub enum EnqueueLspError {
     InvalidRequest {
         message: String,
     },
-    UnknownClient {
+    UnknownRunner {
         client_id: String,
     },
-    ClientOffline {
+    RunnerOffline {
         client_id: String,
     },
     UnsupportedCapability {
@@ -69,24 +65,24 @@ impl fmt::Display for EnqueueLspError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest { message } => formatter.write_str(message),
-            Self::UnknownClient { client_id } => {
+            Self::UnknownRunner { client_id } => {
                 write!(formatter, "unknown shell client: {client_id}")
             }
-            Self::ClientOffline { client_id } => write!(
+            Self::RunnerOffline { client_id } => write!(
                 formatter,
-                "shell client {client_id} is offline (no keepalive within \
-                 {CLIENT_ONLINE_WINDOW_SECS}s); reconnect the agent before retrying"
+                "runner {client_id} is offline (no keepalive within \
+                 {RUNNER_ONLINE_WINDOW_SECS}s); reconnect the Runner before retrying"
             ),
             Self::UnsupportedCapability {
                 client_id,
                 capability,
             } => write!(
                 formatter,
-                "agent client {client_id} does not support {capability}"
+                "runner {client_id} does not support {capability}"
             ),
             Self::QueueFull { client_id, limit } => write!(
                 formatter,
-                "too many pending requests for shell client {client_id} (limit {limit})"
+                "too many pending requests for runner {client_id} (limit {limit})"
             ),
         }
     }
@@ -97,11 +93,11 @@ impl std::error::Error for EnqueueLspError {}
 impl From<PendingRequestEnqueueError> for EnqueueLspError {
     fn from(error: PendingRequestEnqueueError) -> Self {
         match error {
-            PendingRequestEnqueueError::UnknownClient { client_id } => {
-                Self::UnknownClient { client_id }
+            PendingRequestEnqueueError::UnknownRunner { client_id } => {
+                Self::UnknownRunner { client_id }
             }
-            PendingRequestEnqueueError::ClientOffline { client_id } => {
-                Self::ClientOffline { client_id }
+            PendingRequestEnqueueError::RunnerOffline { client_id } => {
+                Self::RunnerOffline { client_id }
             }
             PendingRequestEnqueueError::QueueFull { client_id, limit } => {
                 Self::QueueFull { client_id, limit }
@@ -111,12 +107,10 @@ impl From<PendingRequestEnqueueError> for EnqueueLspError {
 }
 
 #[cfg(test)]
-impl From<ShellClientLookupError> for EnqueueLspError {
-    fn from(error: ShellClientLookupError) -> Self {
+impl From<RunnerLookupError> for EnqueueLspError {
+    fn from(error: RunnerLookupError) -> Self {
         match error {
-            ShellClientLookupError::UnknownClient { client_id } => {
-                Self::UnknownClient { client_id }
-            }
+            RunnerLookupError::UnknownRunner { client_id } => Self::UnknownRunner { client_id },
         }
     }
 }
@@ -125,7 +119,7 @@ pub(super) fn next_request_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-pub(super) fn notify_client_locked(inner: &ShellClientRegistryInner, client_id: &str) {
+pub(super) fn notify_runner_locked(inner: &RunnerRegistryInner, client_id: &str) {
     if let Some(entry) = inner.notifiers.get(client_id) {
         entry.notify.notify_one();
     }
@@ -133,23 +127,23 @@ pub(super) fn notify_client_locked(inner: &ShellClientRegistryInner, client_id: 
 
 pub(super) fn enqueue_pending_request_locked(
     telemetry: &dyn crate::RunnerRegistryTelemetry,
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
     request_id: String,
-    request: ShellAgentShellRequest,
+    request: RunnerRequest,
     waiter: Option<oneshot::Sender<ShellRunResponse>>,
     job_id: Option<String>,
 ) -> Result<(), PendingRequestEnqueueError> {
     ensure_dispatch_supported_locked(inner, client_id)?;
     ensure_queue_capacity_locked(inner, client_id)?;
-    let runner = inner.clients.get(client_id);
+    let runner = inner.runners.get(client_id);
     telemetry.request_enqueued(
         &request,
         &request_id,
         client_id,
         &request.kind,
         request.job_id.as_deref().or(job_id.as_deref()),
-        runner.map(|record| record.agent_instance_id.as_str()),
+        runner.map(|record| record.runner_instance_id.as_str()),
         runner.map(|record| record.transport.as_str()),
         runner
             .and_then(|record| record.build.as_ref())
@@ -159,7 +153,7 @@ pub(super) fn enqueue_pending_request_locked(
             .and_then(|build| build.git_commit.as_deref()),
     );
     inner
-        .queues_by_client
+        .queues_by_runner
         .entry(client_id.to_string())
         .or_default()
         .push_back(request_id.clone());
@@ -169,10 +163,10 @@ pub(super) fn enqueue_pending_request_locked(
             request,
             waiter,
             job_id,
-            expected_client_owner: None,
+            expected_runner_owner: None,
             expected_project_id: None,
             expected_project_cwd: None,
-            expected_mcp_gateway_agent_instance_id: None,
+            expected_mcp_gateway_runner_instance_id: None,
             expected_mcp_gateway_provider_id: None,
             expected_mcp_gateway_provider_instance_id: None,
             skill_store_fence: None,
@@ -183,14 +177,14 @@ pub(super) fn enqueue_pending_request_locked(
 }
 
 pub(super) fn take_pending_request_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     request_id: &str,
 ) -> Option<PendingShellRequest> {
     inner.pending_by_id.remove(request_id)
 }
 
 pub(super) fn remove_pending_request_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     request_id: &str,
 ) -> Option<PendingShellRequest> {
     let pending = take_pending_request_locked(inner, request_id);
@@ -198,8 +192,8 @@ pub(super) fn remove_pending_request_locked(
     pending
 }
 
-fn remove_request_from_queues_locked(inner: &mut ShellClientRegistryInner, request_id: &str) {
-    for queue in inner.queues_by_client.values_mut() {
+fn remove_request_from_queues_locked(inner: &mut RunnerRegistryInner, request_id: &str) {
+    for queue in inner.queues_by_runner.values_mut() {
         queue.retain(|id| id != request_id);
     }
 }
@@ -213,11 +207,11 @@ fn remove_request_from_queues_locked(inner: &mut ShellClientRegistryInner, reque
 /// `Sender` lives in the shared registry, not in the transport handler, so
 /// aborting the connection task does not drop it — without this drain the
 /// caller (e.g. an MCP `run_shell`/`read_file`) blocks for the full wait
-/// timeout (tens of seconds) after the agent goes away. Job-backed requests
+/// timeout (tens of seconds) after the Runner goes away. Job-backed requests
 /// are handled separately by `reconcile_disconnect` (they transition their job
 /// to `lost`) and are intentionally skipped here.
 pub(super) fn resolve_disconnected_sync_requests_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
     error: &str,
 ) {
@@ -231,7 +225,7 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
         let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
             continue;
         };
-        if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+        if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
             queue.retain(|id| id != &request_id);
         }
         if let Some(waiter) = pending.waiter.take() {
@@ -377,7 +371,7 @@ impl RunnerRegistry {
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let kind = format!("file_{}", body.op);
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind,
@@ -415,7 +409,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -437,7 +431,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_apply_text_edits".to_string(),
@@ -466,15 +460,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ApplyTextEditOccurrence)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
                 body.client_id
             ));
         }
@@ -487,7 +481,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -511,7 +505,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_apply_text_edits".to_string(),
@@ -540,25 +534,25 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ApplyTextEditLineScope)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE}",
                 body.client_id
             ));
         }
         if requires_occurrence
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::ApplyTextEditOccurrence)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
                 body.client_id
             ));
         }
@@ -571,7 +565,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -594,7 +588,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_apply_patch".to_string(),
@@ -623,31 +617,31 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        if !client.runner_features.supports(RunnerFeature::ApplyPatch) {
+        if !runner.runner_features.supports(RunnerFeature::ApplyPatch) {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_PATCH}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_PATCH}",
                 body.client_id
             ));
         }
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ApplyPatchMatchMetadata)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_PATCH_MATCH_METADATA}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA}",
                 body.client_id
             ));
         }
         if strict_matching
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::ApplyPatchStrictMatching)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_PATCH_STRICT_MATCHING}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING}",
                 body.client_id
             ));
         }
@@ -660,7 +654,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -693,7 +687,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_save_project_artifact".to_string(),
@@ -722,15 +716,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
         let current = inner
-            .clients
+            .runners
             .get(&body.client_id)
             .ok_or_else(|| format!("unknown shell client: {}", body.client_id))?;
-        assert_shell_client_access(auth, current)?;
+        assert_runner_access(auth, current)?;
         if !current.runner_features.supports(RunnerFeature::FileWrite) {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_FILE_WRITE}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_FILE_WRITE}",
                 body.client_id
             ));
         }
@@ -743,7 +737,7 @@ impl RunnerRegistry {
                 "stale_project: target project {expected_project_id} is no longer registered at the resolved path"
             ));
         }
-        let expected_client_owner = current.owner.clone();
+        let expected_runner_owner = current.owner.clone();
         enqueue_pending_request_locked(
             self.telemetry.as_ref(),
             &mut inner,
@@ -757,10 +751,10 @@ impl RunnerRegistry {
             .pending_by_id
             .get_mut(&request_id)
             .expect("computer snapshot artifact request was just enqueued");
-        pending.expected_client_owner = expected_client_owner;
+        pending.expected_runner_owner = expected_runner_owner;
         pending.expected_project_id = Some(expected_project_id.to_string());
         pending.expected_project_cwd = Some(expected_project_cwd.to_string());
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -782,7 +776,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_read_project_artifact_metadata".to_string(),
@@ -811,31 +805,31 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        assert_shell_client_access(auth, client)?;
-        if !client.runner_features.supports(RunnerFeature::FileRead) {
+        assert_runner_access(auth, runner)?;
+        if !runner.runner_features.supports(RunnerFeature::FileRead) {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_FILE_READ}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_FILE_READ}",
                 body.client_id
             ));
         }
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ArtifactExportChunkRead)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ}",
                 body.client_id
             ));
         }
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ArtifactExportStreamingMetadata)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA}",
                 body.client_id
             ));
         }
@@ -848,7 +842,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -870,7 +864,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "file_read_project_artifact_export_chunk".to_string(),
@@ -899,22 +893,22 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        assert_shell_client_access(auth, client)?;
-        if !client.runner_features.supports(RunnerFeature::FileRead) {
+        assert_runner_access(auth, runner)?;
+        if !runner.runner_features.supports(RunnerFeature::FileRead) {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_FILE_READ}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_FILE_READ}",
                 body.client_id
             ));
         }
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::ArtifactExportChunkRead)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ}",
                 body.client_id
             ));
         }
@@ -927,11 +921,11 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
-    /// Enqueue a structured `delete_project_files` agent file op. The
+    /// Enqueue a structured `delete_project_files` Runner file op. The
     /// generation-2 `structured_file_delete` baseline check and pending-request
     /// admission happen under the same registry lock. A baseline miss queues
     /// nothing and is reported as an invariant failure; there is no shell fallback.
@@ -950,7 +944,7 @@ impl RunnerRegistry {
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let kind = format!("file_{}", body.op);
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind,
@@ -979,15 +973,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&body.client_id) else {
+        let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::StructuredFileDelete)
         {
             return Err(format!(
-                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_FILE_DELETE}",
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE}",
                 body.client_id
             ));
         }
@@ -1000,7 +994,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
@@ -1035,7 +1029,7 @@ impl RunnerRegistry {
         let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: "run_process".to_string(),
@@ -1064,15 +1058,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&client_id) else {
+        let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {client_id}"));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::StructuredProcessArgv)
         {
             return Err(format!(
-                "capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_PROCESS_ARGV}"
+                "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV}"
             ));
         }
         enqueue_pending_request_locked(
@@ -1084,7 +1078,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
@@ -1110,7 +1104,7 @@ impl RunnerRegistry {
         let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: "run_script".to_string(),
@@ -1139,15 +1133,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&client_id) else {
+        let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {client_id}"));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::StructuredScriptPayload)
         {
             return Err(format!(
-                "capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD}"
+                "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD}"
             ));
         }
         enqueue_pending_request_locked(
@@ -1159,7 +1153,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
@@ -1177,9 +1171,9 @@ impl RunnerRegistry {
         wait_timeout_secs: u64,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
-        webcodex_core::shell_protocol::validate_raw_shell_wire_command(&script)?;
+        webcodex_core::runner_protocol::validate_raw_shell_wire_command(&script)?;
         let script = ShellScriptPayload {
-            language: webcodex_core::shell_protocol::ShellScriptLanguage::Sh,
+            language: webcodex_core::runner_protocol::ShellScriptLanguage::Sh,
             script,
             args: Vec::new(),
         };
@@ -1194,7 +1188,7 @@ impl RunnerRegistry {
         let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: "run_internal_posix_script".to_string(),
@@ -1223,15 +1217,15 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&client_id) else {
+        let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {client_id}"));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::InternalPosixScript)
         {
             return Err(format!(
-                "capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_INTERNAL_POSIX_SCRIPT}"
+                "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT}"
             ));
         }
         enqueue_pending_request_locked(
@@ -1243,7 +1237,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
@@ -1283,7 +1277,7 @@ impl RunnerRegistry {
             });
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: body.client_id.clone(),
             kind: "run_shell".to_string(),
@@ -1317,12 +1311,12 @@ impl RunnerRegistry {
             .as_ref()
             .is_some_and(|context| context.ssh_resource.is_some())
         {
-            let Some(client) = inner.clients.get(&body.client_id) else {
+            let Some(runner) = inner.runners.get(&body.client_id) else {
                 return Err(format!("unknown shell client: {}", body.client_id));
             };
-            if !client.runner_features.supports(RunnerFeature::SshShell) {
+            if !runner.runner_features.supports(RunnerFeature::SshShell) {
                 return Err(format!(
-                    "agent_capability_unavailable: agent client {} does not support ssh_shell",
+                    "agent_capability_unavailable: runner {} does not support ssh_shell",
                     body.client_id
                 ));
             }
@@ -1336,11 +1330,11 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &body.client_id);
+        notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
 
-    /// Cancel a pending synchronous request and report whether an Agent had
+    /// Cancel a pending synchronous request and report whether a Runner had
     /// already polled it. This lets timeout callers distinguish queue timeout
     /// from an actually started command without retaining expired requests.
     pub async fn cancel_request(&self, request_id: &str) -> bool {
@@ -1404,7 +1398,7 @@ impl RunnerRegistry {
     pub async fn enqueue_skill_store(
         &self,
         client_id: &str,
-        expected_agent_instance_id: &str,
+        expected_runner_instance_id: &str,
         operation: SkillStoreRequest,
         auth: Option<&crate::RunnerAccess>,
         requested_by: String,
@@ -1417,7 +1411,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.to_string(),
             kind: "skill_store".to_string(),
@@ -1446,13 +1440,13 @@ impl RunnerRegistry {
             coding_agent: None,
         };
         let mut inner = self.inner.lock().await;
-        let client = inner
-            .clients
+        let runner = inner
+            .runners
             .get(client_id)
             .ok_or_else(|| "exact Runner is unavailable".to_string())?;
-        assert_shell_client_access(auth, client)
+        assert_runner_access(auth, runner)
             .map_err(|_| "exact Runner is unavailable".to_string())?;
-        if client.agent_instance_id != expected_agent_instance_id {
+        if runner.runner_instance_id != expected_runner_instance_id {
             return Err(
                 "stale Runner identity; Skill store request was not dispatched".to_string(),
             );
@@ -1462,13 +1456,13 @@ impl RunnerRegistry {
         } else {
             RunnerFeature::SkillStoreRead
         };
-        if !client.runner_features.supports(required) {
+        if !runner.runner_features.supports(required) {
             return Err(format!(
                 "skill_store_capability_unavailable: exact Runner does not support {}",
                 required.as_wire_name()
             ));
         }
-        if now_ts().saturating_sub(client.last_seen) > CLIENT_ONLINE_WINDOW_SECS {
+        if now_ts().saturating_sub(runner.last_seen) > RUNNER_ONLINE_WINDOW_SECS {
             return Err(
                 "exact Runner is offline; Skill store request was not dispatched".to_string(),
             );
@@ -1487,10 +1481,10 @@ impl RunnerRegistry {
             .get_mut(&request_id)
             .expect("Skill store request was just enqueued");
         pending.skill_store_fence = Some(SkillStoreDispatchFence {
-            agent_instance_id: expected_agent_instance_id.to_string(),
+            runner_instance_id: expected_runner_instance_id.to_string(),
             management,
         });
-        notify_client_locked(&inner, client_id);
+        notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
 
@@ -1501,7 +1495,7 @@ impl RunnerRegistry {
     pub async fn enqueue_mcp_gateway(
         &self,
         client_id: &str,
-        expected_agent_instance_id: &str,
+        expected_runner_instance_id: &str,
         operation: McpGatewayRequest,
         auth: Option<&crate::RunnerAccess>,
         requested_by: String,
@@ -1512,7 +1506,7 @@ impl RunnerRegistry {
         let expected_provider_instance_id = operation.provider_instance_id().to_string();
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.to_string(),
             kind: "mcp_gateway".to_string(),
@@ -1541,16 +1535,16 @@ impl RunnerRegistry {
             coding_agent: None,
         };
         let mut inner = self.inner.lock().await;
-        let client = inner
-            .clients
+        let runner = inner
+            .runners
             .get(client_id)
             .ok_or_else(|| "exact Runner is unavailable".to_string())?;
-        assert_shell_client_access(auth, client)
+        assert_runner_access(auth, runner)
             .map_err(|_| "exact Runner is unavailable".to_string())?;
-        if client.agent_instance_id != expected_agent_instance_id {
+        if runner.runner_instance_id != expected_runner_instance_id {
             return Err("stale Runner identity; request was not started".to_string());
         }
-        let provider_is_current = client
+        let provider_is_current = runner
             .policy
             .as_ref()
             .and_then(|policy| policy.mcp_gateway_providers.as_ref())
@@ -1563,7 +1557,7 @@ impl RunnerRegistry {
         if !provider_is_current {
             return Err("stale provider identity; request was not started".to_string());
         }
-        if now_ts().saturating_sub(client.last_seen) > super::CLIENT_ONLINE_WINDOW_SECS {
+        if now_ts().saturating_sub(runner.last_seen) > super::RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; request was not started".to_string());
         }
         enqueue_pending_request_locked(
@@ -1579,12 +1573,12 @@ impl RunnerRegistry {
             .pending_by_id
             .get_mut(&request_id)
             .expect("MCP gateway request was just enqueued");
-        pending.expected_mcp_gateway_agent_instance_id =
-            Some(expected_agent_instance_id.to_string());
+        pending.expected_mcp_gateway_runner_instance_id =
+            Some(expected_runner_instance_id.to_string());
         pending.expected_mcp_gateway_provider_id = Some(expected_provider_id);
         pending.expected_mcp_gateway_provider_instance_id = Some(expected_provider_instance_id);
         inner.mcp_gateway_waiters.insert(request_id.clone(), tx);
-        notify_client_locked(&inner, client_id);
+        notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
 
@@ -1594,7 +1588,7 @@ impl RunnerRegistry {
     pub async fn enqueue_coding_agent(
         &self,
         client_id: &str,
-        expected_agent_instance_id: &str,
+        expected_runner_instance_id: &str,
         expected_provider_id: &str,
         expected_provider_instance_id: &str,
         operation: CodingAgentRequest,
@@ -1615,7 +1609,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.to_string(),
             kind: "coding_agent".to_string(),
@@ -1644,22 +1638,22 @@ impl RunnerRegistry {
             coding_agent: Some(operation),
         };
         let mut inner = self.inner.lock().await;
-        let client = inner
-            .clients
+        let runner = inner
+            .runners
             .get(client_id)
             .ok_or_else(|| "exact Runner is unavailable".to_string())?;
-        assert_shell_client_access(auth, client)
+        assert_runner_access(auth, runner)
             .map_err(|_| "exact Runner is unavailable".to_string())?;
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::CodingAgentRuns)
         {
             return Err("exact Runner does not support CodingAgentRun".to_string());
         }
-        if client.agent_instance_id != expected_agent_instance_id {
+        if runner.runner_instance_id != expected_runner_instance_id {
             return Err("stale Runner identity; CodingAgentRun was not dispatched".to_string());
         }
-        let provider_is_current = client.coding_agent_providers.iter().any(|provider| {
+        let provider_is_current = runner.coding_agent_providers.iter().any(|provider| {
             provider.provider_id == expected_provider_id
                 && provider.provider_instance_id == expected_provider_instance_id
         });
@@ -1668,7 +1662,7 @@ impl RunnerRegistry {
                 "stale ACP provider identity; CodingAgentRun was not dispatched".to_string(),
             );
         }
-        if now_ts().saturating_sub(client.last_seen) > super::CLIENT_ONLINE_WINDOW_SECS {
+        if now_ts().saturating_sub(runner.last_seen) > super::RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; CodingAgentRun was not dispatched".to_string());
         }
         enqueue_pending_request_locked(
@@ -1683,13 +1677,13 @@ impl RunnerRegistry {
         inner.coding_agent_fences.insert(
             request_id.clone(),
             CodingAgentDispatchFence {
-                agent_instance_id: expected_agent_instance_id.to_string(),
+                runner_instance_id: expected_runner_instance_id.to_string(),
                 provider_id: expected_provider_id.to_string(),
                 provider_instance_id: expected_provider_instance_id.to_string(),
             },
         );
         inner.coding_agent_waiters.insert(request_id.clone(), tx);
-        notify_client_locked(&inner, client_id);
+        notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
 
@@ -1741,7 +1735,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let wire_request = ShellAgentShellRequest {
+        let wire_request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: "persistent_shell".to_string(),
@@ -1770,15 +1764,15 @@ impl RunnerRegistry {
             persistent_shell: Some(request),
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&client_id) else {
+        let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {client_id}"));
         };
-        if !client
+        if !runner
             .runner_features
             .supports(RunnerFeature::PersistentShell)
         {
             return Err(format!(
-                "agent_capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_PERSISTENT_SHELL}"
+                "agent_capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_PERSISTENT_SHELL}"
             ));
         }
         // `persistent_shell` is checked above. A named SSH persistent shell
@@ -1787,12 +1781,12 @@ impl RunnerRegistry {
         if job_context
             .as_ref()
             .is_some_and(|ctx| ctx.ssh_resource.is_some())
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::SshPersistentShell)
         {
             return Err(format!(
-                "agent_capability_unavailable: agent client {client_id} does not support {SHELL_CLIENT_CAPABILITY_SSH_PERSISTENT_SHELL}"
+                "agent_capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_SSH_PERSISTENT_SHELL}"
             ));
         }
         enqueue_pending_request_locked(
@@ -1805,17 +1799,17 @@ impl RunnerRegistry {
             None,
         )?;
         inner.persistent_waiters.insert(request_id.clone(), tx);
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
-    /// Enqueue a project-management agent request (`register_project`,
+    /// Enqueue a project-management Runner request (`register_project`,
     /// `create_project`, or the internal path resolver). The JSON payload is
     /// carried in `stdin` so the
-    /// agent can parse it without shell interpolation. The `command` field is
-    /// empty (unused for these kinds); the agent dispatches on `kind` and
+    /// Runner can parse it without shell interpolation. The `command` field is
+    /// empty (unused for these kinds); the Runner dispatches on `kind` and
     /// reads the payload from `stdin`. Returns a oneshot receiver for the
-    /// `ShellRunResponse` (the agent returns structured JSON in `stdout`).
+    /// `ShellRunResponse` (the Runner returns structured JSON in `stdout`).
     pub async fn enqueue_project_op(
         &self,
         client_id: String,
@@ -1848,7 +1842,7 @@ impl RunnerRegistry {
         };
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: kind.to_string(),
@@ -1878,13 +1872,13 @@ impl RunnerRegistry {
         };
         let mut inner = self.inner.lock().await;
         if let Some(required_feature) = required_feature {
-            let client = inner
-                .clients
+            let runner = inner
+                .runners
                 .get(&client_id)
                 .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
-            if !client.runner_features.supports(required_feature) {
+            if !runner.runner_features.supports(required_feature) {
                 return Err(format!(
-                    "capability_unavailable: agent client {client_id} does not support {}",
+                    "capability_unavailable: runner {client_id} does not support {}",
                     required_feature.as_wire_name()
                 ));
             }
@@ -1898,7 +1892,7 @@ impl RunnerRegistry {
             Some(tx),
             None,
         )?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
@@ -1949,7 +1943,7 @@ impl RunnerRegistry {
         }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: kind.to_string(),
@@ -1978,19 +1972,19 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
         let current = inner
-            .clients
+            .runners
             .get(&client_id)
             .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
-        assert_shell_client_access(auth, current)?;
+        assert_runner_access(auth, current)?;
         if let Some(required_feature) = required_features
             .iter()
             .copied()
             .find(|feature| !current.runner_features.supports(*feature))
         {
             return Err(format!(
-                "agent client {client_id} does not support {}",
+                "runner {client_id} does not support {}",
                 required_feature.as_wire_name()
             ));
         }
@@ -2004,25 +1998,25 @@ impl RunnerRegistry {
             None,
         )
         .map_err(|error| error.to_string())?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 
     /// Enqueue a typed read-only LSP navigation request. Never falls through
-    /// to shell execution: the agent dispatches exclusively on `kind = "lsp"`
+    /// to shell execution: the Runner dispatches exclusively on `kind = "lsp"`
     /// with a structured `lsp` payload.
     pub async fn enqueue_lsp(
         &self,
         client_id: String,
-        payload: AgentLspPayload,
+        payload: RunnerLspPayload,
         requested_by: String,
         timeout_secs: u64,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), EnqueueLspError> {
         validate_id(&client_id, "client_id")
             .map_err(|message| EnqueueLspError::InvalidRequest { message })?;
-        // Capability gate before enqueue so old agents never receive unknown
+        // Capability gate before enqueue so old Runners never receive unknown
         // LSP kinds that could fall into shell fallback.
-        let required_feature = if matches!(&payload.request, AgentLspRequest::CallHierarchy { .. })
+        let required_feature = if matches!(&payload.request, RunnerLspRequest::CallHierarchy { .. })
         {
             RunnerFeature::LspCallHierarchy
         } else {
@@ -2030,7 +2024,7 @@ impl RunnerRegistry {
         };
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: AGENT_LSP_REQUEST_KIND.to_string(),
@@ -2059,14 +2053,14 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
         // This check is the authoritative TOCTOU fence: capability validation
         // and pending-request admission happen under the same registry lock.
         let current =
             inner
-                .clients
+                .runners
                 .get(&client_id)
-                .ok_or_else(|| EnqueueLspError::UnknownClient {
+                .ok_or_else(|| EnqueueLspError::UnknownRunner {
                     client_id: client_id.clone(),
                 })?;
         if !current.runner_features.supports(required_feature) {
@@ -2085,7 +2079,7 @@ impl RunnerRegistry {
             None,
         )
         .map_err(EnqueueLspError::from)?;
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }
 }

@@ -17,8 +17,8 @@ use super::validation_profile::{
 };
 use super::{ExecutionPurpose, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_client::ShellJobStartMetadata;
-use crate::shell_protocol::{
+use crate::runner_http::ShellJobStartMetadata;
+use crate::runner_protocol::{
     ShellCommandExecutionState, ShellJobOpRequest, ShellJobValidationMetadata,
     ShellJobValidationStep,
 };
@@ -283,11 +283,11 @@ fn resolve_cargo_test_minimum(
     no_run: Option<bool>,
 ) -> Result<Option<u64>, ToolResult> {
     if let Some(minimum) = min_tests {
-        if !(1..=crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum) {
+        if !(1..=crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum) {
             return Err(cargo_test_assertion_rejection(
                 format!(
                     "cargo_test min_tests must be between 1 and {}",
-                    crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX
+                    crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX
                 ),
                 "pass a bounded positive min_tests value, or omit it.",
             ));
@@ -917,9 +917,9 @@ impl ToolRuntime {
                 ))
             }
         };
-        let access = crate::shell_client::runner_access_from_auth(auth);
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let job = match self
-            .shell_clients
+            .runner_registry
             .start_job_with_metadata_for_access(
                 ShellJobOpRequest {
                     op: "start".to_string(),
@@ -953,7 +953,7 @@ impl ToolRuntime {
                         validation_target_id: validation_target_id.clone(),
                         minimum_tests,
                     }),
-                    visibility: crate::shell_client::ShellJobVisibility::HiddenUntilHandoff,
+                    visibility: crate::runner_http::ShellJobVisibility::HiddenUntilHandoff,
                     validation_identity: None,
                     validation_tool: None,
                     assertion_name: None,
@@ -985,7 +985,7 @@ impl ToolRuntime {
             cwd: resolved_cwd,
             shell: actual_shell.to_string(),
             executor: "agent".to_string(),
-            command_summary: crate::shell_client::command_preview(command),
+            command_summary: crate::runner_http::command_preview(command),
             minimum_tests,
             auth: access,
         };
@@ -1012,7 +1012,7 @@ impl ToolRuntime {
         handoff: ValidationHandoff,
     ) -> ToolResult {
         let mut guard = ValidationCleanupGuard::new(
-            self.shell_clients.clone(),
+            self.runner_registry.clone(),
             job_id.clone(),
             handoff.auth.clone(),
         );
@@ -1025,7 +1025,7 @@ impl ToolRuntime {
         let deadline = std::time::Instant::now() + wait;
         loop {
             let status = self
-                .shell_clients
+                .runner_registry
                 .get_hidden_job_for_auth(handoff.auth.as_ref(), &job_id)
                 .await;
             let (terminal, observed_status) = match status {
@@ -1052,7 +1052,7 @@ impl ToolRuntime {
         // deadline; promote_hidden_job deliberately leaves such a record hidden
         // so the original Cargo call can still return its structured terminal
         // result instead of handing off an already-finished Job.
-        let promoted = match self.shell_clients.promote_hidden_job(&job_id).await {
+        let promoted = match self.runner_registry.promote_hidden_job(&job_id).await {
             Ok(job) => job,
             Err(error) => {
                 return ToolResult::err(command_rejected_message(
@@ -1070,7 +1070,7 @@ impl ToolRuntime {
             return result;
         }
         let observation = match structured_job_observation(
-            &self.shell_clients,
+            &self.runner_registry,
             handoff.auth.as_ref(),
             &job_id,
         )
@@ -1151,7 +1151,7 @@ impl ToolRuntime {
         handoff: ValidationHandoff,
     ) -> ToolResult {
         let log = self
-            .shell_clients
+            .runner_registry
             .hidden_job_log_for_auth(handoff.auth.as_ref(), &job_id, Some(200))
             .await;
         let (job, stdout, stderr, stdout_source_truncated, stderr_source_truncated) = match log {
@@ -1225,7 +1225,7 @@ impl ToolRuntime {
         if validation_passed {
             // Discard the hidden Job record so a fast validation never leaves a
             // redundant visible job in list_jobs.
-            self.shell_clients
+            self.runner_registry
                 .remove_projected_hidden_terminal_job_record(&job_id)
                 .await;
             ToolResult::ok(payload)
@@ -1255,7 +1255,7 @@ impl ToolRuntime {
                     }
                 }),
             };
-            self.shell_clients
+            self.runner_registry
                 .remove_projected_hidden_terminal_job_record(&job_id)
                 .await;
             result
@@ -1302,7 +1302,7 @@ impl ToolRuntime {
         };
         let mut payload = json!({
             "project": project,
-            "command_summary": crate::shell_client::command_preview(command),
+            "command_summary": crate::runner_http::command_preview(command),
             "cwd": resolved_cwd,
             "shell": shell,
             "executor": executor,
@@ -1540,7 +1540,8 @@ fn validation_step(
                 // Whitespace-only filter means "no filter", matching the
                 // synchronous path. Option-like filters are rejected by the
                 // shared filter contract before any argv is built.
-                if let Some(normalized) = crate::shell_protocol::normalize_rust_test_filter(filter)?
+                if let Some(normalized) =
+                    crate::runner_protocol::normalize_rust_test_filter(filter)?
                 {
                     args.push(normalized);
                 }
@@ -1563,7 +1564,7 @@ fn validation_step(
         }
         "go_test" => {
             let packages =
-                crate::shell_protocol::normalize_go_test_packages(options.go_packages.as_deref())
+                crate::runner_protocol::normalize_go_test_packages(options.go_packages.as_deref())
                     .map_err(|reason| format!("packages {reason}"))?;
             let mut args = vec!["test".to_string(), "-json".to_string()];
             args.extend(packages);
@@ -1593,7 +1594,7 @@ fn push_paired_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) -> R
     let Some(value) = value else {
         return Ok(());
     };
-    let Some(normalized) = crate::shell_protocol::normalize_cargo_value(value)? else {
+    let Some(normalized) = crate::runner_protocol::normalize_cargo_value(value)? else {
         return Ok(());
     };
     args.push(flag.to_string());
@@ -1632,7 +1633,7 @@ fn apply_validation_projection_fields(payload: &mut Value, projection: &Value) {
 /// Once the tool has produced a terminal result or public handoff, the guard is
 /// disarmed.
 struct ValidationCleanupGuard {
-    clients: std::sync::Arc<crate::shell_client::ShellClientRegistry>,
+    clients: std::sync::Arc<crate::runner_http::RunnerRegistry>,
     job_id: String,
     auth: Option<webcodex_runner_registry::RunnerAccess>,
     armed: bool,
@@ -1640,7 +1641,7 @@ struct ValidationCleanupGuard {
 
 impl ValidationCleanupGuard {
     fn new(
-        clients: std::sync::Arc<crate::shell_client::ShellClientRegistry>,
+        clients: std::sync::Arc<crate::runner_http::RunnerRegistry>,
         job_id: String,
         auth: Option<webcodex_runner_registry::RunnerAccess>,
     ) -> Self {
@@ -1739,7 +1740,7 @@ mod structured_cargo_arg_parity_tests {
             resolve_cargo_test_minimum(None, Some(0), None),
             resolve_cargo_test_minimum(
                 None,
-                Some(crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX + 1),
+                Some(crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX + 1),
                 None,
             ),
             resolve_cargo_test_minimum(Some(true), None, Some(true)),
@@ -1885,7 +1886,7 @@ mod structured_cargo_arg_parity_tests {
             (
                 "cargo_check",
                 ValidationCommandOptions {
-                    features: Some("a".repeat(crate::shell_protocol::CARGO_VALUE_MAX_BYTES + 1)),
+                    features: Some("a".repeat(crate::runner_protocol::CARGO_VALUE_MAX_BYTES + 1)),
                     ..ValidationCommandOptions::default()
                 },
             ),

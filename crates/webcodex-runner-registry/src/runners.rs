@@ -1,7 +1,4 @@
-use super::access_control::{
-    assert_runner_access as assert_shell_client_access,
-    runner_visible_to_access as shell_client_visible_to_auth,
-};
+use super::access_control::{assert_runner_access, runner_visible_to_access};
 use super::jobs::{begin_job_recovery, is_final_job_status, mark_job_lost, offline_last_seen};
 use super::project_inventory::{
     expire_staging, pending_inventory_state, preserve_authoritative_pending,
@@ -11,16 +8,14 @@ use super::reconciliation::{
     validate_job_inventory_without_project_membership,
 };
 use super::requests::resolve_disconnected_sync_requests_locked;
-use super::state::{
-    NotifierEntry, ShellClientRecord, ShellClientRegistryInner, ShellClientSemanticView,
-};
+use super::state::{NotifierEntry, RunnerRecord, RunnerRegistryInner, RunnerSemanticView};
 use super::validation::{
-    normalize_tool_providers, trim_string, validate_agent_instance_id, validate_id,
-    validate_optional_field,
+    normalize_tool_providers, trim_string, validate_id, validate_optional_field,
+    validate_runner_instance_id,
 };
 use super::{
-    now_ts, AcceptedRunnerProtocol, AgentTransport, RunnerFeature, RunnerFeatureSet,
-    RunnerRegistry, CLIENT_ONLINE_WINDOW_SECS, MAX_RETIRED_INSTANCES_PER_CLIENT,
+    now_ts, AcceptedRunnerProtocol, RunnerFeature, RunnerFeatureSet, RunnerRegistry,
+    RunnerTransport, MAX_RETIRED_INSTANCES_PER_RUNNER, RUNNER_ONLINE_WINDOW_SECS,
 };
 use crate::RunnerAccessGroup;
 use std::collections::{HashSet, VecDeque};
@@ -34,9 +29,8 @@ use webcodex_core::coding_agent::{
     CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
 };
 use webcodex_core::mcp_gateway::validate_providers;
-use webcodex_core::shell_protocol::{
-    ShellClientRegisterRequest, ShellClientView, RUNNER_JOB_CONCURRENCY_MAX,
-    RUNNER_JOB_CONCURRENCY_MIN,
+use webcodex_core::runner_protocol::{
+    RunnerRegisterRequest, RunnerView, RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN,
 };
 
 fn validate_coding_agent_registration(
@@ -114,13 +108,13 @@ fn validate_coding_agent_registration(
 }
 
 fn reject_same_instance_feature_downgrade(
-    existing: Option<&ShellClientRecord>,
-    agent_instance_id: &str,
+    existing: Option<&RunnerRecord>,
+    runner_instance_id: &str,
     incoming: &RunnerFeatureSet,
     feature: RunnerFeature,
 ) -> Result<(), String> {
     if existing.is_some_and(|existing| {
-        existing.agent_instance_id == agent_instance_id
+        existing.runner_instance_id == runner_instance_id
             && existing.runner_features.supports(feature)
             && !incoming.supports(feature)
     }) {
@@ -134,37 +128,34 @@ fn reject_same_instance_feature_downgrade(
 
 struct StreamingSessionRegistration {
     connection_id: String,
-    transport: AgentTransport,
+    transport: RunnerTransport,
     notify: Arc<Notify>,
     cancel: watch::Sender<bool>,
 }
 
 impl RunnerRegistry {
     #[cfg(any(test, feature = "root-test-support"))]
-    pub async fn register(
-        &self,
-        body: ShellClientRegisterRequest,
-    ) -> Result<ShellClientView, String> {
+    pub async fn register(&self, body: RunnerRegisterRequest) -> Result<RunnerView, String> {
         self.register_with_auth(body, None).await
     }
 
     pub async fn register_with_auth(
         &self,
-        body: ShellClientRegisterRequest,
+        body: RunnerRegisterRequest,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Result<ShellClientView, String> {
+    ) -> Result<RunnerView, String> {
         self.register_session(body, auth, None).await
     }
 
     #[cfg(any(test, feature = "root-test-support"))]
     pub async fn register_streaming_session(
         &self,
-        body: ShellClientRegisterRequest,
+        body: RunnerRegisterRequest,
         auth: Option<&crate::RunnerAccess>,
         connection_id: &str,
-        transport: AgentTransport,
+        transport: RunnerTransport,
         notify: Arc<Notify>,
-    ) -> Result<ShellClientView, String> {
+    ) -> Result<RunnerView, String> {
         let (cancel, _cancelled) = watch::channel(false);
         self.register_streaming_session_with_cancel_sender(
             body,
@@ -183,12 +174,12 @@ impl RunnerRegistry {
     /// a failed replacement cannot signal the currently active session.
     pub async fn register_streaming_session_with_cancel(
         &self,
-        body: ShellClientRegisterRequest,
+        body: RunnerRegisterRequest,
         auth: Option<&crate::RunnerAccess>,
         connection_id: &str,
-        transport: AgentTransport,
+        transport: RunnerTransport,
         notify: Arc<Notify>,
-    ) -> Result<(ShellClientView, watch::Receiver<bool>), String> {
+    ) -> Result<(RunnerView, watch::Receiver<bool>), String> {
         let (cancel, cancelled) = watch::channel(false);
         let view = self
             .register_streaming_session_with_cancel_sender(
@@ -205,16 +196,16 @@ impl RunnerRegistry {
 
     async fn register_streaming_session_with_cancel_sender(
         &self,
-        body: ShellClientRegisterRequest,
+        body: RunnerRegisterRequest,
         auth: Option<&crate::RunnerAccess>,
         connection_id: &str,
-        transport: AgentTransport,
+        transport: RunnerTransport,
         notify: Arc<Notify>,
         cancel: watch::Sender<bool>,
-    ) -> Result<ShellClientView, String> {
+    ) -> Result<RunnerView, String> {
         validate_id(connection_id, "connection_id")?;
-        if transport == AgentTransport::Polling {
-            return Err("streaming agent transport is unsupported".to_string());
+        if transport == RunnerTransport::Polling {
+            return Err("streaming Runner transport is unsupported".to_string());
         }
         self.register_session(
             body,
@@ -231,12 +222,12 @@ impl RunnerRegistry {
 
     async fn register_session(
         &self,
-        body: ShellClientRegisterRequest,
+        body: RunnerRegisterRequest,
         auth: Option<&crate::RunnerAccess>,
         streaming: Option<StreamingSessionRegistration>,
-    ) -> Result<ShellClientView, String> {
+    ) -> Result<RunnerView, String> {
         validate_id(&body.client_id, "client_id")?;
-        validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_runner_instance_id(&body.runner_instance_id)?;
         validate_optional_field(&body.display_name, "display_name")?;
         validate_optional_field(&body.owner, "owner")?;
         validate_optional_field(&body.hostname, "hostname")?;
@@ -249,9 +240,9 @@ impl RunnerRegistry {
         }
 
         let client_id = body.client_id.trim().to_string();
-        let agent_instance_id = body.agent_instance_id.trim().to_string();
+        let runner_instance_id = body.runner_instance_id.trim().to_string();
         let accepted_protocol =
-            AcceptedRunnerProtocol::try_from_registration(body.agent_protocol_generation)?;
+            AcceptedRunnerProtocol::try_from_registration(body.runner_protocol_generation)?;
         let runner_features = RunnerFeatureSet::try_from_registration(&body.capabilities)?;
         if runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
             && !runner_features.supports(RunnerFeature::ApplyPatch)
@@ -282,7 +273,7 @@ impl RunnerRegistry {
         let host_context = body
             .host_context
             .clone()
-            .map(webcodex_core::shell_protocol::AgentHostContext::normalized)
+            .map(webcodex_core::runner_protocol::RunnerHostContext::normalized)
             .transpose()?;
         let mut policy = body.policy;
         if let Some(policy) = policy.as_mut() {
@@ -300,9 +291,9 @@ impl RunnerRegistry {
         // exclusively through the bounded paged inventory protocol.
         let projects = Vec::new();
         let project_inventory = pending_inventory_state(0);
-        let record = ShellClientRecord {
+        let record = RunnerRecord {
             client_id: client_id.clone(),
-            agent_instance_id: agent_instance_id.clone(),
+            runner_instance_id: runner_instance_id.clone(),
             display_name: trim_string(body.display_name),
             owner: trim_string(body.owner),
             hostname: trim_string(body.hostname),
@@ -314,7 +305,7 @@ impl RunnerRegistry {
             transport: streaming
                 .as_ref()
                 .map(|session| session.transport)
-                .unwrap_or(AgentTransport::Polling),
+                .unwrap_or(RunnerTransport::Polling),
             accepted_protocol,
             policy,
             auth_group: auth.and_then(|access| access.group.clone()),
@@ -337,7 +328,7 @@ impl RunnerRegistry {
         ) {
             (true, Some(inventory)) => {
                 // Registration inventory is always paged. Validate the bounded Job snapshot
-                // and same-client namespace now; exact project membership is established by
+                // and same-runner namespace now; exact project membership is established by
                 // the authoritative project inventory before any project becomes routable.
                 validate_job_inventory_without_project_membership(&client_id, inventory)?;
             }
@@ -354,24 +345,24 @@ impl RunnerRegistry {
             (false, None) => {}
         }
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
 
         if inner
-            .clients
+            .runners
             .get(&client_id)
             .is_some_and(|existing| existing.auth_group != record.auth_group)
         {
-            return Err("agent client identity is unavailable".to_string());
+            return Err("runner identity is unavailable".to_string());
         }
         if let Some(RunnerAccessGroup::SharedKey(group)) = record.auth_group.as_ref() {
-            let is_new_client = !inner.clients.contains_key(&client_id);
-            if is_new_client {
+            let is_new_runner = !inner.runners.contains_key(&client_id);
+            if is_new_runner {
                 let group_count = inner
-                    .clients
+                    .runners
                     .values()
-                    .filter(|client| {
+                    .filter(|runner| {
                         matches!(
-                            client.auth_group.as_ref(),
+                            runner.auth_group.as_ref(),
                             Some(RunnerAccessGroup::SharedKey(existing_group))
                                 if existing_group == group
                         )
@@ -384,10 +375,10 @@ impl RunnerRegistry {
                     ));
                 }
                 let global_count = inner
-                    .clients
+                    .runners
                     .values()
-                    .filter(|client| {
-                        matches!(client.auth_group, Some(RunnerAccessGroup::SharedKey(_)))
+                    .filter(|runner| {
+                        matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_)))
                     })
                     .count();
                 if global_count >= self.shared_key_limits.global {
@@ -401,27 +392,27 @@ impl RunnerRegistry {
         if inner
             .retired_instances
             .get(&client_id)
-            .is_some_and(|retired| retired.iter().any(|id| id == &agent_instance_id))
+            .is_some_and(|retired| retired.iter().any(|id| id == &runner_instance_id))
         {
             return Err(format!(
-                "agent client {} instance was replaced and cannot reclaim the lease",
+                "runner {} instance was replaced and cannot reclaim the lease",
                 client_id
             ));
         }
         reject_same_instance_feature_downgrade(
-            inner.clients.get(&client_id),
-            &agent_instance_id,
+            inner.runners.get(&client_id),
+            &runner_instance_id,
             &runner_features,
             RunnerFeature::JobStateReconciliation,
         )?;
         reject_same_instance_feature_downgrade(
-            inner.clients.get(&client_id),
-            &agent_instance_id,
+            inner.runners.get(&client_id),
+            &runner_instance_id,
             &runner_features,
             RunnerFeature::CodingAgentRuns,
         )?;
-        if inner.clients.get(&client_id).is_some_and(|existing| {
-            existing.agent_instance_id == agent_instance_id
+        if inner.runners.get(&client_id).is_some_and(|existing| {
+            existing.runner_instance_id == runner_instance_id
                 && existing.coding_agent_providers != coding_agent_providers
         }) {
             return Err(
@@ -429,8 +420,8 @@ impl RunnerRegistry {
                     .to_string(),
             );
         }
-        if inner.clients.get(&client_id).is_some_and(|existing| {
-            existing.agent_instance_id == agent_instance_id
+        if inner.runners.get(&client_id).is_some_and(|existing| {
+            existing.runner_instance_id == runner_instance_id
                 && existing
                     .policy
                     .as_ref()
@@ -444,13 +435,15 @@ impl RunnerRegistry {
                 "same runner instance cannot change MCP gateway provider inventory".to_string(),
             );
         }
-        // Enforce the agent instance lease. `client_id` is the unique active
-        // agent identity: at most one agent process may be online for it at a
+        // Enforce the Runner instance lease. `client_id` is the unique active
+        // wire identity: at most one Runner process may be online for it at a
         // time.
-        if let Some(existing) = inner.clients.get(&client_id) {
-            let online = now_ts().saturating_sub(existing.last_seen) <= CLIENT_ONLINE_WINDOW_SECS;
-            let same_instance = existing.agent_instance_id == agent_instance_id;
+        if let Some(existing) = inner.runners.get(&client_id) {
+            let online = now_ts().saturating_sub(existing.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
+            let same_instance = existing.runner_instance_id == runner_instance_id;
             if online && !same_instance {
+                // Rolling compatibility fence: webcodex-runner classifies this
+                // complete historical prose string exactly during registration recovery.
                 return Err(format!(
                     "agent client {} is already online with a different instance",
                     client_id
@@ -459,20 +452,20 @@ impl RunnerRegistry {
         }
 
         let replaced_instance = inner
-            .clients
+            .runners
             .get(&client_id)
-            .map(|existing| existing.agent_instance_id != agent_instance_id)
+            .map(|existing| existing.runner_instance_id != runner_instance_id)
             .unwrap_or(false);
         let replaced_instance_id = replaced_instance.then(|| {
             inner
-                .clients
+                .runners
                 .get(&client_id)
-                .expect("replacement requires existing client")
-                .agent_instance_id
+                .expect("replacement requires existing runner")
+                .runner_instance_id
                 .clone()
         });
         if let Some(inventory) = job_inventory.as_ref() {
-            preflight_inventory_locked(&inner, &client_id, &agent_instance_id, inventory)?;
+            preflight_inventory_locked(&inner, &client_id, &runner_instance_id, inventory)?;
         }
         // All fallible validation/preflight is complete. Capture the previous
         // streaming session's cancellation sender now, but do not signal it
@@ -512,7 +505,7 @@ impl RunnerRegistry {
                 .or_default();
             if !retired.iter().any(|id| id == replaced_instance_id) {
                 retired.push_back(replaced_instance_id.to_string());
-                while retired.len() > MAX_RETIRED_INSTANCES_PER_CLIENT {
+                while retired.len() > MAX_RETIRED_INSTANCES_PER_RUNNER {
                     retired.pop_front();
                 }
             }
@@ -522,8 +515,8 @@ impl RunnerRegistry {
         // original registration time; `connected_at` reflects the new
         // connection. A new instance starts a fresh lifecycle.
         let mut record = record;
-        if let Some(existing) = inner.clients.get(&client_id) {
-            if existing.agent_instance_id == agent_instance_id {
+        if let Some(existing) = inner.runners.get(&client_id) {
+            if existing.runner_instance_id == runner_instance_id {
                 record.registered_at = existing.registered_at;
                 record.projected_structured_terminal_suppressions =
                     existing.projected_structured_terminal_suppressions.clone();
@@ -536,7 +529,7 @@ impl RunnerRegistry {
             // pending/degraded. A different `agent_instance_id` must use the
             // projection built from its own registration (empty for V2 paged
             // registration) until that instance completes an atomic snapshot.
-            if existing.agent_instance_id == agent_instance_id {
+            if existing.runner_instance_id == runner_instance_id {
                 record.projects = existing.projects.clone();
                 record.project_inventory = preserve_authoritative_pending(
                     &existing.project_inventory,
@@ -550,40 +543,40 @@ impl RunnerRegistry {
         // connection lease, and notifier are committed under this same lock so
         // the registry never exposes a half-registered long-lived session.
         inner.notifiers.remove(&client_id);
-        inner.clients.insert(client_id.clone(), record);
+        inner.runners.insert(client_id.clone(), record);
         if let Some(streaming) = streaming {
             inner.notifiers.insert(
                 client_id.clone(),
                 NotifierEntry {
                     notify: streaming.notify,
                     cancel: streaming.cancel,
-                    agent_instance_id: agent_instance_id.clone(),
+                    runner_instance_id: runner_instance_id.clone(),
                     connection_id: Some(streaming.connection_id),
                 },
             );
         }
         if let Some(inventory) = job_inventory.as_ref() {
             let auth_group = inner
-                .clients
+                .runners
                 .get(&client_id)
-                .and_then(|client| client.auth_group.clone());
+                .and_then(|runner| runner.auth_group.clone());
             let reconciliation = reconcile_inventory_locked(
                 &mut inner,
                 &client_id,
-                &agent_instance_id,
+                &runner_instance_id,
                 auth_group,
                 self.observation_epoch.clone(),
                 inventory,
                 now,
             );
             let process_started_at = inner
-                .clients
+                .runners
                 .get(&client_id)
-                .and_then(|client| client.process_started_at);
+                .and_then(|runner| runner.process_started_at);
             tracing::info!(
                 target: "webcodex::job_reconciliation",
                 client_id = %client_id,
-                agent_instance_id = %agent_instance_id,
+                runner_instance_id = %runner_instance_id,
                 process_started_at = ?process_started_at,
                 inventory_active = reconciliation.inventory_active,
                 inventory_terminal = reconciliation.inventory_terminal,
@@ -594,7 +587,7 @@ impl RunnerRegistry {
                 "runner job inventory reconciled"
             );
         }
-        let view = Self::client_view_locked(&inner, &client_id).expect("client just inserted");
+        let view = Self::runner_view_locked(&inner, &client_id).expect("runner just inserted");
         drop(inner);
         if let Some(cancel) = replaced_streaming_cancel {
             let _ = cancel.send(true);
@@ -609,7 +602,7 @@ impl RunnerRegistry {
     pub async fn set_transport(
         &self,
         client_id: &str,
-        transport: AgentTransport,
+        transport: RunnerTransport,
     ) -> Result<(), String> {
         self.set_transport_checked(client_id, None, None, transport)
             .await
@@ -619,50 +612,50 @@ impl RunnerRegistry {
     async fn set_transport_checked(
         &self,
         client_id: &str,
-        agent_instance_id: Option<&str>,
+        runner_instance_id: Option<&str>,
         connection_id: Option<&str>,
-        transport: AgentTransport,
+        transport: RunnerTransport,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get_mut(client_id) else {
+        let Some(runner) = inner.runners.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
-        if agent_instance_id.is_some_and(|id| client.agent_instance_id != id)
-            || connection_id.is_some_and(|id| client.connection_id.as_deref() != Some(id))
+        if runner_instance_id.is_some_and(|id| runner.runner_instance_id != id)
+            || connection_id.is_some_and(|id| runner.connection_id.as_deref() != Some(id))
         {
             return Err(format!(
-                "agent client {} transport connection is no longer active",
+                "runner {} transport connection is no longer active",
                 client_id
             ));
         }
-        client.transport = transport;
+        runner.transport = transport;
         Ok(())
     }
 
-    /// Refresh `last_seen` for a registered client to "now" without performing
+    /// Refresh `last_seen` for a registered Runner to "now" without performing
     /// any business operation. Used by keepalive traffic to keep active
-    /// long-lived transports inside the online window. Polling agents have no
+    /// long-lived transports inside the online window. Polling Runners have no
     /// server-internal connection lease and use this path directly; long-lived
-    /// transports use [`Self::touch_client_for_connection`] instead so a stale
+    /// transports use [`Self::touch_runner_for_connection`] instead so a stale
     /// same-instance connection cannot revive the new lease.
     #[cfg(test)]
-    pub async fn touch_client(
+    pub async fn touch_runner(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
     ) -> Result<(), String> {
-        validate_agent_instance_id(agent_instance_id)?;
+        validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get_mut(client_id) else {
+        let Some(runner) = inner.runners.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
-        if client.agent_instance_id != agent_instance_id {
+        if runner.runner_instance_id != runner_instance_id {
             return Err(format!(
-                "agent client {} is no longer the active instance (stale or replaced)",
+                "runner {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
         }
-        client.last_seen = now_ts();
+        runner.last_seen = now_ts();
         Ok(())
     }
 
@@ -672,46 +665,46 @@ impl RunnerRegistry {
     /// registry mutex that owns `last_seen`. A delayed Ping/Pong from a stale
     /// same-instance connection (replaced by a reconnect) returns a stable
     /// error and must not refresh the new connection's `last_seen` or revive
-    /// an already-disconnected client. Polling keepalive keeps using
-    /// [`RunnerRegistry::touch_client`].
-    pub async fn touch_client_for_connection(
+    /// an already-disconnected runner. Polling keepalive keeps using
+    /// [`RunnerRegistry::touch_runner`].
+    pub async fn touch_runner_for_connection(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: &str,
     ) -> Result<(), String> {
-        validate_agent_instance_id(agent_instance_id)?;
+        validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get_mut(client_id) else {
+        let Some(runner) = inner.runners.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
-        if client.agent_instance_id != agent_instance_id {
+        if runner.runner_instance_id != runner_instance_id {
             return Err(format!(
-                "agent client {} is no longer the active instance (stale or replaced)",
+                "runner {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
         }
-        if client.connection_id.as_deref() != Some(connection_id) {
+        if runner.connection_id.as_deref() != Some(connection_id) {
             return Err(format!(
-                "agent client {} transport connection is no longer active",
+                "runner {} transport connection is no longer active",
                 client_id
             ));
         }
-        client.last_seen = now_ts();
+        runner.last_seen = now_ts();
         Ok(())
     }
 
-    /// Apply sanitized provider metadata to the active agent record. Optional
+    /// Apply sanitized provider metadata to the active Runner record. Optional
     /// metadata is best-effort: malformed/unknown state is ignored by the
     /// normalizer and never changes transport or tool completion semantics.
     /// Polling-transport `RuntimeMetadata` uses this path.
     pub async fn update_tool_providers(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
-        status: Option<webcodex_core::shell_protocol::ToolProvidersStatus>,
+        runner_instance_id: &str,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
     ) -> Result<(), String> {
-        self.update_tool_providers_checked(client_id, agent_instance_id, None, status)
+        self.update_tool_providers_checked(client_id, runner_instance_id, None, status)
             .await
     }
 
@@ -722,13 +715,13 @@ impl RunnerRegistry {
     pub async fn update_tool_providers_for_connection(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: &str,
-        status: Option<webcodex_core::shell_protocol::ToolProvidersStatus>,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
     ) -> Result<(), String> {
         self.update_tool_providers_checked(
             client_id,
-            agent_instance_id,
+            runner_instance_id,
             Some(connection_id),
             status,
         )
@@ -738,68 +731,68 @@ impl RunnerRegistry {
     async fn update_tool_providers_checked(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         expected_connection_id: Option<&str>,
-        status: Option<webcodex_core::shell_protocol::ToolProvidersStatus>,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
     ) -> Result<(), String> {
         let Some(status) = normalize_tool_providers(status) else {
             return Ok(());
         };
-        validate_agent_instance_id(agent_instance_id)?;
+        validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get_mut(client_id) else {
+        let Some(runner) = inner.runners.get_mut(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
-        if client.agent_instance_id != agent_instance_id {
+        if runner.runner_instance_id != runner_instance_id {
             return Err(format!(
-                "agent client {} is no longer the active instance (stale or replaced)",
+                "runner {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
         }
         if let Some(expected) = expected_connection_id {
-            if client.connection_id.as_deref() != Some(expected) {
+            if runner.connection_id.as_deref() != Some(expected) {
                 return Err(format!(
-                    "agent client {} transport connection is no longer active",
+                    "runner {} transport connection is no longer active",
                     client_id
                 ));
             }
         }
-        if let Some(policy) = client.policy.as_mut() {
+        if let Some(policy) = runner.policy.as_mut() {
             policy.tool_providers = Some(status);
         }
-        client.last_seen = now_ts();
+        runner.last_seen = now_ts();
         Ok(())
     }
 
-    /// Test-only hook to force a client's `last_seen` so liveness/stale
+    /// Test-only hook to force a runner's `last_seen` so liveness/stale
     /// behavior can be exercised without sleeping for the full online window.
     #[cfg(any(test, feature = "root-test-support"))]
     pub async fn set_last_seen_for_test(&self, client_id: &str, ts: i64) {
         let mut inner = self.inner.lock().await;
-        if let Some(client) = inner.clients.get_mut(client_id) {
-            client.last_seen = ts;
+        if let Some(runner) = inner.runners.get_mut(client_id) {
+            runner.last_seen = ts;
         }
     }
 
-    pub(super) fn prune_expired_shared_key_clients_locked(
+    pub(super) fn prune_expired_shared_key_runners_locked(
         &self,
-        inner: &mut ShellClientRegistryInner,
+        inner: &mut RunnerRegistryInner,
         now: i64,
     ) {
         let expired = inner
-            .clients
+            .runners
             .iter()
-            .filter_map(|(client_id, client)| {
-                if !matches!(client.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
+            .filter_map(|(client_id, runner)| {
+                if !matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
                     return None;
                 }
                 let transport_connected = inner.notifiers.contains_key(client_id);
                 let recently_seen =
-                    now.saturating_sub(client.last_seen) <= CLIENT_ONLINE_WINDOW_SECS;
+                    now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
                 if transport_connected || recently_seen {
                     return None;
                 }
-                let offline_since = client.disconnected_at.unwrap_or(client.last_seen);
+                let offline_since = runner.disconnected_at.unwrap_or(runner.last_seen);
                 (now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs)
                     .then(|| client_id.clone())
             })
@@ -826,7 +819,7 @@ impl RunnerRegistry {
             resolve_disconnected_sync_requests_locked(
                 inner,
                 client_id,
-                "agent went offline: shared-key runner registration expired",
+                "runner went offline: shared-key runner registration expired",
             );
         }
         for job_id in &job_ids {
@@ -847,8 +840,8 @@ impl RunnerRegistry {
             !request_ids.contains(request_id) && !job_ids.contains(job_id)
         });
         for client_id in &expired {
-            inner.clients.remove(client_id);
-            inner.queues_by_client.remove(client_id);
+            inner.runners.remove(client_id);
+            inner.queues_by_runner.remove(client_id);
             inner.notifiers.remove(client_id);
             inner.retired_instances.remove(client_id);
             let project_prefix = format!("agent:{client_id}:");
@@ -862,23 +855,23 @@ impl RunnerRegistry {
             .retain(|job_id, _| !job_ids.contains(job_id));
     }
 
-    pub(super) async fn prune_expired_shared_key_clients(&self) {
+    pub(super) async fn prune_expired_shared_key_runners(&self) {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
     }
 
     /// Test-only hook for instance-lease notifier regressions that intentionally
     /// exercise notifier replacement independently. Production streaming
-    /// registration installs its notifier atomically with the client record.
+    /// registration installs its notifier atomically with the runner record.
     #[cfg(test)]
     pub async fn register_notifier(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         notify: Arc<Notify>,
     ) -> Result<(), String> {
-        self.register_notifier_checked(client_id, agent_instance_id, None, notify)
+        self.register_notifier_checked(client_id, runner_instance_id, None, notify)
             .await
     }
 
@@ -886,24 +879,24 @@ impl RunnerRegistry {
     async fn register_notifier_checked(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: Option<&str>,
         notify: Arc<Notify>,
     ) -> Result<(), String> {
-        validate_agent_instance_id(agent_instance_id)?;
+        validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(client_id) else {
+        let Some(runner) = inner.runners.get(client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
-        if client.agent_instance_id != agent_instance_id {
+        if runner.runner_instance_id != runner_instance_id {
             return Err(format!(
-                "agent client {} is no longer the active instance (stale or replaced)",
+                "runner {} is no longer the active instance (stale or replaced)",
                 client_id
             ));
         }
-        if connection_id.is_some_and(|id| client.connection_id.as_deref() != Some(id)) {
+        if connection_id.is_some_and(|id| runner.connection_id.as_deref() != Some(id)) {
             return Err(format!(
-                "agent client {} transport connection is no longer active",
+                "runner {} transport connection is no longer active",
                 client_id
             ));
         }
@@ -913,45 +906,45 @@ impl RunnerRegistry {
             NotifierEntry {
                 notify,
                 cancel,
-                agent_instance_id: agent_instance_id.to_string(),
+                runner_instance_id: runner_instance_id.to_string(),
                 connection_id: connection_id.map(str::to_string),
             },
         );
         Ok(())
     }
 
-    /// Reconcile state after an agent transport disconnects or sends a
+    /// Reconcile state after an Runner transport disconnects or sends a
     /// graceful offline notice.
     #[cfg(any(test, feature = "root-test-support"))]
-    pub async fn reconcile_disconnect(&self, client_id: &str, agent_instance_id: &str) {
-        self.reconcile_disconnect_checked(client_id, agent_instance_id, None)
+    pub async fn reconcile_disconnect(&self, client_id: &str, runner_instance_id: &str) {
+        self.reconcile_disconnect_checked(client_id, runner_instance_id, None)
             .await;
     }
 
     pub async fn reconcile_disconnect_for_connection(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: &str,
     ) {
-        self.reconcile_disconnect_checked(client_id, agent_instance_id, Some(connection_id))
+        self.reconcile_disconnect_checked(client_id, runner_instance_id, Some(connection_id))
             .await;
     }
 
     async fn reconcile_disconnect_checked(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: Option<&str>,
     ) {
         let mut inner = self.inner.lock().await;
         let is_active = inner
-            .clients
+            .runners
             .get(client_id)
-            .map(|client| {
-                client.agent_instance_id == agent_instance_id
+            .map(|runner| {
+                runner.runner_instance_id == runner_instance_id
                     && connection_id
-                        .map(|id| client.connection_id.as_deref() == Some(id))
+                        .map(|id| runner.connection_id.as_deref() == Some(id))
                         .unwrap_or(true)
             })
             .unwrap_or(false);
@@ -962,7 +955,7 @@ impl RunnerRegistry {
             .notifiers
             .get(client_id)
             .map(|entry| {
-                entry.agent_instance_id == agent_instance_id
+                entry.runner_instance_id == runner_instance_id
                     && connection_id
                         .map(|id| entry.connection_id.as_deref() == Some(id))
                         .unwrap_or(true)
@@ -972,14 +965,14 @@ impl RunnerRegistry {
             inner.notifiers.remove(client_id);
         }
         let now = now_ts();
-        let recoverable = inner.clients.get(client_id).is_some_and(|client| {
-            client
+        let recoverable = inner.runners.get(client_id).is_some_and(|runner| {
+            runner
                 .runner_features
                 .supports(RunnerFeature::JobStateReconciliation)
         });
-        if let Some(client) = inner.clients.get_mut(client_id) {
-            client.last_seen = offline_last_seen(now);
-            client.disconnected_at = Some(now);
+        if let Some(runner) = inner.runners.get_mut(client_id) {
+            runner.last_seen = offline_last_seen(now);
+            runner.disconnected_at = Some(now);
         }
         let affected_job_ids: Vec<String> = inner
             .jobs_by_id
@@ -1011,12 +1004,12 @@ impl RunnerRegistry {
                     let (reason, message) = if job.status == "queued" {
                         (
                             "runner_request_not_dispatched",
-                            "agent transport disconnected before the queued request was dispatched",
+                            "Runner transport disconnected before the queued request was dispatched",
                         )
                     } else {
                         (
                             "runner_disconnected_without_reconciliation",
-                            "agent transport disconnected without reconciliation support",
+                            "Runner transport disconnected without reconciliation support",
                         )
                     };
                     mark_job_lost(job, now, reason, message);
@@ -1025,7 +1018,7 @@ impl RunnerRegistry {
             if let Some(request_id) = request_id {
                 inner.pending_by_id.remove(&request_id);
                 inner.request_to_job.remove(&request_id);
-                if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+                if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
                     queue.retain(|id| id != &request_id);
                 }
             }
@@ -1044,70 +1037,70 @@ impl RunnerRegistry {
         for request_id in extra_job_requests {
             inner.pending_by_id.remove(&request_id);
             inner.request_to_job.remove(&request_id);
-            if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+            if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
                 queue.retain(|id| id != &request_id);
             }
         }
         // Synchronous tool requests (run_shell/read_file/write/lsp/project ops)
         // carry a live oneshot waiter but no job_id, so the job loop above skips
         // them. Fail them fast here; otherwise the calling tool blocks until its
-        // own wait timeout (tens of seconds) after the agent has already gone,
+        // own wait timeout (tens of seconds) after the Runner has already gone,
         // which surfaces as an unresponsive MCP `tools/call`.
         resolve_disconnected_sync_requests_locked(
             &mut inner,
             client_id,
-            "agent went offline: transport disconnected before returning a result",
+            "runner went offline: transport disconnected before returning a result",
         );
     }
 
     #[cfg(any(test, feature = "root-test-support"))]
-    pub async fn list_clients(&self) -> Vec<ShellClientView> {
+    pub async fn list_runners(&self) -> Vec<RunnerView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        for client in inner.clients.values_mut() {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        for runner in inner.runners.values_mut() {
+            expire_staging(runner, now);
         }
-        let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
+        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids.into_iter()
-            .filter_map(|id| Self::client_view_locked(&inner, &id))
+            .filter_map(|id| Self::runner_view_locked(&inner, &id))
             .collect()
     }
 
-    pub async fn list_clients_for_auth(
+    pub async fn list_runners_for_auth(
         &self,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Vec<ShellClientView> {
+    ) -> Vec<RunnerView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        for client in inner.clients.values_mut() {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        for runner in inner.runners.values_mut() {
+            expire_staging(runner, now);
         }
-        let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
+        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids.into_iter()
             .filter(|id| {
                 inner
-                    .clients
+                    .runners
                     .get(id)
-                    .map(|client| shell_client_visible_to_auth(auth, client))
+                    .map(|runner| runner_visible_to_access(auth, runner))
                     .unwrap_or(false)
             })
-            .filter_map(|id| Self::client_view_locked(&inner, &id))
+            .filter_map(|id| Self::runner_view_locked(&inner, &id))
             .collect()
     }
 
     pub async fn has_connected_shared_key_group(&self, shared_key_hash: &str) -> bool {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        inner.clients.values().any(|client| {
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        inner.runners.values().any(|runner| {
             matches!(
-                client.auth_group.as_ref(),
+                runner.auth_group.as_ref(),
                 Some(RunnerAccessGroup::SharedKey(group)) if group == shared_key_hash
-            ) && now.saturating_sub(client.last_seen) <= CLIENT_ONLINE_WINDOW_SECS
+            ) && now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS
         })
     }
 
@@ -1121,83 +1114,83 @@ impl RunnerRegistry {
     ) -> Vec<RunnerFeatureSet> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
         inner
-            .clients
+            .runners
             .values()
-            .filter(|client| {
+            .filter(|runner| {
                 matches!(
-                    client.auth_group.as_ref(),
+                    runner.auth_group.as_ref(),
                     Some(RunnerAccessGroup::SharedKey(group)) if group == shared_key_hash
-                ) && now.saturating_sub(client.last_seen) <= CLIENT_ONLINE_WINDOW_SECS
+                ) && now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS
             })
-            .map(|client| client.runner_features.clone())
+            .map(|runner| runner.runner_features.clone())
             .collect()
     }
 
-    pub async fn list_client_semantic_views_for_auth(
+    pub async fn list_runner_semantic_views_for_auth(
         &self,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Vec<ShellClientSemanticView> {
+    ) -> Vec<RunnerSemanticView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        for client in inner.clients.values_mut() {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        for runner in inner.runners.values_mut() {
+            expire_staging(runner, now);
         }
-        let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
+        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         ids.into_iter()
             .filter(|id| {
                 inner
-                    .clients
+                    .runners
                     .get(id)
-                    .map(|client| shell_client_visible_to_auth(auth, client))
+                    .map(|runner| runner_visible_to_access(auth, runner))
                     .unwrap_or(false)
             })
-            .filter_map(|id| Self::client_semantic_view_locked(&inner, &id))
+            .filter_map(|id| Self::runner_semantic_view_locked(&inner, &id))
             .collect()
     }
 
     /// Return a complete canonical Runner/Project observation only when both
     /// caller-supplied cardinality bounds hold. `None` means the observation is
     /// incomplete and must never support a negative authority conclusion.
-    pub async fn list_bounded_client_semantic_views_for_auth(
+    pub async fn list_bounded_runner_semantic_views_for_auth(
         &self,
         auth: Option<&crate::RunnerAccess>,
-        max_clients: usize,
+        max_runners: usize,
         max_projects: usize,
-    ) -> Option<Vec<ShellClientSemanticView>> {
+    ) -> Option<Vec<RunnerSemanticView>> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        for client in inner.clients.values_mut() {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        for runner in inner.runners.values_mut() {
+            expire_staging(runner, now);
         }
-        Self::bounded_client_semantic_views_for_auth_locked(&inner, auth, max_clients, max_projects)
+        Self::bounded_runner_semantic_views_for_auth_locked(&inner, auth, max_runners, max_projects)
     }
 
     /// Hold one bounded authoritative Runner/Project registry observation stable
     /// while a synchronous Control operation decides against it. `None` is an
     /// incomplete observation; callers must fail closed. Callers must not await
     /// inside `f`.
-    pub async fn with_bounded_client_semantic_views_for_auth_locked<R>(
+    pub async fn with_bounded_runner_semantic_views_for_auth_locked<R>(
         &self,
         auth: Option<&crate::RunnerAccess>,
-        max_clients: usize,
+        max_runners: usize,
         max_projects: usize,
-        f: impl FnOnce(Option<Vec<ShellClientSemanticView>>) -> R,
+        f: impl FnOnce(Option<Vec<RunnerSemanticView>>) -> R,
     ) -> R {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        for client in inner.clients.values_mut() {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        for runner in inner.runners.values_mut() {
+            expire_staging(runner, now);
         }
-        let views = Self::bounded_client_semantic_views_for_auth_locked(
+        let views = Self::bounded_runner_semantic_views_for_auth_locked(
             &inner,
             auth,
-            max_clients,
+            max_runners,
             max_projects,
         );
         let result = f(views);
@@ -1205,110 +1198,107 @@ impl RunnerRegistry {
         result
     }
 
-    pub async fn get_client_view(&self, client_id: &str) -> Option<ShellClientView> {
+    pub async fn get_runner_view(&self, client_id: &str) -> Option<RunnerView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        if let Some(client) = inner.clients.get_mut(client_id) {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        if let Some(runner) = inner.runners.get_mut(client_id) {
+            expire_staging(runner, now);
         }
-        Self::client_view_locked(&inner, client_id)
+        Self::runner_view_locked(&inner, client_id)
     }
 
     #[cfg(any(test, feature = "root-test-support"))]
-    pub async fn get_client_view_for_connection(
+    pub async fn get_runner_view_for_connection(
         &self,
         client_id: &str,
-        agent_instance_id: &str,
+        runner_instance_id: &str,
         connection_id: &str,
-    ) -> Option<ShellClientView> {
+    ) -> Option<RunnerView> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner.clients.get(client_id)?;
-        if client.agent_instance_id != agent_instance_id
-            || client.connection_id.as_deref() != Some(connection_id)
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(client_id)?;
+        if runner.runner_instance_id != runner_instance_id
+            || runner.connection_id.as_deref() != Some(connection_id)
         {
             return None;
         }
-        Self::client_view_locked(&inner, client_id)
+        Self::runner_view_locked(&inner, client_id)
     }
 
-    pub async fn get_client_view_for_auth(
+    pub async fn get_runner_view_for_auth(
         &self,
         client_id: &str,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Option<ShellClientView> {
+    ) -> Option<RunnerView> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner.clients.get(client_id)?;
-        if !shell_client_visible_to_auth(auth, client) {
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(client_id)?;
+        if !runner_visible_to_access(auth, runner) {
             return None;
         }
-        Self::client_view_locked(&inner, client_id)
+        Self::runner_view_locked(&inner, client_id)
     }
 
-    pub async fn get_client_semantic_view(
-        &self,
-        client_id: &str,
-    ) -> Option<ShellClientSemanticView> {
+    pub async fn get_runner_semantic_view(&self, client_id: &str) -> Option<RunnerSemanticView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        if let Some(client) = inner.clients.get_mut(client_id) {
-            expire_staging(client, now);
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        if let Some(runner) = inner.runners.get_mut(client_id) {
+            expire_staging(runner, now);
         }
-        Self::client_semantic_view_locked(&inner, client_id)
+        Self::runner_semantic_view_locked(&inner, client_id)
     }
 
-    pub async fn get_client_semantic_view_for_auth(
+    pub async fn get_runner_semantic_view_for_auth(
         &self,
         client_id: &str,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Option<ShellClientSemanticView> {
+    ) -> Option<RunnerSemanticView> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner.clients.get(client_id)?;
-        if !shell_client_visible_to_auth(auth, client) {
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(client_id)?;
+        if !runner_visible_to_access(auth, runner) {
             return None;
         }
-        Self::client_semantic_view_locked(&inner, client_id)
+        Self::runner_semantic_view_locked(&inner, client_id)
     }
 
-    pub async fn get_client_semantic_view_checked_for_auth(
+    pub async fn get_runner_semantic_view_checked_for_auth(
         &self,
         client_id: &str,
         auth: Option<&crate::RunnerAccess>,
-    ) -> Result<ShellClientSemanticView, String> {
+    ) -> Result<RunnerSemanticView, String> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner
-            .clients
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner
+            .runners
             .get(client_id)
             .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
-        assert_shell_client_access(auth, client)?;
-        Self::client_semantic_view_locked(&inner, client_id)
+        assert_runner_access(auth, runner)?;
+        Self::runner_semantic_view_locked(&inner, client_id)
             .ok_or_else(|| format!("unknown shell client: {client_id}"))
     }
 
-    pub async fn coding_agent_run_for_client_for_auth(
+    pub async fn coding_agent_run_for_runner_for_auth(
         &self,
         auth: Option<&crate::RunnerAccess>,
         client_id: &str,
         run_id: &str,
-    ) -> Option<(ShellClientView, CodingAgentRunSnapshot)> {
+    ) -> Option<(RunnerView, CodingAgentRunSnapshot)> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner.clients.get(client_id)?;
-        if !shell_client_visible_to_auth(auth, client) {
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(client_id)?;
+        if !runner_visible_to_access(auth, runner) {
             return None;
         }
-        let run = client
+        let run = runner
             .coding_agent_inventory
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
             .cloned()?;
-        let view = Self::client_view_locked(&inner, client_id)?;
+        let view = Self::runner_view_locked(&inner, client_id)?;
         Some((view, run))
     }
 
@@ -1316,21 +1306,21 @@ impl RunnerRegistry {
         &self,
         auth: Option<&crate::RunnerAccess>,
         run_id: &str,
-    ) -> Option<(ShellClientView, CodingAgentRunSnapshot)> {
+    ) -> Option<(RunnerView, CodingAgentRunSnapshot)> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now);
-        let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         let mut matched = None;
         for client_id in ids {
-            let Some(client) = inner.clients.get(&client_id) else {
+            let Some(runner) = inner.runners.get(&client_id) else {
                 continue;
             };
-            if !shell_client_visible_to_auth(auth, client) {
+            if !runner_visible_to_access(auth, runner) {
                 continue;
             }
-            let Some(run) = client
+            let Some(run) = runner
                 .coding_agent_inventory
                 .runs
                 .iter()
@@ -1345,45 +1335,45 @@ impl RunnerRegistry {
                 // registry iteration order and silently retargeting provenance.
                 return None;
             }
-            let view = Self::client_view_locked(&inner, &client_id)?;
+            let view = Self::runner_view_locked(&inner, &client_id)?;
             matched = Some((view, run));
         }
         matched
     }
 
-    pub async fn assert_client_access(
+    pub async fn assert_runner_access(
         &self,
         auth: Option<&crate::RunnerAccess>,
         client_id: &str,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
-        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
-        let client = inner
-            .clients
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner
+            .runners
             .get(client_id)
             .ok_or_else(|| format!("unknown shell client: {}", client_id))?;
-        assert_shell_client_access(auth, client)
+        assert_runner_access(auth, runner)
     }
 
-    fn bounded_client_semantic_views_for_auth_locked(
-        inner: &ShellClientRegistryInner,
+    fn bounded_runner_semantic_views_for_auth_locked(
+        inner: &RunnerRegistryInner,
         auth: Option<&crate::RunnerAccess>,
-        max_clients: usize,
+        max_runners: usize,
         max_projects: usize,
-    ) -> Option<Vec<ShellClientSemanticView>> {
+    ) -> Option<Vec<RunnerSemanticView>> {
         // Check the backing registry before allocating/sorting identifiers. This
         // is conservative for non-admin callers, but lifecycle tools are
         // administrator-only and a conservative incomplete result is fail-closed.
-        if inner.clients.len() > max_clients {
+        if inner.runners.len() > max_runners {
             return None;
         }
-        let mut ids = Vec::with_capacity(inner.clients.len());
+        let mut ids = Vec::with_capacity(inner.runners.len());
         let mut project_count = 0usize;
-        for (id, client) in &inner.clients {
-            if !shell_client_visible_to_auth(auth, client) {
+        for (id, runner) in &inner.runners {
+            if !runner_visible_to_access(auth, runner) {
                 continue;
             }
-            project_count = project_count.checked_add(client.projects.len())?;
+            project_count = project_count.checked_add(runner.projects.len())?;
             if project_count > max_projects {
                 return None;
             }
@@ -1391,59 +1381,56 @@ impl RunnerRegistry {
         }
         ids.sort();
         ids.into_iter()
-            .map(|id| Self::client_semantic_view_locked(inner, &id))
+            .map(|id| Self::runner_semantic_view_locked(inner, &id))
             .collect()
     }
 
-    fn client_semantic_view_locked(
-        inner: &ShellClientRegistryInner,
+    fn runner_semantic_view_locked(
+        inner: &RunnerRegistryInner,
         client_id: &str,
-    ) -> Option<ShellClientSemanticView> {
-        let runner_features = inner.clients.get(client_id)?.runner_features.clone();
-        let view = Self::client_view_locked(inner, client_id)?;
-        Some(ShellClientSemanticView {
+    ) -> Option<RunnerSemanticView> {
+        let runner_features = inner.runners.get(client_id)?.runner_features.clone();
+        let view = Self::runner_view_locked(inner, client_id)?;
+        Some(RunnerSemanticView {
             view,
             runner_features,
         })
     }
 
-    fn client_view_locked(
-        inner: &ShellClientRegistryInner,
-        client_id: &str,
-    ) -> Option<ShellClientView> {
-        let client = inner.clients.get(client_id)?;
+    fn runner_view_locked(inner: &RunnerRegistryInner, client_id: &str) -> Option<RunnerView> {
+        let runner = inner.runners.get(client_id)?;
         let pending_requests = inner
-            .queues_by_client
+            .queues_by_runner
             .get(client_id)
             .map(VecDeque::len)
             .unwrap_or(0);
-        let age = now_ts().saturating_sub(client.last_seen);
-        let connected = age <= CLIENT_ONLINE_WINDOW_SECS;
-        Some(ShellClientView {
-            client_id: client.client_id.clone(),
-            agent_instance_id: client.agent_instance_id.clone(),
-            display_name: client.display_name.clone(),
-            owner: client.owner.clone(),
-            hostname: client.hostname.clone(),
-            host_context: client.host_context.clone(),
+        let age = now_ts().saturating_sub(runner.last_seen);
+        let connected = age <= RUNNER_ONLINE_WINDOW_SECS;
+        Some(RunnerView {
+            client_id: runner.client_id.clone(),
+            runner_instance_id: runner.runner_instance_id.clone(),
+            display_name: runner.display_name.clone(),
+            owner: runner.owner.clone(),
+            hostname: runner.hostname.clone(),
+            host_context: runner.host_context.clone(),
             status: if connected { "online" } else { "stale" }.to_string(),
             connected,
-            last_seen: client.last_seen,
-            capabilities: client.runner_features.wire_capabilities().clone(),
-            coding_agent_providers: (!client.coding_agent_providers.is_empty())
-                .then(|| client.coding_agent_providers.clone()),
+            last_seen: runner.last_seen,
+            capabilities: runner.runner_features.wire_capabilities().clone(),
+            coding_agent_providers: (!runner.coding_agent_providers.is_empty())
+                .then(|| runner.coding_agent_providers.clone()),
             pending_requests,
-            projects: client.projects.clone(),
-            project_inventory: Some(client.project_inventory.status.clone()),
-            agent_protocol_generation: client.accepted_protocol.generation(),
-            transport: client.transport.as_str().to_string(),
-            policy: client.policy.clone(),
-            registered_at: client.registered_at,
-            connected_at: client.connected_at,
-            disconnected_at: client.disconnected_at,
-            process_started_at: client.process_started_at,
-            build: client.build.clone(),
-            job_concurrency_limit: client.job_concurrency_limit,
+            projects: runner.projects.clone(),
+            project_inventory: Some(runner.project_inventory.status.clone()),
+            runner_protocol_generation: runner.accepted_protocol.generation(),
+            transport: runner.transport.as_str().to_string(),
+            policy: runner.policy.clone(),
+            registered_at: runner.registered_at,
+            connected_at: runner.connected_at,
+            disconnected_at: runner.disconnected_at,
+            process_started_at: runner.process_started_at,
+            build: runner.build.clone(),
+            job_concurrency_limit: runner.job_concurrency_limit,
         })
     }
 }

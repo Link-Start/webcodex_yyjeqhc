@@ -2,15 +2,13 @@ use super::jobs::{
     command_preview, is_final_job_status, is_runner_active_job_status, mark_job_lost,
     notify_job_update, observe_job_terminal, replace_log_from_snapshot, COMMAND_PREVIEW_MAX_CHARS,
 };
-use super::state::{
-    ShellClientRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility,
-};
+use super::state::{RunnerRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility};
 use super::validation::validate_id;
 use super::{job_recovery_grace_secs, RunnerRegistry};
 use crate::RunnerAccessGroup;
 use std::collections::HashSet;
-use webcodex_core::shell_protocol::{
-    ShellAgentProjectSummary, ShellCommandExecutionState, ShellJobInventory, ShellJobSnapshot,
+use webcodex_core::runner_protocol::{
+    RunnerProjectSummary, ShellCommandExecutionState, ShellJobInventory, ShellJobSnapshot,
     ShellJobStreamSnapshot, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS,
     JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
@@ -55,7 +53,7 @@ pub(super) fn validate_stream_snapshot(
 
 fn validate_context(
     client_id: &str,
-    projects: &[ShellAgentProjectSummary],
+    projects: &[RunnerProjectSummary],
     require_project_membership: bool,
     snapshot: &ShellJobSnapshot,
 ) -> Result<(), String> {
@@ -169,7 +167,7 @@ fn validate_context(
 
 fn validate_snapshot(
     client_id: &str,
-    projects: &[ShellAgentProjectSummary],
+    projects: &[RunnerProjectSummary],
     require_project_membership: bool,
     snapshot: &ShellJobSnapshot,
 ) -> Result<bool, String> {
@@ -322,7 +320,7 @@ fn validate_snapshot(
 
 fn validate_job_inventory_inner(
     client_id: &str,
-    projects: &[ShellAgentProjectSummary],
+    projects: &[RunnerProjectSummary],
     require_project_membership: bool,
     inventory: &ShellJobInventory,
 ) -> Result<(), String> {
@@ -392,7 +390,7 @@ fn validate_job_inventory_inner(
 #[cfg(test)]
 pub(super) fn validate_job_inventory(
     client_id: &str,
-    projects: &[ShellAgentProjectSummary],
+    projects: &[RunnerProjectSummary],
     inventory: &ShellJobInventory,
 ) -> Result<(), String> {
     validate_job_inventory_inner(client_id, projects, true, inventory)
@@ -436,9 +434,9 @@ fn detached_instance_transfer_allowed(job: &ShellJobRecord, snapshot: &ShellJobS
 }
 
 pub(super) fn preflight_inventory_locked(
-    inner: &ShellClientRegistryInner,
+    inner: &RunnerRegistryInner,
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     inventory: &ShellJobInventory,
 ) -> Result<(), String> {
     for snapshot in &inventory.jobs {
@@ -457,13 +455,13 @@ pub(super) fn preflight_inventory_locked(
         };
         if existing.client_id != client_id {
             return Err(format!(
-                "job inventory job_id {} belongs to a different client",
+                "job inventory job_id {} belongs to a different runner",
                 snapshot.job_id
             ));
         }
-        let detached_instance_transfer = existing.agent_instance_id != agent_instance_id
+        let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
             && detached_instance_transfer_allowed(existing, snapshot);
-        if existing.agent_instance_id != agent_instance_id && !detached_instance_transfer {
+        if existing.runner_instance_id != runner_instance_id && !detached_instance_transfer {
             return Err(format!(
                 "job inventory job_id {} belongs to a replaced runner instance",
                 snapshot.job_id
@@ -517,7 +515,7 @@ pub(super) fn preflight_inventory_locked(
 }
 
 fn remove_job_request_mapping(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
     request_id: Option<&str>,
 ) {
@@ -527,13 +525,13 @@ fn remove_job_request_mapping(
     inner.pending_by_id.remove(request_id);
     inner.persistent_waiters.remove(request_id);
     inner.request_to_job.remove(request_id);
-    if let Some(queue) = inner.queues_by_client.get_mut(client_id) {
+    if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
         queue.retain(|queued| queued != request_id);
     }
 }
 
 fn remove_job_control_requests(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
     job_ids: &HashSet<String>,
 ) {
@@ -556,7 +554,7 @@ fn remove_job_control_requests(
 
 fn record_from_snapshot(
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
     snapshot: &ShellJobSnapshot,
@@ -568,7 +566,7 @@ fn record_from_snapshot(
         request_id: Some(snapshot.request_id.clone()),
         client_id: client_id.to_string(),
         auth_group,
-        agent_instance_id: agent_instance_id.to_string(),
+        runner_instance_id: runner_instance_id.to_string(),
         kind: context
             .structured_execution
             .as_ref()
@@ -646,7 +644,7 @@ fn apply_snapshot(
     notify_job_update(job);
 }
 
-fn remove_cleanup_terminal_jobs_locked(inner: &mut ShellClientRegistryInner) {
+fn remove_cleanup_terminal_jobs_locked(inner: &mut RunnerRegistryInner) {
     let removable = inner
         .jobs_by_id
         .iter()
@@ -661,18 +659,18 @@ fn remove_cleanup_terminal_jobs_locked(inner: &mut ShellClientRegistryInner) {
 }
 
 fn prune_projected_structured_terminal_suppressions_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     now: i64,
 ) {
-    for client in inner.clients.values_mut() {
-        client.prune_projected_structured_terminal_suppressions(now);
+    for runner in inner.runners.values_mut() {
+        runner.prune_projected_structured_terminal_suppressions(now);
     }
 }
 
 impl RunnerRegistry {
     fn prune_expired_terminal_jobs_locked(
         &self,
-        inner: &mut ShellClientRegistryInner,
+        inner: &mut RunnerRegistryInner,
         now: i64,
     ) -> usize {
         enum TerminalSweepAction {
@@ -727,14 +725,14 @@ impl RunnerRegistry {
             .iter()
             .map(|(job_id, _, _)| job_id.clone())
             .collect::<HashSet<_>>();
-        let distinct_clients = expired
+        let distinct_runners = expired
             .iter()
             .map(|(_, client_id, _)| client_id.clone())
             .collect::<HashSet<_>>();
         for (_, client_id, request_id) in &expired {
             remove_job_request_mapping(inner, client_id, request_id.as_deref());
         }
-        for client_id in distinct_clients {
+        for client_id in distinct_runners {
             remove_job_control_requests(inner, &client_id, &expired_job_ids);
         }
         inner
@@ -762,15 +760,15 @@ pub(super) const RECOVERY_SWEEP_PASS_CAP: usize = 64;
 /// Transition `recovering` jobs whose recovery deadline has elapsed to
 /// terminal `lost` with `runner_recovery_deadline_exceeded`, and clean up
 /// their pending request / request-to-job mappings. Shared by the
-/// inventory-reconciliation path (scoped to one client) and the periodic
-/// recovery-timeout sweep (all clients). Returns the number of jobs lost.
+/// inventory-reconciliation path (scoped to one runner) and the periodic
+/// recovery-timeout sweep (all runners). Returns the number of jobs lost.
 ///
 /// Callers must already hold `inner`. Performs only in-memory work; no disk,
 /// network, or await. `mark_job_lost` is idempotent (terminal guard) and sets
 /// `ended_at` only once, so a race between this and the on-demand
 /// `refresh_job_status_locked` path is harmless — the second call is a no-op.
 pub(super) fn expire_recovering_jobs_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_filter: Option<&str>,
     now: i64,
     pass_cap: usize,
@@ -808,7 +806,7 @@ pub(super) fn expire_recovering_jobs_locked(
         .iter()
         .map(|(job_id, _, _)| job_id.clone())
         .collect::<HashSet<_>>();
-    let distinct_clients = expired
+    let distinct_runners = expired
         .iter()
         .map(|(_, client_id, _)| client_id.clone())
         .collect::<HashSet<_>>();
@@ -832,7 +830,7 @@ pub(super) fn expire_recovering_jobs_locked(
         remove_job_request_mapping(inner, client_id, request_id.as_deref());
         let _ = job_id;
     }
-    for client_id in distinct_clients {
+    for client_id in distinct_runners {
         remove_job_control_requests(inner, &client_id, &expired_job_ids);
     }
     remove_cleanup_terminal_jobs_locked(inner);
@@ -840,7 +838,7 @@ pub(super) fn expire_recovering_jobs_locked(
 }
 
 /// Periodic recovery-deadline sweep. NOT request-triggered: scans every
-/// `recovering` job across all clients and transitions any whose grace window
+/// `recovering` job across all runners and transitions any whose grace window
 /// has elapsed to `lost`. This closes the gap where a reconciliation-capable
 /// runner disconnects permanently and nobody queries the job, which would
 /// otherwise leave it in `recovering` forever. Pure in-memory: holds the
@@ -850,7 +848,7 @@ pub async fn recovery_timeout_sweep(registry: &RunnerRegistry) {
     registry.process_hidden_cleanup_intents().await;
     let now = crate::registry::now_ts();
     let mut inner = registry.inner.lock().await;
-    registry.prune_expired_shared_key_clients_locked(&mut inner, now);
+    registry.prune_expired_shared_key_runners_locked(&mut inner, now);
     prune_projected_structured_terminal_suppressions_locked(&mut inner, now);
     expire_recovering_jobs_locked(&mut inner, None, now, RECOVERY_SWEEP_PASS_CAP);
     registry.prune_expired_terminal_jobs_locked(&mut inner, now);
@@ -867,9 +865,9 @@ pub(super) struct ReconciliationSummary {
 }
 
 pub(super) fn reconcile_inventory_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
     inventory: &ShellJobInventory,
@@ -901,7 +899,7 @@ pub(super) fn reconcile_inventory_locked(
         .iter()
         .filter(|(job_id, job)| {
             job.client_id == client_id
-                && job.agent_instance_id == agent_instance_id
+                && job.runner_instance_id == runner_instance_id
                 && is_runner_active_job_status(&job.status)
                 && !inventory_ids.contains(job_id.as_str())
         })
@@ -927,10 +925,10 @@ pub(super) fn reconcile_inventory_locked(
 
     for snapshot in &inventory.jobs {
         let suppress_unknown_terminal = is_final_job_status(&snapshot.status)
-            && inner.clients.get(client_id).is_some_and(|client| {
-                client.suppresses_projected_structured_terminal(
+            && inner.runners.get(client_id).is_some_and(|runner| {
+                runner.suppresses_projected_structured_terminal(
                     client_id,
-                    agent_instance_id,
+                    runner_instance_id,
                     &snapshot.job_id,
                     &snapshot.request_id,
                     now,
@@ -943,7 +941,7 @@ pub(super) fn reconcile_inventory_locked(
                 // changes terminal class.
                 continue;
             }
-            let detached_instance_transfer = existing.agent_instance_id != agent_instance_id
+            let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
                 && detached_instance_transfer_allowed(existing, snapshot);
             if snapshot.update_seq < existing.last_update_seq {
                 continue;
@@ -955,7 +953,7 @@ pub(super) fn reconcile_inventory_locked(
                 continue;
             }
             if detached_instance_transfer {
-                existing.agent_instance_id = agent_instance_id.to_string();
+                existing.runner_instance_id = runner_instance_id.to_string();
             }
             let recovery_reason_code = if detached_instance_transfer {
                 "detached_instance_transfer"
@@ -970,7 +968,7 @@ pub(super) fn reconcile_inventory_locked(
         } else {
             let mut record = record_from_snapshot(
                 client_id,
-                agent_instance_id,
+                runner_instance_id,
                 auth_group.clone(),
                 observation_epoch.clone(),
                 snapshot,
@@ -991,9 +989,9 @@ pub(super) fn reconcile_inventory_locked(
 }
 
 pub(super) fn terminate_instance_jobs_locked(
-    inner: &mut ShellClientRegistryInner,
+    inner: &mut RunnerRegistryInner,
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     replacement_inventory: Option<&ShellJobInventory>,
     now: i64,
 ) {
@@ -1008,7 +1006,7 @@ pub(super) fn terminate_instance_jobs_locked(
                 })
             });
             job.client_id == client_id
-                && job.agent_instance_id == agent_instance_id
+                && job.runner_instance_id == runner_instance_id
                 && (job.status == "queued" || is_runner_active_job_status(&job.status))
                 && !detached_instance_transfer
         })

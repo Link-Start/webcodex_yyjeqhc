@@ -12,7 +12,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             async_shell_jobs: true,
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
@@ -54,7 +54,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     });
     let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
     runtime
-        .shell_clients
+        .runner_registry
         .update_job(cargo_test_update(
             client_id,
             &request.request_id,
@@ -119,7 +119,7 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             async_shell_jobs: true,
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
@@ -172,7 +172,7 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
     assert_eq!(handoff.output["job_id"], job_id);
 
     runtime
-        .shell_clients
+        .runner_registry
         .update_job(cargo_test_update(
             client_id,
             &request.request_id,

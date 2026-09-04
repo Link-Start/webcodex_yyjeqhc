@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-fn wire_capabilities_with_only(feature: Option<RunnerFeature>) -> ShellClientCapabilities {
+fn wire_capabilities_with_only(feature: Option<RunnerFeature>) -> RunnerCapabilities {
     let mut value = serde_json::Map::new();
     // `shell` is the one historical true-by-default field. Pin it false so an
     // omitted field really means false in this all-false/individual-true fixture.
@@ -16,10 +16,10 @@ fn wire_capabilities_with_only(feature: Option<RunnerFeature>) -> ShellClientCap
 }
 
 fn with_wire_feature(
-    capabilities: &ShellClientCapabilities,
+    capabilities: &RunnerCapabilities,
     feature: RunnerFeature,
     enabled: bool,
-) -> ShellClientCapabilities {
+) -> RunnerCapabilities {
     let mut value = serde_json::to_value(capabilities).unwrap();
     value
         .as_object_mut()
@@ -30,7 +30,7 @@ fn with_wire_feature(
 
 #[test]
 fn canonical_runner_feature_inventory_matches_wire_names_exactly() {
-    let wire_names = SHELL_CLIENT_CAPABILITY_NAMES
+    let wire_names = RUNNER_CAPABILITY_NAMES
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
@@ -39,7 +39,7 @@ fn canonical_runner_feature_inventory_matches_wire_names_exactly() {
         .map(|feature| feature.as_wire_name())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(wire_names.len(), SHELL_CLIENT_CAPABILITY_NAMES.len());
+    assert_eq!(wire_names.len(), RUNNER_CAPABILITY_NAMES.len());
     assert_eq!(canonical_names.len(), RunnerFeature::all().len());
     assert_eq!(canonical_names, wire_names);
 }
@@ -124,7 +124,7 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
 
 #[tokio::test]
 async fn patch_contract_capabilities_require_their_prerequisites() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let mut registration = runner_registration("metadata-without-base", "inst-a", Vec::new());
     registration.capabilities = with_wire_feature(
         &v2_baseline_capabilities(),
@@ -153,7 +153,7 @@ async fn patch_contract_capabilities_require_their_prerequisites() {
 
 #[test]
 fn v2_baseline_exactly_matches_generation_eligible_classification() {
-    let baseline = AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+    let baseline = RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
@@ -167,7 +167,7 @@ fn v2_baseline_exactly_matches_generation_eligible_classification() {
     assert_eq!(baseline.len(), 22);
     assert_eq!(
         baseline.len(),
-        AGENT_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len()
+        RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len()
     );
     assert_eq!(baseline, generation_eligible);
     for feature in RunnerFeature::all() {
@@ -248,7 +248,7 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
 
 #[test]
 fn missing_additive_wire_fields_remain_false_in_canonical_semantics() {
-    let wire: ShellClientCapabilities = serde_json::from_str(r#"{}"#).unwrap();
+    let wire: RunnerCapabilities = serde_json::from_str(r#"{}"#).unwrap();
     let semantics = RunnerFeatureSet::from_wire_for_test(&wire);
 
     assert!(semantics.supports(RunnerFeature::Shell));
@@ -262,7 +262,7 @@ fn missing_additive_wire_fields_remain_false_in_canonical_semantics() {
 
 #[tokio::test]
 async fn current_protocol_generation_never_infers_registration_required_host_features() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let mut registration = runner_registration("no-inference", "inst-a", Vec::new());
     let capabilities = v2_baseline_capabilities();
     registration.capabilities = capabilities;
@@ -277,7 +277,7 @@ async fn current_protocol_generation_never_infers_registration_required_host_fea
     ] {
         assert!(
             !registry
-                .client_supports("no-inference", feature.as_wire_name())
+                .runner_supports("no-inference", feature.as_wire_name())
                 .await
                 .unwrap(),
             "{} must require explicit Runner advertisement",
@@ -285,14 +285,14 @@ async fn current_protocol_generation_never_infers_registration_required_host_fea
         );
     }
     assert!(!registry
-        .client_supports("no-inference", "future_runner_feature")
+        .runner_supports("no-inference", "future_runner_feature")
         .await
         .unwrap());
 }
 
 #[tokio::test]
 async fn shell_client_view_preserves_capability_wire_projection() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let mut advertised = v2_baseline_capabilities();
     advertised.computer_control = true;
 
@@ -312,7 +312,7 @@ async fn shell_client_view_preserves_capability_wire_projection() {
 
 #[tokio::test]
 async fn top_level_generation_stays_separate_from_public_capability_projection() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let mut capabilities = v2_baseline_capabilities();
     capabilities.computer_control = true;
 
@@ -320,7 +320,10 @@ async fn top_level_generation_stays_separate_from_public_capability_projection()
     registration.capabilities = capabilities;
     let view = registry.register(registration).await.unwrap();
 
-    assert_eq!(view.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+    assert_eq!(
+        view.runner_protocol_generation,
+        RUNNER_PROTOCOL_GENERATION_V2
+    );
     assert!(view.capabilities.computer_control);
     let serialized = serde_json::to_value(&view.capabilities).unwrap();
     assert!(serialized.get("agent_protocol_generation").is_none());
@@ -329,7 +332,7 @@ async fn top_level_generation_stays_separate_from_public_capability_projection()
 
 #[tokio::test]
 async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_replacement() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
 
     let mut first_capabilities = v2_baseline_capabilities();
     first_capabilities.computer_observe = true;
@@ -338,10 +341,10 @@ async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_repla
     registry.register(first).await.unwrap();
 
     let first_snapshot = registry
-        .get_client_semantic_view("semantic-snapshot")
+        .get_runner_semantic_view("semantic-snapshot")
         .await
         .unwrap();
-    assert_eq!(first_snapshot.view.agent_instance_id, "inst-a");
+    assert_eq!(first_snapshot.view.runner_instance_id, "inst-a");
     assert!(first_snapshot.view.connected);
     assert!(first_snapshot.supports(RunnerFeature::FileRead));
     assert!(first_snapshot.supports(RunnerFeature::StructuredProcessArgv));
@@ -353,7 +356,7 @@ async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_repla
     registry
         .set_last_seen_for_test(
             "semantic-snapshot",
-            now_ts() - CLIENT_ONLINE_WINDOW_SECS - 1,
+            now_ts() - RUNNER_ONLINE_WINDOW_SECS - 1,
         )
         .await;
     let mut replacement_capabilities = v2_baseline_capabilities();
@@ -363,10 +366,10 @@ async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_repla
     registry.register(replacement).await.unwrap();
 
     let replacement_snapshot = registry
-        .get_client_semantic_view("semantic-snapshot")
+        .get_runner_semantic_view("semantic-snapshot")
         .await
         .unwrap();
-    assert_eq!(replacement_snapshot.view.agent_instance_id, "inst-b");
+    assert_eq!(replacement_snapshot.view.runner_instance_id, "inst-b");
     assert!(replacement_snapshot.view.connected);
     assert!(replacement_snapshot.supports(RunnerFeature::FileRead));
     assert!(replacement_snapshot.supports(RunnerFeature::FileWrite));
@@ -376,7 +379,7 @@ async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_repla
 
     // The prior immutable observation remains internally coherent rather than
     // being paired with feature truth from the replacement process.
-    assert_eq!(first_snapshot.view.agent_instance_id, "inst-a");
+    assert_eq!(first_snapshot.view.runner_instance_id, "inst-a");
     assert!(first_snapshot.supports(RunnerFeature::FileRead));
     assert!(first_snapshot.supports(RunnerFeature::FileWrite));
     assert!(first_snapshot.supports(RunnerFeature::ComputerObserve));
@@ -385,7 +388,7 @@ async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_repla
 
 #[tokio::test]
 async fn generation_baseline_project_features_cannot_downgrade_on_reregistration() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
         .register(runner_registration(
             "project-feature-fence",
@@ -396,7 +399,7 @@ async fn generation_baseline_project_features_cannot_downgrade_on_reregistration
         .unwrap();
 
     let original = registry
-        .get_client_semantic_view("project-feature-fence")
+        .get_runner_semantic_view("project-feature-fence")
         .await
         .unwrap();
     assert!(original.supports(RunnerFeature::ProjectPathRegistration));
@@ -413,7 +416,7 @@ async fn generation_baseline_project_features_cannot_downgrade_on_reregistration
     );
 
     let preserved = registry
-        .get_client_semantic_view("project-feature-fence")
+        .get_runner_semantic_view("project-feature-fence")
         .await
         .unwrap();
     assert!(preserved.supports(RunnerFeature::ProjectPathRegistration));
@@ -422,7 +425,7 @@ async fn generation_baseline_project_features_cannot_downgrade_on_reregistration
 
 #[tokio::test]
 async fn coding_agent_registration_consistency_uses_canonical_feature_semantics() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
 
     let mut metadata_without_feature = runner_registration("coding-metadata", "inst-a", Vec::new());
     metadata_without_feature.capabilities = v2_baseline_capabilities();
@@ -460,7 +463,7 @@ async fn coding_agent_registration_consistency_uses_canonical_feature_semantics(
 }
 
 async fn register_sticky_feature_state(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
     instance_id: &str,
     feature: RunnerFeature,
@@ -471,7 +474,7 @@ async fn register_sticky_feature_state(
     registration.capabilities = capabilities;
 
     if feature == RunnerFeature::JobStateReconciliation && enabled {
-        registration.job_inventory = Some(crate::shell_protocol::ShellJobInventory {
+        registration.job_inventory = Some(crate::runner_protocol::ShellJobInventory {
             active_complete: true,
             jobs: Vec::new(),
         });
@@ -499,7 +502,7 @@ async fn generation_baseline_features_reject_reregistration_downgrade() {
         RunnerFeature::ArtifactExportChunkRead,
         RunnerFeature::ArtifactExportStreamingMetadata,
     ] {
-        let registry = ShellClientRegistry::default();
+        let registry = RunnerRegistry::default();
         let client_id = format!("baseline-{}", feature.as_wire_name());
         registry
             .register(runner_registration(&client_id, "inst-a", Vec::new()))
@@ -516,7 +519,7 @@ async fn generation_baseline_features_reject_reregistration_downgrade() {
             )
         );
         assert!(registry
-            .client_supports(&client_id, feature.as_wire_name())
+            .runner_supports(&client_id, feature.as_wire_name())
             .await
             .unwrap());
     }
@@ -528,7 +531,7 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
     ] {
-        let registry = ShellClientRegistry::default();
+        let registry = RunnerRegistry::default();
         let client_id = format!("sticky-{}", feature.as_wire_name());
         register_sticky_feature_state(&registry, &client_id, "inst-a", feature, true)
             .await
@@ -542,7 +545,7 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
             feature.as_wire_name()
         );
         assert!(registry
-            .client_supports(&client_id, feature.as_wire_name())
+            .runner_supports(&client_id, feature.as_wire_name())
             .await
             .unwrap());
     }
@@ -552,7 +555,7 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
 async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions() {
     let feature = RunnerFeature::JobStateReconciliation;
 
-    let false_false = ShellClientRegistry::default();
+    let false_false = RunnerRegistry::default();
     register_sticky_feature_state(&false_false, "ff", "inst-a", feature, false)
         .await
         .unwrap();
@@ -560,7 +563,7 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
         .await
         .unwrap();
 
-    let false_true = ShellClientRegistry::default();
+    let false_true = RunnerRegistry::default();
     register_sticky_feature_state(&false_true, "ft", "inst-a", feature, false)
         .await
         .unwrap();
@@ -568,7 +571,7 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
         .await
         .unwrap();
 
-    let true_true = ShellClientRegistry::default();
+    let true_true = RunnerRegistry::default();
     register_sticky_feature_state(&true_true, "tt", "inst-a", feature, true)
         .await
         .unwrap();
@@ -576,7 +579,7 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
         .await
         .unwrap();
 
-    let true_false = ShellClientRegistry::default();
+    let true_false = RunnerRegistry::default();
     register_sticky_feature_state(&true_false, "tf", "inst-a", feature, true)
         .await
         .unwrap();
@@ -585,17 +588,17 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
         .unwrap_err();
     assert!(error.contains("cannot downgrade job_state_reconciliation"));
 
-    let replacement = ShellClientRegistry::default();
+    let replacement = RunnerRegistry::default();
     register_sticky_feature_state(&replacement, "replacement", "inst-a", feature, true)
         .await
         .unwrap();
     replacement
-        .set_last_seen_for_test("replacement", now_ts() - CLIENT_ONLINE_WINDOW_SECS - 1)
+        .set_last_seen_for_test("replacement", now_ts() - RUNNER_ONLINE_WINDOW_SECS - 1)
         .await;
     register_sticky_feature_state(&replacement, "replacement", "inst-b", feature, false)
         .await
         .unwrap();
-    let view = replacement.get_client_view("replacement").await.unwrap();
-    assert_eq!(view.agent_instance_id, "inst-b");
+    let view = replacement.get_runner_view("replacement").await.unwrap();
+    assert_eq!(view.runner_instance_id, "inst-b");
     assert!(!view.capabilities.job_state_reconciliation);
 }

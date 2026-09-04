@@ -2,9 +2,9 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellCommandExecutionState, ShellScriptLanguage, SCRIPT_MAX_BYTES,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerResultPayload, RunnerResultRequest,
+    ShellCommandExecutionState, ShellScriptLanguage, SCRIPT_MAX_BYTES,
 };
 use crate::tool_runtime::activity::{ActivityRecord, ActivityRecorder};
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
@@ -57,7 +57,7 @@ async fn register_script_agent(
     root: &std::path::Path,
     structured_script_payload: bool,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         structured_validation_argv: true,
         structured_process_argv: true,
@@ -72,7 +72,7 @@ async fn register_script_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn register_script_job_agent(
@@ -80,7 +80,7 @@ async fn register_script_job_agent(
     client_id: &str,
     root: &std::path::Path,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
@@ -98,13 +98,13 @@ async fn register_script_job_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn update_script_job(
     runtime: &ToolRuntime,
     client_id: &str,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     status: &str,
     state: Option<ShellCommandExecutionState>,
     exit_code: Option<i32>,
@@ -113,10 +113,10 @@ async fn update_script_job(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
             update_seq: None,
@@ -148,11 +148,11 @@ async fn complete_script_lifecycle(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id,
                 exit_code,
                 stdout: Some(stdout.to_string()),
@@ -346,11 +346,11 @@ async fn run_script_fast_success_projects_back_and_removes_the_hidden_job() {
         });
 
     assert!(runtime
-        .shell_clients
+        .runner_registry
         .hidden_job_ids_for_test()
         .await
         .is_empty());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -417,7 +417,7 @@ async fn run_script_explicit_sync_wait_captures_terminal_after_old_ten_second_th
     assert!(result.output.get("command_completed").is_none());
     assert!(result.output.get("job_id").is_none());
     assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(
         probe_patch_agent_request(&runtime, "script-extended-sync-wait")
             .await
@@ -446,7 +446,7 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
     });
     let request = wait_for_patch_agent_request(&runtime, "script-prestart-job").await;
     let queued = runtime
-        .shell_clients
+        .runner_registry
         .get_hidden_job_for_auth(
             Some(&crate::test_support::runner_access(&auth)),
             request.job_id.as_deref().unwrap(),
@@ -479,7 +479,7 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["failure_kind"], "interpreter_unavailable");
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -558,7 +558,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     let job_id = handoff.output["job_id"].as_str().unwrap();
     assert_eq!(request.job_id.as_deref(), Some(job_id));
 
-    let job = runtime.shell_clients.get_job(job_id).await.unwrap();
+    let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.kind, "run_script");
     assert_eq!(job.session_id.as_deref(), Some(session.session_id.as_str()));
     let metadata = job
@@ -663,7 +663,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
         None,
     )
     .await;
-    let terminal = runtime.shell_clients.get_job(job_id).await.unwrap();
+    let terminal = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(terminal.status, "completed");
     assert_eq!(
         terminal.command_execution_state,
@@ -760,7 +760,7 @@ async fn run_script_nonzero_timeout_uncertainty_and_interpreter_absence_are_trut
     });
     wait_for_patch_agent_request(&runtime, "script-lifecycle").await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("script-lifecycle", "inst")
         .await;
     let uncertain = uncertain_task.await.unwrap();

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capability() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let alice = auth_context(Some("alice"), false);
     let bob = auth_context(Some("bob"), false);
     let text = "隐私输入🙂";
@@ -13,7 +13,7 @@ async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capabi
     })
     .to_string();
 
-    register_computer_test_client(
+    register_computer_test_runner(
         &registry,
         "computer-input",
         "alice",
@@ -36,7 +36,7 @@ async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capabi
         .unwrap_err();
     assert!(error.contains("does not support computer_text_input"));
 
-    register_computer_test_client(&registry, "computer-input", "alice", true, true, true, true)
+    register_computer_test_runner(&registry, "computer-input", "alice", true, true, true, true)
         .await;
     let error = registry
         .enqueue_computer(
@@ -64,9 +64,9 @@ async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capabi
         .await
         .unwrap();
     let request = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "computer-input".to_string(),
-            agent_instance_id: "computer-inst".to_string(),
+            runner_instance_id: "computer-inst".to_string(),
         })
         .await
         .unwrap()
@@ -81,9 +81,9 @@ async fn computer_text_input_enqueue_requires_exact_owner_and_independent_capabi
 
 #[tokio::test]
 async fn computer_text_input_enqueue_preserves_max_utf8_text_after_json_escaping() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let alice = auth_context(Some("alice"), false);
-    register_computer_test_client(
+    register_computer_test_runner(
         &registry,
         "computer-input-escaped",
         "alice",
@@ -101,8 +101,8 @@ async fn computer_text_input_enqueue_preserves_max_utf8_text_after_json_escaping
         "text": text,
     })
     .to_string();
-    assert!(payload.len() > crate::shell_protocol::SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES);
-    assert!(payload.len() <= crate::shell_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES);
+    assert!(payload.len() > crate::runner_protocol::SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES);
+    assert!(payload.len() <= crate::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES);
 
     let (_request_id, _rx) = registry
         .enqueue_computer(
@@ -116,9 +116,9 @@ async fn computer_text_input_enqueue_preserves_max_utf8_text_after_json_escaping
         .await
         .unwrap();
     let request = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "computer-input-escaped".to_string(),
-            agent_instance_id: "computer-inst".to_string(),
+            runner_instance_id: "computer-inst".to_string(),
         })
         .await
         .unwrap()
@@ -128,7 +128,7 @@ async fn computer_text_input_enqueue_preserves_max_utf8_text_after_json_escaping
     assert_eq!(decoded["text"].as_str(), Some(text.as_str()));
 
     let oversized =
-        "x".repeat(crate::shell_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES + 1);
+        "x".repeat(crate::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES + 1);
     let error = registry
         .enqueue_computer(
             "computer-input-escaped".to_string(),

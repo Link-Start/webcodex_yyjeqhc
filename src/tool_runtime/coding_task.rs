@@ -41,9 +41,8 @@ use super::unknown_session_result;
 use super::validation_events::skipped_validation_summary;
 use super::{ToolCall, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_protocol::{
-    ShellFileOpRequest, SHELL_CLIENT_CAPABILITY_FILE_READ, SHELL_CLIENT_CAPABILITY_GIT,
-    SHELL_CLIENT_CAPABILITY_SHELL,
+use crate::runner_protocol::{
+    ShellFileOpRequest, RUNNER_CAPABILITY_FILE_READ, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_SHELL,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -255,17 +254,17 @@ impl ToolRuntime {
         client_id: &str,
         auth: Option<&AuthContext>,
     ) -> Result<(), ToolResult> {
-        let access = crate::shell_client::runner_access_from_auth(auth);
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let supports_shell = self
-            .shell_clients
-            .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_SHELL, access.as_ref())
+            .runner_registry
+            .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_SHELL, access.as_ref())
             .await
             .map_err(ToolResult::err)?;
         let supports_git = if supports_shell {
             false
         } else {
-            self.shell_clients
-                .client_supports_for_auth(client_id, SHELL_CLIENT_CAPABILITY_GIT, access.as_ref())
+            self.runner_registry
+                .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_GIT, access.as_ref())
                 .await
                 .map_err(ToolResult::err)?
         };
@@ -896,7 +895,7 @@ impl ToolRuntime {
         // Continuation feedback for reused/resumed/restored sessions. Pure
         // read-only projection over existing session ledger, validation evidence,
         // bounded job metadata, and the message board. Never executes shell,
-        // reads project files, enqueues Agent requests, mutates the ledger,
+        // reads project files, enqueues Runner requests, mutates the ledger,
         // refreshes activity, or consumes guidance. `created` (fresh empty
         // session) surfaces a compact `not_applicable` verdict.
         let continuation_kind = if resume_requested {
@@ -1481,7 +1480,7 @@ impl ToolRuntime {
     /// (`validation_summary_from_events`, no job-status enrichment), jobs come
     /// from the bounded `active_jobs_summary` metadata, and guidance is read
     /// from the message board without marking anything read or resolved. No
-    /// shell, no file reads, no Agent requests, no ledger mutation.
+    /// shell, no file reads, no Runner requests, no ledger mutation.
     async fn startup_continuation_feedback(
         &self,
         summary: &sessions::SessionSummary,
@@ -1655,15 +1654,11 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> Value {
         let client_id = resolved.config.client_id.as_str();
-        let access = crate::shell_client::runner_access_from_auth(auth);
+        let access = crate::runner_http::runner_access_from_auth(auth);
         // The owning runner must support the structured file capability.
         if !self
-            .shell_clients
-            .client_supports_for_auth(
-                client_id,
-                SHELL_CLIENT_CAPABILITY_FILE_READ,
-                access.as_ref(),
-            )
+            .runner_registry
+            .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_FILE_READ, access.as_ref())
             .await
             .unwrap_or(false)
         {
@@ -1673,7 +1668,7 @@ impl ToolRuntime {
         // `project_overview` tool's 30s wait.
         let probe_wait_timeout = self.repository_overview_probe_timeout.as_secs().max(1);
         let (request_id, receiver) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_file_op(
                 ShellFileOpRequest {
                     op: "project_overview".to_string(),
@@ -1740,11 +1735,11 @@ impl ToolRuntime {
             }
             Ok(Ok(_)) => repository_overview_unavailable(),
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 repository_overview_unavailable()
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 repository_overview_unavailable()
             }
         }

@@ -2,8 +2,8 @@ use super::*;
 
 #[tokio::test]
 async fn registry_allows_quic_run_queueing() {
-    let registry = ShellClientRegistry::default();
-    register_quic_v1_client(&registry, "quic-run").await;
+    let registry = RunnerRegistry::default();
+    register_quic_v1_runner(&registry, "quic-run").await;
 
     let (_request_id, _rx) = registry
         .enqueue_run(
@@ -19,9 +19,12 @@ async fn registry_allows_quic_run_queueing() {
         )
         .await
         .unwrap();
-    let view = registry.get_client_view("quic-run").await.unwrap();
+    let view = registry.get_runner_view("quic-run").await.unwrap();
     assert_eq!(view.transport, TRANSPORT_QUIC);
-    assert_eq!(view.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2);
+    assert_eq!(
+        view.runner_protocol_generation,
+        RUNNER_PROTOCOL_GENERATION_V2
+    );
     assert_eq!(view.pending_requests, 1);
     assert!(view.capabilities.shell);
     assert!(view.capabilities.async_shell_jobs);
@@ -29,8 +32,8 @@ async fn registry_allows_quic_run_queueing() {
 
 #[tokio::test]
 async fn enqueue_file_op_allows_read_with_line_range() {
-    let registry = ShellClientRegistry::default();
-    register_quic_v1_client(&registry, "oe").await;
+    let registry = RunnerRegistry::default();
+    register_quic_v1_runner(&registry, "oe").await;
 
     let mut req = file_request("read");
     req.start_line = Some(7);
@@ -41,9 +44,9 @@ async fn enqueue_file_op_allows_read_with_line_range() {
         .unwrap();
 
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -57,7 +60,7 @@ async fn enqueue_file_op_allows_read_with_line_range() {
 
 #[tokio::test]
 async fn generic_file_enqueue_rejects_internal_skill_runtime_ops() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
 
     let mut list = file_request("skill_list_packages");
     list.path = ".agents/skills".to_string();
@@ -86,8 +89,8 @@ async fn generic_file_enqueue_rejects_internal_skill_runtime_ops() {
 
 #[tokio::test]
 async fn registry_allows_quic_v1_file_and_project_ops_queueing() {
-    let registry = ShellClientRegistry::default();
-    register_quic_v1_client(&registry, "quic-ops").await;
+    let registry = RunnerRegistry::default();
+    register_quic_v1_runner(&registry, "quic-ops").await;
 
     let (_file_request_id, _file_rx) = registry
         .enqueue_file_op(
@@ -123,14 +126,14 @@ async fn registry_allows_quic_v1_file_and_project_ops_queueing() {
         .await
         .unwrap();
 
-    let view = registry.get_client_view("quic-ops").await.unwrap();
+    let view = registry.get_runner_view("quic-ops").await.unwrap();
     assert_eq!(view.pending_requests, 2);
 }
 
 #[tokio::test]
 async fn registry_allows_quic_v1_start_job_queueing() {
-    let registry = ShellClientRegistry::default();
-    register_quic_v1_client(&registry, "quic-job").await;
+    let registry = RunnerRegistry::default();
+    register_quic_v1_runner(&registry, "quic-job").await;
 
     let job = registry
         .start_job(
@@ -152,7 +155,7 @@ async fn registry_allows_quic_v1_start_job_queueing() {
         .await
         .unwrap();
 
-    let view = registry.get_client_view("quic-job").await.unwrap();
+    let view = registry.get_runner_view("quic-job").await.unwrap();
     assert_eq!(view.pending_requests, 1);
     assert_eq!(job.status, "queued");
     assert_eq!(registry.list_jobs(Some(10)).await.len(), 1);
@@ -160,9 +163,9 @@ async fn registry_allows_quic_v1_start_job_queueing() {
 
 #[tokio::test]
 async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -170,8 +173,8 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "quic-stop".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
@@ -201,15 +204,15 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
         .await
         .unwrap();
     let _ = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "quic-stop".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
         .unwrap();
     registry
-        .set_transport("quic-stop", AgentTransport::Quic)
+        .set_transport("quic-stop", RunnerTransport::Quic)
         .await
         .unwrap();
 
@@ -217,7 +220,7 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
         .stop_job(&job.job_id, "tester".to_string())
         .await
         .unwrap();
-    let view = registry.get_client_view("quic-stop").await.unwrap();
+    let view = registry.get_runner_view("quic-stop").await.unwrap();
     assert_eq!(view.pending_requests, 1);
     assert_eq!(stopped.status, "stop_requested");
 }

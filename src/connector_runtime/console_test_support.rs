@@ -1,7 +1,7 @@
 use super::{ConnectorContext, ConnectorRuntime};
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{
-    ShellClientCapabilities, ShellClientRegisterRequest, AGENT_PROTOCOL_GENERATION_V2,
+use crate::runner_http::RunnerRegistry;
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerRegisterRequest, RUNNER_PROTOCOL_GENERATION_V2,
 };
 use crate::Database;
 use std::sync::Arc;
@@ -18,11 +18,11 @@ pub(crate) async fn console_fixture() -> ConsoleFixture {
     let project = temp.path().join("project");
     let state = temp.path().join("state");
     super::tests::init_repo(&project);
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     register_client(&registry, "hosted", "instance-a", &super::tests::auth("u1")).await;
     register_client(&registry, "laptop", "instance-b", &super::tests::auth("u2")).await;
     let tools =
-        Arc::new(crate::tool_runtime::ToolRuntime::new_for_tests_with_shell_clients(registry));
+        Arc::new(crate::tool_runtime::ToolRuntime::new_for_tests_with_runner_registry(registry));
     let runtime = Arc::new(
         ConnectorRuntime::new(
             tools,
@@ -55,14 +55,14 @@ pub(crate) async fn console_fixture() -> ConsoleFixture {
 }
 
 async fn register_client(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
     instance_id: &str,
     auth: &crate::auth::AuthContext,
 ) {
     registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -70,14 +70,14 @@ async fn register_client(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: instance_id.to_string(),
-                agent_protocol_generation: AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: instance_id.to_string(),
+                runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: Some("owner".into()),
                 hostname: None,
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities::default(),
+                    RunnerCapabilities::default(),
                 ),
                 policy: None,
             },

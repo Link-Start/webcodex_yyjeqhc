@@ -1,4 +1,4 @@
-use crate::shell_protocol::{RAW_SHELL_COMMAND_MAX_BYTES, RAW_SHELL_WIRE_MAX_BYTES};
+use crate::runner_protocol::{RAW_SHELL_COMMAND_MAX_BYTES, RAW_SHELL_WIRE_MAX_BYTES};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -453,7 +453,7 @@ pub(crate) fn bounded_tail(text: &str, max_chars: usize) -> (String, bool) {
 pub(crate) const COMMAND_STDIO_TAIL_CHARS: usize = 12_000;
 
 /// Synchronous Runner-wait tools share this hard upper bound with
-/// `shell_client` validation (`wait_timeout_secs` must be <= 120).
+/// `runner_http` validation (`wait_timeout_secs` must be <= 120).
 pub(crate) const MIN_SYNC_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_SYNC_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;

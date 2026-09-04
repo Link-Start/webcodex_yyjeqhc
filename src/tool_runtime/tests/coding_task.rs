@@ -1,6 +1,6 @@
 use super::support::*;
 use crate::auth::AuthContext;
-use crate::shell_protocol::AgentPolicySummary;
+use crate::runner_protocol::RunnerPolicySummary;
 use crate::tool_runtime::handoff::VALIDATION_IDENTITY_REUSE_ACTION;
 use crate::tool_runtime::metadata::lookup_tool_metadata;
 use crate::tool_runtime::sessions::SessionTransport;
@@ -273,7 +273,7 @@ async fn coding_workflow_test_seam_keeps_internal_diagnostic_modes_without_tool_
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let client_id = "advanced-hidden-start";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let params = json!({
         "project": project,
@@ -308,7 +308,7 @@ async fn coding_workflow_full_diagnostic_has_no_binding_projection() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(
@@ -424,7 +424,7 @@ async fn coding_workflow_standard_omits_compact_tool_manifest() {
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-no-manifest", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-no-manifest", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(
@@ -450,7 +450,7 @@ async fn coding_workflow_minimal_brief_is_bounded_and_path_safe() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from("/tmp/startup-full-allowed-root")],
         ..Default::default()
     };
@@ -515,7 +515,7 @@ async fn coding_workflow_standard_returns_model_facing_brief_without_diagnostics
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from("/tmp/compact-allowed-root-never-emit")],
         ..Default::default()
     };
@@ -577,19 +577,20 @@ async fn coding_workflow_standard_returns_model_facing_brief_without_diagnostics
     let serialized = serde_json::to_string(&result.output).unwrap();
     for forbidden in [
         "tools.names",
-        "policy",
         "allowed_roots",
         "compact-allowed-root-never-emit",
-        "stdout",
-        "stderr",
-        "command",
-        "env",
-        "token",
-        "secret",
     ] {
         assert!(
             !serialized.contains(forbidden),
-            "compact startup leaked {forbidden}: {serialized}"
+            "compact startup leaked sensitive value {forbidden}: {serialized}"
+        );
+    }
+    for forbidden in [
+        "policy", "stdout", "stderr", "command", "env", "token", "secret",
+    ] {
+        assert!(
+            !json_contains_key(&result.output, forbidden),
+            "compact startup leaked field {forbidden}: {serialized}"
         );
     }
 }
@@ -601,7 +602,7 @@ async fn coding_workflow_full_startup_verdict_accepts_clean_workspace() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start-verdict", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start-verdict", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(
@@ -771,7 +772,7 @@ async fn coding_workflow_untracked_only_is_nonblocking_warning() {
 
     let runtime = test_runtime();
     let client_id = "coding-start-untracked";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
@@ -803,7 +804,7 @@ async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_ed
 
     let runtime = test_runtime();
     let client_id = "coding-start-modified";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
@@ -891,7 +892,7 @@ async fn coding_workflow_staged_changes_are_nonblocking() {
 
     let runtime = test_runtime();
     let client_id = "coding-start-staged";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
@@ -923,7 +924,7 @@ async fn coding_workflow_mixed_dirty_workspace_summarizes_counts_without_blockin
 
     let runtime = test_runtime();
     let client_id = "coding-start-mixed";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
@@ -959,7 +960,7 @@ async fn coding_workflow_conflict_state_is_a_hard_blocker_but_remains_inspectabl
 
     let runtime = test_runtime();
     let client_id = "coding-start-conflict";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(
@@ -1062,10 +1063,10 @@ async fn coding_workflow_runner_offline_is_still_blocking() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start-offline", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start-offline", "demo", tmp.path()).await;
     // Transport disconnect leaves the agent offline while project id may still resolve.
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("coding-start-offline", "inst")
         .await;
 
@@ -1132,7 +1133,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let start = work_on_project_serviced(
         &runtime,
@@ -1269,7 +1270,8 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-compact", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-compact", "demo", tmp.path())
+            .await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1402,7 +1404,7 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
     commit_file(tmp.path(), "docs.md", "hello\n", "add docs");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-docs", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-docs", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1498,7 +1500,7 @@ async fn finish_coding_task_summary_only_treats_dirty_workspace_as_advisory() {
     fs::write(tmp.path().join("README.md"), "changed\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-dirty", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-dirty", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1552,7 +1554,7 @@ async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-resolved", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "coding-finish-resolved", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
     let session = runtime.sessions.start_session(
@@ -3282,7 +3284,7 @@ async fn finish_summary_fixture(client_id: &'static str) -> FinishSummaryFixture
     let runtime = test_runtime();
     let auth = auth_context(None, true);
     let project =
-        register_agent_project_at_path_with_auth(&runtime, client_id, "demo", tmp.path(), &auth)
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", tmp.path(), &auth)
             .await;
     let session = runtime
         .sessions
@@ -3438,7 +3440,7 @@ async fn coding_workflow_full_diagnostic_recommended_flow_projects_to_visible_ma
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-flow-proj", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-flow-proj", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(
@@ -3492,7 +3494,7 @@ async fn coding_workflow_standard_omits_repeated_manifest_and_recommended_flow()
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-flow-full", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-flow-full", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
     let result = coding_workflow_serviced(

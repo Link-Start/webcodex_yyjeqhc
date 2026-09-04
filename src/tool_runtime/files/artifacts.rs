@@ -268,9 +268,9 @@ pub(crate) fn validate_project_artifact_export_snapshot(
 
 impl ToolRuntime {
     /// Internal-only large-file metadata transport for MCP artifact export.
-    /// The ShellClient registry atomically rechecks the generation-2 streaming
+    /// The Runner registry atomically rechecks the generation-2 streaming
     /// metadata and chunk-read baseline while admitting the request.
-    async fn run_agent_json_artifact_export_metadata_op(
+    async fn run_runner_json_artifact_export_metadata_op(
         &self,
         client_id: String,
         cwd: String,
@@ -300,21 +300,21 @@ impl ToolRuntime {
             wait_timeout_secs: wait_timeout,
         };
         let (request_id, rx) = self
-            .shell_clients
+            .runner_registry
             .enqueue_artifact_export_metadata(
                 request,
                 "mcp_artifact_export".to_string(),
-                crate::shell_client::runner_access_from_auth(auth).as_ref(),
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
             )
             .await?;
         let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("agent export_project_artifact request was dropped".to_string());
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("timed out waiting for agent export_project_artifact".to_string());
             }
         };
@@ -404,21 +404,21 @@ impl ToolRuntime {
             wait_timeout_secs: wait_timeout,
         };
         let (request_id, rx) = self
-            .shell_clients
+            .runner_registry
             .enqueue_artifact_export_chunk(
                 request,
                 "mcp_artifact_export".to_string(),
-                crate::shell_client::runner_access_from_auth(auth).as_ref(),
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
             )
             .await?;
         let response = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("agent artifact export chunk request was dropped".to_string());
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&request_id).await;
+                self.runner_registry.cancel_request(&request_id).await;
                 return Err("timed out waiting for agent artifact export chunk".to_string());
             }
         };
@@ -489,7 +489,7 @@ impl ToolRuntime {
             "max_bytes": MAX_PROJECT_ARTIFACT_BYTES,
         });
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -536,7 +536,7 @@ impl ToolRuntime {
             "allow_missing": allow_missing.unwrap_or(false),
         });
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -579,7 +579,7 @@ impl ToolRuntime {
             "allow_missing": false,
         });
         let output = match self
-            .run_agent_json_artifact_export_metadata_op(
+            .run_runner_json_artifact_export_metadata_op(
                 client_id,
                 resolved.config.path.clone(),
                 path.clone(),
@@ -698,7 +698,7 @@ impl ToolRuntime {
             payload["mcp_image"] = json!(true);
         }
         let obj = match self
-            .run_agent_json_file_op(
+            .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
                 path.clone(),
@@ -750,7 +750,7 @@ impl ToolRuntime {
         };
         let client_id = proj.client_id.clone();
         let obj = match self
-            .run_agent_json_file_op(client_id, proj.path.clone(), path, op, payload, tool_name)
+            .run_runner_json_file_op(client_id, proj.path.clone(), path, op, payload, tool_name)
             .await
         {
             Ok(v) => v,

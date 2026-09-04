@@ -1,22 +1,18 @@
 use super::*;
-use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellClientRegisterRequest, ShellCommandExecutionState,
+use crate::runner_protocol::{
+    RunnerPollRequest, RunnerRegisterRequest, ShellCommandExecutionState,
 };
 use webcodex_core::skill_store::SkillStoreRequest;
 
-fn skill_store_registration(
-    instance: &str,
-    read: bool,
-    manage: bool,
-) -> ShellClientRegisterRequest {
-    current_runner_registration(ShellClientRegisterRequest {
+fn skill_store_registration(instance: &str, read: bool, manage: bool) -> RunnerRegisterRequest {
+    current_runner_registration(RunnerRegisterRequest {
         client_id: "skill-store-runner".to_string(),
-        agent_instance_id: instance.to_string(),
-        agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+        runner_instance_id: instance.to_string(),
+        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
         display_name: None,
         owner: Some("alice".to_string()),
         hostname: None,
-        capabilities: ShellClientCapabilities {
+        capabilities: RunnerCapabilities {
             skill_store_read: read,
             skill_store_manage: manage,
             ..Default::default()
@@ -38,7 +34,7 @@ fn alice() -> RunnerAccess {
 
 #[tokio::test]
 async fn skill_store_enqueue_requires_exact_instance_and_independent_capability() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
         .register(skill_store_registration("instance-a", false, false))
         .await
@@ -97,7 +93,7 @@ async fn skill_store_enqueue_requires_exact_instance_and_independent_capability(
 
 #[tokio::test]
 async fn skill_store_dequeue_rejects_replacement_runner_before_dispatch() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
         .register(skill_store_registration("instance-a", true, true))
         .await
@@ -124,15 +120,15 @@ async fn skill_store_dequeue_rejects_replacement_runner_before_dispatch() {
     {
         let mut inner = registry.inner.lock().await;
         inner
-            .clients
+            .runners
             .get_mut("skill-store-runner")
             .unwrap()
-            .agent_instance_id = "instance-b".to_string();
+            .runner_instance_id = "instance-b".to_string();
     }
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "skill-store-runner".to_string(),
-            agent_instance_id: "instance-b".to_string(),
+            runner_instance_id: "instance-b".to_string(),
         })
         .await
         .unwrap();
@@ -152,7 +148,7 @@ async fn skill_store_dequeue_rejects_replacement_runner_before_dispatch() {
     let inner = registry.inner.lock().await;
     assert!(inner.pending_by_id.is_empty());
     assert!(inner
-        .queues_by_client
+        .queues_by_runner
         .get("skill-store-runner")
         .is_none_or(|queue| queue.is_empty()));
 }

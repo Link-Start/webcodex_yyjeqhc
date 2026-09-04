@@ -1,9 +1,9 @@
 use super::*;
-use crate::shell_protocol::ShellProjectInventoryPage;
+use crate::runner_protocol::ShellProjectInventoryPage;
 
 #[tokio::test]
 async fn bounded_semantic_inventory_fails_closed_on_client_or_project_overflow() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     for index in 0..2 {
         let client_id = format!("bounded-{index}");
         let instance_id = format!("bounded-instance-{index}");
@@ -25,35 +25,35 @@ async fn bounded_semantic_inventory_fails_closed_on_client_or_project_overflow()
     let admin = auth_context(None, true);
     assert_eq!(
         registry
-            .list_bounded_client_semantic_views_for_auth(Some(&admin), 2, 2)
+            .list_bounded_runner_semantic_views_for_auth(Some(&admin), 2, 2)
             .await
             .unwrap()
             .len(),
         2
     );
     assert!(registry
-        .list_bounded_client_semantic_views_for_auth(Some(&admin), 1, 2)
+        .list_bounded_runner_semantic_views_for_auth(Some(&admin), 1, 2)
         .await
         .is_none());
     assert!(registry
-        .list_bounded_client_semantic_views_for_auth(Some(&admin), 2, 1)
+        .list_bounded_runner_semantic_views_for_auth(Some(&admin), 2, 1)
         .await
         .is_none());
     let locked_count = registry
-        .with_bounded_client_semantic_views_for_auth_locked(Some(&admin), 2, 2, |views| {
+        .with_bounded_runner_semantic_views_for_auth_locked(Some(&admin), 2, 2, |views| {
             views.map(|views| views.len())
         })
         .await;
     assert_eq!(locked_count, Some(2));
     let locked_overflow = registry
-        .with_bounded_client_semantic_views_for_auth_locked(Some(&admin), 1, 2, |views| views)
+        .with_bounded_runner_semantic_views_for_auth_locked(Some(&admin), 1, 2, |views| views)
         .await;
     assert!(locked_overflow.is_none());
 }
 
 #[tokio::test]
 async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     let shared = shared_key_access("project-scale-shared");
     let projects = (0..65)
         .map(|index| project_summary(&format!("project-{index}"), "/tmp/project"))
@@ -76,7 +76,7 @@ async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert()
     .await;
     assert_eq!(
         registry
-            .list_client_projects("project-scale")
+            .list_runner_projects("project-scale")
             .await
             .unwrap()
             .len(),
@@ -84,7 +84,7 @@ async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert()
     );
 
     registry
-        .upsert_client_project(
+        .upsert_runner_project(
             "project-scale",
             project_summary("project-65", "/tmp/project-65"),
         )
@@ -92,7 +92,7 @@ async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert()
         .expect("dynamic projection may cross the historical 64-project threshold");
     assert_eq!(
         registry
-            .list_client_projects("project-scale")
+            .list_runner_projects("project-scale")
             .await
             .unwrap()
             .len(),
@@ -117,7 +117,7 @@ async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert()
         .expect("malformed inventory refresh must not reject Runner liveness");
     assert_eq!(
         registry
-            .list_client_projects("project-scale")
+            .list_runner_projects("project-scale")
             .await
             .unwrap()
             .len(),
@@ -133,9 +133,9 @@ async fn project_cardinality_does_not_reject_runner_liveness_or_dynamic_upsert()
 
 #[tokio::test]
 async fn registry_inventory_snapshot_saves_projects() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -143,14 +143,14 @@ async fn registry_inventory_snapshot_saves_projects() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
@@ -163,20 +163,20 @@ async fn registry_inventory_snapshot_saves_projects() {
         vec![project_summary("webcodex", "/root/git/webcodex")],
     )
     .await;
-    let clients = registry.list_clients().await;
-    assert_eq!(clients[0].projects.len(), 1);
-    assert_eq!(clients[0].projects[0].id, "webcodex");
+    let runners = registry.list_runners().await;
+    assert_eq!(runners[0].projects.len(), 1);
+    assert_eq!(runners[0].projects[0].id, "webcodex");
 
-    let projects = registry.list_client_projects("oe").await.unwrap();
+    let projects = registry.list_runner_projects("oe").await.unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].path, "/root/git/webcodex");
 }
 
 #[tokio::test]
 async fn registry_inventory_snapshot_updates_projects() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -184,14 +184,14 @@ async fn registry_inventory_snapshot_updates_projects() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
@@ -215,7 +215,7 @@ async fn registry_inventory_snapshot_updates_projects() {
     )
     .await;
 
-    let projects = registry.list_client_projects("oe").await.unwrap();
+    let projects = registry.list_runner_projects("oe").await.unwrap();
     assert_eq!(projects.len(), 2);
     assert_eq!(projects[0].id, "one");
     assert_eq!(projects[1].id, "two");
@@ -223,9 +223,9 @@ async fn registry_inventory_snapshot_updates_projects() {
 
 #[tokio::test]
 async fn registry_poll_without_projects_preserves_existing_projection() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -233,14 +233,14 @@ async fn registry_poll_without_projects_preserves_existing_projection() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
@@ -255,15 +255,15 @@ async fn registry_poll_without_projects_preserves_existing_projection() {
     .await;
 
     let polled = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap();
     assert!(polled.is_none());
 
-    let projects = registry.list_client_projects("oe").await.unwrap();
+    let projects = registry.list_runner_projects("oe").await.unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].id, "one");
     assert_eq!(projects[0].path, "/tmp/one");
@@ -271,9 +271,9 @@ async fn registry_poll_without_projects_preserves_existing_projection() {
 
 #[tokio::test]
 async fn registry_project_owner_check_enforces_boundary() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -281,21 +281,21 @@ async fn registry_project_owner_check_enforces_boundary() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "alice-client".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
         .await
         .unwrap();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -303,14 +303,14 @@ async fn registry_project_owner_check_enforces_boundary() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "bob-client".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("bob".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
@@ -333,14 +333,14 @@ async fn registry_project_owner_check_enforces_boundary() {
 
     let alice = auth_context(Some("alice"), false);
     assert!(registry
-        .assert_client_access(Some(&alice), "alice-client")
+        .assert_runner_access(Some(&alice), "alice-client")
         .await
         .is_ok());
-    let projects = registry.list_client_projects("alice-client").await.unwrap();
+    let projects = registry.list_runner_projects("alice-client").await.unwrap();
     assert_eq!(projects.len(), 1);
 
     let mismatch = registry
-        .assert_client_access(Some(&alice), "bob-client")
+        .assert_runner_access(Some(&alice), "bob-client")
         .await
         .unwrap_err();
     assert!(mismatch.contains("unknown shell client"), "{mismatch}");

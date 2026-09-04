@@ -32,7 +32,7 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             if let Some(executable) = obj.get("executable").and_then(Value::as_str) {
                 out.insert(
                     "process_summary".to_string(),
-                    Value::String(crate::shell_client::process_preview(
+                    Value::String(crate::runner_http::process_preview(
                         executable,
                         args.into_iter().flatten().filter_map(Value::as_str),
                     )),
@@ -221,7 +221,7 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             if let Some(command) = obj.get("command").and_then(Value::as_str) {
                 out.insert(
                     "command_summary".to_string(),
-                    Value::String(crate::shell_client::command_preview(command)),
+                    Value::String(crate::runner_http::command_preview(command)),
                 );
             }
         }
@@ -521,7 +521,7 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             if let Some(instruction) = obj.get("instruction").and_then(Value::as_str) {
                 out.insert(
                     "instruction_summary".to_string(),
-                    Value::String(crate::shell_client::command_preview(instruction)),
+                    Value::String(crate::runner_http::command_preview(instruction)),
                 );
                 out.insert("instruction_present".to_string(), Value::Bool(true));
             }
@@ -2205,7 +2205,7 @@ pub(crate) fn structured_validation_target_identity(
                 .unwrap_or(false);
             let min_tests = obj.get("min_tests").and_then(Value::as_u64);
             if min_tests.is_some_and(|minimum| {
-                !(1..=crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum)
+                !(1..=crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum)
             }) {
                 return None;
             }
@@ -2363,11 +2363,11 @@ fn canonical_cargo_validation_target(
                 index += 1;
             }
             let package = match package {
-                Some(value) => crate::shell_protocol::normalize_cargo_value(&value).ok()?,
+                Some(value) => crate::runner_protocol::normalize_cargo_value(&value).ok()?,
                 None => None,
             };
             let features = match features {
-                Some(value) => crate::shell_protocol::normalize_cargo_value(&value).ok()?,
+                Some(value) => crate::runner_protocol::normalize_cargo_value(&value).ok()?,
                 None => None,
             };
             input.insert("package".to_string(), serde_json::json!(package));
@@ -2381,7 +2381,7 @@ fn canonical_cargo_validation_target(
             if is_test {
                 let filter = match filter {
                     Some(value) => {
-                        crate::shell_protocol::normalize_rust_test_filter(&value).ok()?
+                        crate::runner_protocol::normalize_rust_test_filter(&value).ok()?
                     }
                     None => None,
                 };
@@ -2511,7 +2511,7 @@ fn normalized_cargo_target_value(value: Option<&Value>) -> Option<Option<String>
     if value.is_null() {
         return Some(None);
     }
-    crate::shell_protocol::normalize_cargo_value(value.as_str()?).ok()
+    crate::runner_protocol::normalize_cargo_value(value.as_str()?).ok()
 }
 
 fn normalized_rust_test_target_filter(value: Option<&Value>) -> Option<Option<String>> {
@@ -2521,7 +2521,7 @@ fn normalized_rust_test_target_filter(value: Option<&Value>) -> Option<Option<St
     if value.is_null() {
         return Some(None);
     }
-    crate::shell_protocol::normalize_rust_test_filter(value.as_str()?).ok()
+    crate::runner_protocol::normalize_rust_test_filter(value.as_str()?).ok()
 }
 
 fn normalized_go_test_target_packages(value: Option<&Value>) -> Option<Vec<String>> {
@@ -2538,7 +2538,7 @@ fn normalized_go_test_target_packages(value: Option<&Value>) -> Option<Vec<Strin
         ),
         Some(_) => return None,
     };
-    crate::shell_protocol::normalize_go_test_packages(packages.as_deref()).ok()
+    crate::runner_protocol::normalize_go_test_packages(packages.as_deref()).ok()
 }
 
 #[cfg(test)]
@@ -3992,7 +3992,7 @@ impl ToolCall {
                     "executable_present": true,
                     "arg_count": args.len(),
                     "stdin_present": stdin.is_some(),
-                    "process_summary": crate::shell_client::process_preview(
+                    "process_summary": crate::runner_http::process_preview(
                         executable,
                         args.iter().map(String::as_str),
                     ),
@@ -4089,7 +4089,7 @@ impl ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "command_present": true,
-                "command_summary": crate::shell_client::command_preview(command),
+                "command_summary": crate::runner_http::command_preview(command),
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
                 "purpose": purpose,
@@ -4106,7 +4106,7 @@ impl ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "command_present": true,
-                "command_summary": crate::shell_client::command_preview(command),
+                "command_summary": crate::runner_http::command_preview(command),
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
                 "purpose": purpose,
@@ -4135,7 +4135,7 @@ impl ToolCall {
                 "session_id": session_id,
                 "shell_id": shell_id,
                 "command_present": true,
-                "command_summary": crate::shell_client::command_preview(command),
+                "command_summary": crate::runner_http::command_preview(command),
                 "timeout_secs": timeout_secs,
                 "purpose": purpose,
             }),
@@ -5518,7 +5518,7 @@ impl ToolCall {
                 "client_id": client_id,
                 "path_source_requested": path.is_some(),
                 "instruction_present": true,
-                "instruction_summary": crate::shell_client::command_preview(instruction),
+                "instruction_summary": crate::runner_http::command_preview(instruction),
                 "include_project_instructions": include_project_instructions,
                 "include_workflow_guidance": include_workflow_guidance,
                 "session_id": session_id,

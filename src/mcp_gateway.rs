@@ -77,7 +77,7 @@ impl McpGatewayRuntime {
 #[derive(Debug, Clone)]
 struct ResolvedProvider {
     client_id: String,
-    agent_instance_id: String,
+    runner_instance_id: String,
     provider_id: String,
     provider_instance_id: String,
     name: String,
@@ -415,20 +415,20 @@ async fn visible_provider_candidates(
     auth: Option<&AuthContext>,
 ) -> BTreeMap<String, Vec<ResolvedProvider>> {
     let mut providers: BTreeMap<String, Vec<ResolvedProvider>> = BTreeMap::new();
-    let access = crate::shell_client::runner_access_from_auth(auth);
+    let access = crate::runner_http::runner_access_from_auth(auth);
     for client in runtime
-        .shell_clients
-        .list_clients_for_auth(access.as_ref())
+        .runner_registry
+        .list_runners_for_auth(access.as_ref())
         .await
     {
         if !client.connected
             || runtime
-                .shell_clients
-                .assert_client_access(access.as_ref(), &client.client_id)
+                .runner_registry
+                .assert_runner_access(access.as_ref(), &client.client_id)
                 .await
                 .is_err()
         {
-            // `list_clients_for_auth` applies lightweight auth-group visibility.
+            // `list_runners_for_auth` applies lightweight auth-group visibility.
             // Managed-user clients also require the existing exact owner check;
             // do it here before projecting even sanitized provider metadata.
             continue;
@@ -446,7 +446,7 @@ async fn visible_provider_candidates(
                 .or_default()
                 .push(ResolvedProvider {
                     client_id: client.client_id.clone(),
-                    agent_instance_id: client.agent_instance_id.clone(),
+                    runner_instance_id: client.runner_instance_id.clone(),
                     provider_id: provider.provider_id.clone(),
                     provider_instance_id: provider.provider_instance_id.clone(),
                     name: provider.name.clone(),
@@ -481,12 +481,12 @@ async fn execute_exact(
     request: McpGatewayRequest,
     auth: Option<&AuthContext>,
 ) -> Result<McpGatewayResponse, GatewayError> {
-    let access = crate::shell_client::runner_access_from_auth(auth);
+    let access = crate::runner_http::runner_access_from_auth(auth);
     let (request_id, receiver) = runtime
-        .shell_clients
+        .runner_registry
         .enqueue_mcp_gateway(
             &provider.client_id,
-            &provider.agent_instance_id,
+            &provider.runner_instance_id,
             request,
             access.as_ref(),
             "mcp_tool".to_string(),
@@ -515,7 +515,7 @@ async fn execute_exact(
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) | Err(_) => {
             let dispatched = runtime
-                .shell_clients
+                .runner_registry
                 .cancel_request_dispatch_state(&request_id)
                 .await;
             let state = if dispatched == Some(false) {
@@ -663,7 +663,7 @@ mod tests {
     fn no_arg_list_reports_routing_resolvability_not_health() {
         let provider = |client_id: &str, instance_id: &str| ResolvedProvider {
             client_id: client_id.to_string(),
-            agent_instance_id: format!("{client_id}-agent"),
+            runner_instance_id: format!("{client_id}-agent"),
             provider_id: "server".to_string(),
             provider_instance_id: instance_id.to_string(),
             name: "Server".to_string(),

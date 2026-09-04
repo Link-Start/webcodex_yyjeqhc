@@ -19,7 +19,7 @@ use super::helpers::{
 use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::tool_result::{RecoveryKind, ToolResult};
 use super::ToolRuntime;
-use crate::shell_protocol::{ShellCommandExecutionState, ShellRunRequest};
+use crate::runner_protocol::{ShellCommandExecutionState, ShellRunRequest};
 use crate::tool_runtime::sessions::{SessionEvent, SessionSummary};
 
 /// Sentinel separating `git status --porcelain` from `git diff --stat` in the
@@ -3490,7 +3490,7 @@ impl ToolRuntime {
         };
         let client_id = proj.client_id.clone();
         let (req_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_run(
                 ShellRunRequest {
                     client_id,
@@ -3514,11 +3514,11 @@ impl ToolRuntime {
                 "exit_code": resp.exit_code,
             })),
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("request dropped")
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("timed out")
             }
         }
@@ -3538,7 +3538,7 @@ impl ToolRuntime {
         };
         let client_id = proj.client_id.clone();
         let (req_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_run(
                 ShellRunRequest {
                     client_id,
@@ -3562,11 +3562,11 @@ impl ToolRuntime {
                 "exit_code": resp.exit_code,
             })),
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("request dropped")
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("timed out")
             }
         }
@@ -4058,7 +4058,7 @@ impl ToolRuntime {
         let script = git_commit_paths_script(&expected_head, &paths, &message);
         let client_id = proj.client_id.clone();
         let (request_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_internal_posix_script(
                 client_id,
                 Some(proj.path.clone()),
@@ -4163,7 +4163,7 @@ impl ToolRuntime {
             }
             Ok(Err(_)) => {
                 let dispatch = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 if dispatch_uncertainty_lifecycle(dispatch)
@@ -4182,7 +4182,7 @@ impl ToolRuntime {
             }
             Err(_) => {
                 let dispatch = self
-                    .shell_clients
+                    .runner_registry
                     .cancel_request_dispatch_state(&request_id)
                     .await;
                 if dispatch_uncertainty_lifecycle(dispatch)
@@ -4210,7 +4210,7 @@ impl ToolRuntime {
         let cmd = git_diff_summary_command();
         let client_id = proj.client_id.clone();
         let (req_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_internal_posix_script(
                 client_id,
                 Some(proj.path.clone()),
@@ -4241,11 +4241,11 @@ impl ToolRuntime {
                 }))
             }
             Ok(Err(_)) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("request dropped")
             }
             Err(_) => {
-                self.shell_clients.cancel_request(&req_id).await;
+                self.runner_registry.cancel_request(&req_id).await;
                 ToolResult::err("timed out")
             }
         }

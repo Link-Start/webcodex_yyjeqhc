@@ -1,24 +1,24 @@
-//! Server-side WebSocket agent transport.
+//! Server-side WebSocket Runner transport.
 //!
-//! This module implements the WebSocket endpoint that lets an agent stay
+//! This module implements the WebSocket endpoint that lets a Runner stay
 //! connected over a long-lived connection instead of polling. It is
 //! intentionally thin: every business operation (register, request routing,
 //! result recording, job updates) is delegated to the existing
-//! [`ShellClientRegistry`]. The handler only translates between the
-//! transport-neutral [`AgentEnvelope`] wire format and registry method calls.
+//! [`RunnerRegistry`]. The handler only translates between the
+//! transport-neutral [`RunnerEnvelope`] wire format and registry method calls.
 //!
 //! Request delivery model: after a successful register the server spawns a
 //! "request pump" task. The pump pops pending requests from the registry
 //! queue (the very same queue the polling endpoint serves) and pushes them to
-//! the agent as `Request` envelopes. When the queue is empty, the pump waits
+//! the Runner as `Request` envelopes. When the queue is empty, the pump waits
 //! on a [`Notify`] that the registry fires whenever a new request is
-//! enqueued. This means WebSocket and polling agents share one queue and one
+//! enqueued. This means WebSocket and polling Runners share one queue and one
 //! job state; there is no second business-logic path.
 //!
 //! Polling remains a fully supported fallback transport.
 
-use crate::shell_client::{AgentTransport, ShellClientRegistry};
-use crate::shell_protocol::{AgentEnvelope, ShellClientRegisterRequest};
+use crate::runner_http::{RunnerRegistry, RunnerTransport};
+use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
@@ -27,24 +27,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
-/// Maximum WebSocket text message size. Agent requests/results carry shell
+/// Maximum WebSocket text message size. Runner requests/results carry shell
 /// output which can be sizeable; 8 MiB matches the registry output cap head
 /// room while still bounding memory.
 const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
-/// Deadline for the agent to send its first `Register` envelope after the
+/// Deadline for the Runner to send its first `Register` envelope after the
 /// handshake. Prevents half-open connections from holding registry state.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// WebSocket agent endpoint: `GET /api/agents/ws`. Requires auth via the shared
+/// Runner WebSocket endpoint: `GET /api/agents/ws`. Requires auth via the shared
 /// `AuthMiddleware`, exactly like the polling endpoints. Authentication is
 /// `Authorization: Bearer <token>`; query-string credentials are not accepted.
 #[handler]
-pub async fn agent_ws(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(registry) = depot.obtain::<Arc<ShellClientRegistry>>().ok().cloned() else {
+pub async fn runner_ws(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(registry) = depot.obtain::<Arc<RunnerRegistry>>().ok().cloned() else {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         res.render(Json(json!({
             "success": false,
-            "error": "Shell client registry not configured"
+            "error": "Runner registry not configured"
         })));
         return;
     };
@@ -55,19 +55,19 @@ pub async fn agent_ws(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let upgrade = WebSocketUpgrade::new()
         .max_message_size(WS_MAX_MESSAGE_SIZE)
         .upgrade(req, res, |ws| async move {
-            handle_agent_ws(ws, registry, auth).await;
+            handle_runner_ws(ws, registry, auth).await;
         })
         .await;
     if let Err(e) = upgrade {
-        tracing::warn!(error = ?e, "agent websocket upgrade failed");
+        tracing::warn!(error = ?e, "Runner WebSocket upgrade failed");
     }
 }
 
-/// Drive a single agent WebSocket connection to completion (until the agent
+/// Drive a single Runner WebSocket connection to completion (until the Runner
 /// disconnects or a fatal protocol error occurs).
-async fn handle_agent_ws(
+async fn handle_runner_ws(
     mut ws: WebSocket,
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
     auth: Option<crate::auth::AuthContext>,
 ) {
     // 1. Read the first message: it must be a Register envelope.
@@ -76,7 +76,7 @@ async fn handle_agent_ws(
         Err(e) => {
             send_envelope_or_log(
                 &mut ws,
-                AgentEnvelope::Error {
+                RunnerEnvelope::Error {
                     code: "expected_register".to_string(),
                     message: e,
                 },
@@ -87,10 +87,10 @@ async fn handle_agent_ws(
         }
     };
     let client_id = register_payload.client_id.clone();
-    let agent_instance_id = register_payload.agent_instance_id.clone();
+    let runner_instance_id = register_payload.runner_instance_id.clone();
     let connection_id = uuid::Uuid::new_v4().to_string();
 
-    // 1b. Enforce the agent transport boundary before mutating the registry.
+    // 1b. Enforce the Runner transport boundary before mutating the registry.
     //     This mirrors the polling register handler: bootstrap may register
     //     any owner; an agent token may register only when its
     //     allowed_client_id matches and its owner matches the requested owner
@@ -101,15 +101,15 @@ async fn handle_agent_ws(
     //     resolves the effective owner; it stops before any wire I/O so this
     //     handler sends its own error envelope.
     if let Err(e) =
-        crate::agent_session::register_session_prelude(auth.as_ref(), &mut register_payload)
+        crate::runner_session::register_session_prelude(auth.as_ref(), &mut register_payload)
     {
         send_envelope_or_log(
             &mut ws,
-            AgentEnvelope::Error {
-                code: crate::agent_session::RegisterPreludeError::CODE.to_string(),
+            RunnerEnvelope::Error {
+                code: crate::runner_session::RegisterPreludeError::CODE.to_string(),
                 message: e.message().to_string(),
             },
-            crate::agent_session::RegisterPreludeError::CODE,
+            crate::runner_session::RegisterPreludeError::CODE,
         )
         .await;
         return;
@@ -117,14 +117,14 @@ async fn handle_agent_ws(
 
     // 2. Commit the complete streaming session in one registry transaction.
     //    Transport identity comes from this handler, not the raw protocol label.
-    let access = crate::shell_client::runner_access_from_auth(auth.as_ref());
+    let access = crate::runner_http::runner_access_from_auth(auth.as_ref());
     let notify = Arc::new(Notify::new());
     let (view, cancel) = match registry
         .register_streaming_session_with_cancel(
             register_payload,
             access.as_ref(),
             &connection_id,
-            AgentTransport::WebSocket,
+            RunnerTransport::WebSocket,
             notify.clone(),
         )
         .await
@@ -133,7 +133,7 @@ async fn handle_agent_ws(
         Err(e) => {
             send_envelope_or_log(
                 &mut ws,
-                AgentEnvelope::Error {
+                RunnerEnvelope::Error {
                     code: "register_failed".to_string(),
                     message: e,
                 },
@@ -150,7 +150,7 @@ async fn handle_agent_ws(
     //    reconnect remains protected by the connection_id fence.
     if send_envelope(
         &mut ws,
-        AgentEnvelope::Registered {
+        RunnerEnvelope::Registered {
             success: true,
             client: Some(view),
             error: None,
@@ -159,38 +159,38 @@ async fn handle_agent_ws(
     .await
     .is_err()
     {
-        tracing::debug!(client_id = %client_id, "agent websocket registered ack send failed");
+        tracing::debug!(client_id = %client_id, "Runner WebSocket registered ack send failed");
         registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+            .reconcile_disconnect_for_connection(&client_id, &runner_instance_id, &connection_id)
             .await;
         return;
     }
-    tracing::info!(client_id = %client_id, "agent websocket connected");
+    tracing::info!(client_id = %client_id, "Runner WebSocket connected");
 
     // 4. Split the socket into a writer (owned by a writer task) and a reader
     //    (owned by this task). Outgoing envelopes go through a single mpsc so
     //    the request pump and pong replies share one writer. The channel
-    //    carries `AgentEnvelope`s; the writer serializes each to text, so the
-    //    shared session loop (`run_agent_session`) is transport-neutral.
+    //    carries `RunnerEnvelope`s; the writer serializes each to text, so the
+    //    shared session loop (`run_runner_session`) is transport-neutral.
     let (sink, stream) = ws.split();
     let (out_tx, out_rx) =
-        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
+        mpsc::channel::<RunnerEnvelope>(crate::runner_session::OUTGOING_CHANNEL_CAPACITY);
 
     let writer_task = tokio::spawn(async move {
         let mut sink = sink;
         let mut out_rx = out_rx;
         while let Some(env) = out_rx.recv().await {
             let Ok(json) = env.to_json() else {
-                return crate::agent_session::WriterExit::TransportFailed;
+                return crate::runner_session::WriterExit::TransportFailed;
             };
             if sink.send(Message::text(json)).await.is_err() {
-                return crate::agent_session::WriterExit::TransportFailed;
+                return crate::runner_session::WriterExit::TransportFailed;
             }
         }
         if sink.close().await.is_err() {
-            crate::agent_session::WriterExit::TransportFailed
+            crate::runner_session::WriterExit::TransportFailed
         } else {
-            crate::agent_session::WriterExit::ChannelClosed
+            crate::runner_session::WriterExit::ChannelClosed
         }
     });
 
@@ -198,11 +198,11 @@ async fn handle_agent_ws(
     //      The reader adapter translates tungstenite messages into the
     //      transport-neutral `RecvOutcome`.
     let reader = WsReader { stream };
-    crate::agent_session::run_agent_session(
-        crate::agent_session::SessionContext {
+    crate::runner_session::run_runner_session(
+        crate::runner_session::SessionContext {
             registry: &registry,
             client_id: &client_id,
-            agent_instance_id: &agent_instance_id,
+            runner_instance_id: &runner_instance_id,
             connection_id: &connection_id,
             notify,
             cancel,
@@ -213,11 +213,11 @@ async fn handle_agent_ws(
         writer_task,
     )
     .await;
-    tracing::info!(client_id = %client_id, "agent websocket disconnected");
+    tracing::info!(client_id = %client_id, "Runner WebSocket disconnected");
 }
 
 /// Adapter turning a tungstenite/salvo WebSocket read stream into the
-/// transport-neutral [`crate::agent_session::AgentReader`].
+/// transport-neutral [`crate::runner_session::RunnerReader`].
 ///
 /// `Ping`/`Pong`/`Binary` frames are skipped (tungstenite auto-replies to
 /// protocol pings), close frames stop the reader, and malformed text envelopes
@@ -226,33 +226,33 @@ struct WsReader {
     stream: futures_util::stream::SplitStream<WebSocket>,
 }
 
-impl crate::agent_session::AgentReader for WsReader {
-    async fn recv(&mut self) -> crate::agent_session::RecvOutcome {
+impl crate::runner_session::RunnerReader for WsReader {
+    async fn recv(&mut self) -> crate::runner_session::RecvOutcome {
         use futures_util::StreamExt;
         let Some(msg) = self.stream.next().await else {
-            return crate::agent_session::RecvOutcome::Closed;
+            return crate::runner_session::RecvOutcome::Closed;
         };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!(error = ?e, "agent websocket read error");
-                return crate::agent_session::RecvOutcome::Closed;
+                tracing::debug!(error = ?e, "Runner WebSocket read error");
+                return crate::runner_session::RecvOutcome::Closed;
             }
         };
         if msg.is_close() {
-            return crate::agent_session::RecvOutcome::Closed;
+            return crate::runner_session::RecvOutcome::Closed;
         }
         // tungstenite auto-replies to Ping with Pong at the protocol level,
         // so we only react to application Text messages here.
         let text = match msg.as_str() {
             Ok(s) => s,
-            Err(_) => return crate::agent_session::RecvOutcome::Skip,
+            Err(_) => return crate::runner_session::RecvOutcome::Skip,
         };
-        match AgentEnvelope::from_slice(text.as_bytes()) {
-            Ok(env) => crate::agent_session::RecvOutcome::Envelope(env),
+        match RunnerEnvelope::from_slice(text.as_bytes()) {
+            Ok(env) => crate::runner_session::RecvOutcome::Envelope(env),
             Err(e) => {
-                tracing::debug!(error = %e, "agent websocket received malformed envelope; ignoring");
-                crate::agent_session::RecvOutcome::Skip
+                tracing::debug!(error = %e, "Runner WebSocket received malformed envelope; ignoring");
+                crate::runner_session::RecvOutcome::Skip
             }
         }
     }
@@ -260,7 +260,7 @@ impl crate::agent_session::AgentReader for WsReader {
 
 /// Read the first envelope from the socket, requiring it to be a `Register`.
 /// Applies a deadline so a half-open connection cannot hold registry state.
-async fn read_register(ws: &mut WebSocket) -> Result<ShellClientRegisterRequest, String> {
+async fn read_register(ws: &mut WebSocket) -> Result<RunnerRegisterRequest, String> {
     let msg = tokio::time::timeout(REGISTER_TIMEOUT, ws.recv())
         .await
         .map_err(|_| "register timed out".to_string())?
@@ -269,27 +269,27 @@ async fn read_register(ws: &mut WebSocket) -> Result<ShellClientRegisterRequest,
     let text = msg
         .as_str()
         .map_err(|_| "register message must be text".to_string())?;
-    let env = AgentEnvelope::from_slice(text.as_bytes())
+    let env = RunnerEnvelope::from_slice(text.as_bytes())
         .map_err(|e| format!("register message is not a valid envelope: {}", e))?;
     match env {
-        AgentEnvelope::Register { payload, .. } => Ok(payload),
+        RunnerEnvelope::Register { payload, .. } => Ok(payload),
         other => Err(format!("expected register envelope, got {}", other.kind())),
     }
 }
 
 /// Encode and send a single envelope before the socket is split.
-async fn send_envelope(ws: &mut WebSocket, env: AgentEnvelope) -> Result<(), ()> {
+async fn send_envelope(ws: &mut WebSocket, env: RunnerEnvelope) -> Result<(), ()> {
     let json = env.to_json().map_err(|_| ())?;
     ws.send(Message::text(json)).await.map_err(|_| ())
 }
 
-async fn send_envelope_or_log(ws: &mut WebSocket, env: AgentEnvelope, context: &'static str) {
+async fn send_envelope_or_log(ws: &mut WebSocket, env: RunnerEnvelope, context: &'static str) {
     let kind = env.kind();
     if send_envelope(ws, env).await.is_err() {
         tracing::debug!(
             envelope_kind = kind,
             context,
-            "agent websocket pre-register send failed"
+            "Runner WebSocket pre-register send failed"
         );
     }
 }
@@ -297,10 +297,10 @@ async fn send_envelope_or_log(ws: &mut WebSocket, env: AgentEnvelope, context: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell_protocol::{
-        AgentPolicySummary, AgentProtocolGenerationNumber, ClaudeCodeProviderStatus,
-        ProviderCallSummary, ShellAgentResultRequest, ShellClientCapabilities,
-        ShellClientRegisterRequest, ShellJobOpRequest, ShellRunRequest, ToolProvidersStatus,
+    use crate::runner_protocol::{
+        ClaudeCodeProviderStatus, ProviderCallSummary, RunnerCapabilities, RunnerPolicySummary,
+        RunnerProtocolGenerationNumber, RunnerRegisterRequest, RunnerResultRequest,
+        ShellJobOpRequest, ShellRunRequest, ToolProvidersStatus,
     };
     use salvo::conn::{Acceptor, Listener};
     use std::net::SocketAddr;
@@ -310,13 +310,13 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     async fn wait_for_ws_client_connected(
-        registry: &ShellClientRegistry,
+        registry: &RunnerRegistry,
         client_id: &str,
         expected: bool,
     ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let view = registry.get_client_view(client_id).await.unwrap();
+            let view = registry.get_runner_view(client_id).await.unwrap();
             if view.connected == expected {
                 return;
             }
@@ -330,7 +330,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_ws_job_status(registry: &ShellClientRegistry, job_id: &str, expected: &str) {
+    async fn wait_for_ws_job_status(registry: &RunnerRegistry, job_id: &str, expected: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let job = registry.get_job(job_id).await.unwrap();
@@ -346,13 +346,13 @@ mod tests {
         }
     }
 
-    fn register_envelope(client_id: &str) -> AgentEnvelope {
+    fn register_envelope(client_id: &str) -> RunnerEnvelope {
         register_envelope_with_instance(client_id, "ws-inst")
     }
 
-    fn register_envelope_with_instance(client_id: &str, instance_id: &str) -> AgentEnvelope {
-        AgentEnvelope::Register {
-            payload: ShellClientRegisterRequest {
+    fn register_envelope_with_instance(client_id: &str, instance_id: &str) -> RunnerEnvelope {
+        RunnerEnvelope::Register {
+            payload: RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -360,14 +360,14 @@ mod tests {
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: instance_id.to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some("ws-test".to_string()),
                 owner: Some("tester".to_string()),
                 hostname: None,
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         shell: true,
                         file_read: true,
                         file_write: true,
@@ -421,14 +421,14 @@ mod tests {
                         coding_agent_runs: false,
                     },
                 ),
-                policy: Some(AgentPolicySummary::default()),
+                policy: Some(RunnerPolicySummary::default()),
             },
         }
     }
 
     /// A `last_seen` timestamp comfortably past the 60s online window, used to
     /// simulate liveness decay without a real sleep. The window constant lives
-    /// in `shell_client` and is private, so we use a generous 2-minute age.
+    /// in `runner_http` and is private, so we use a generous 2-minute age.
     fn aged_last_seen() -> i64 {
         chrono::Utc::now().timestamp() - 120
     }
@@ -465,26 +465,26 @@ mod tests {
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-    ) -> AgentEnvelope {
+    ) -> RunnerEnvelope {
         let msg = ws
             .next()
             .await
             .expect("stream not closed")
             .expect("ok message");
         let text = msg.into_text().expect("text message");
-        AgentEnvelope::from_slice(text.as_bytes()).expect("valid envelope")
+        RunnerEnvelope::from_slice(text.as_bytes()).expect("valid envelope")
     }
 
-    /// Build a salvo router serving only the agent ws endpoint backed by a
+    /// Build a salvo router serving only the Runner WebSocket endpoint backed by a
     /// fresh registry. No auth middleware: the integration test exercises the
     /// protocol, not authentication.
-    fn build_router(registry: Arc<ShellClientRegistry>) -> Router {
+    fn build_router(registry: Arc<RunnerRegistry>) -> Router {
         Router::new()
             .hoop(affix_state::inject(registry))
-            .push(Router::with_path("api/agents/ws").goal(agent_ws))
+            .push(Router::with_path("api/agents/ws").goal(runner_ws))
     }
 
-    async fn start_server(registry: Arc<ShellClientRegistry>) -> SocketAddr {
+    async fn start_server(registry: Arc<RunnerRegistry>) -> SocketAddr {
         let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
         let addr = acceptor.holdings()[0]
             .local_addr
@@ -499,7 +499,7 @@ mod tests {
     }
 
     async fn start_authenticated_server(
-        registry: Arc<ShellClientRegistry>,
+        registry: Arc<RunnerRegistry>,
     ) -> (SocketAddr, tempfile::TempDir) {
         let config = crate::test_support::test_config(Some("bootstrap-secret"));
         let (tmp, db) = crate::test_support::test_db();
@@ -516,7 +516,7 @@ mod tests {
             .push(
                 Router::with_path("api/agents/ws")
                     .hoop(crate::auth::AuthMiddleware)
-                    .goal(agent_ws),
+                    .goal(runner_ws),
             );
         tokio::spawn(async move {
             Server::new(acceptor).serve(router).await;
@@ -537,21 +537,21 @@ mod tests {
         connect_async(request).await.expect("ws connect").0
     }
 
-    fn shared_key_register_envelope(client_id: &str, instance_id: &str) -> AgentEnvelope {
-        let AgentEnvelope::Register { mut payload, .. } =
+    fn shared_key_register_envelope(client_id: &str, instance_id: &str) -> RunnerEnvelope {
+        let RunnerEnvelope::Register { mut payload, .. } =
             register_envelope_with_instance(client_id, instance_id)
         else {
             unreachable!()
         };
         payload.owner = Some("untrusted-owner".to_string());
-        AgentEnvelope::Register { payload }
+        RunnerEnvelope::Register { payload }
     }
 
     #[tokio::test]
     async fn ws_direct_shared_keys_register_by_group_and_cannot_spoof_results() {
         let env = crate::auth::AuthEnvGuard::auth_required();
         env.enable_direct_shared_key();
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let (addr, _tmp) = start_authenticated_server(registry.clone()).await;
         let url = format!("ws://{addr}/api/agents/ws");
 
@@ -564,7 +564,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let AgentEnvelope::Registered {
+        let RunnerEnvelope::Registered {
             success: true,
             client: Some(client_a),
             ..
@@ -578,14 +578,14 @@ mod tests {
         let auth_a = crate::auth::shared_key::shared_key_context("shared-key-a");
         let auth_b = crate::auth::shared_key::shared_key_context("shared-key-b");
         assert!(registry
-            .get_client_view_for_auth(
+            .get_runner_view_for_auth(
                 "shared-a",
                 Some(&crate::test_support::runner_access(&auth_a))
             )
             .await
             .is_some());
         assert!(registry
-            .get_client_view_for_auth(
+            .get_runner_view_for_auth(
                 "shared-a",
                 Some(&crate::test_support::runner_access(&auth_b))
             )
@@ -602,11 +602,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        let AgentEnvelope::Error { code, message } = recv_envelope(&mut ws_collision).await else {
+        let RunnerEnvelope::Error { code, message } = recv_envelope(&mut ws_collision).await else {
             panic!("cross-group client_id collision should fail")
         };
         assert_eq!(code, "register_failed");
-        assert_eq!(message, "agent client identity is unavailable");
+        assert_eq!(message, "runner identity is unavailable");
 
         let mut ws_b = connect_with_bearer(&url, "shared-key-b").await;
         ws_b.send(TungsteniteMessage::Text(
@@ -619,7 +619,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             recv_envelope(&mut ws_b).await,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
 
         let (request_id, mut result_rx) = registry
@@ -638,16 +638,16 @@ mod tests {
             .unwrap();
         assert!(matches!(
             recv_envelope(&mut ws_a).await,
-            AgentEnvelope::Request { .. }
+            RunnerEnvelope::Request { .. }
         ));
 
         // Key B knows the public ids but its registered connection identity
         // must not be able to submit Key A's result.
         ws_b.send(TungsteniteMessage::Text(
-            AgentEnvelope::Result {
-                payload: ShellAgentResultRequest {
+            RunnerEnvelope::Result {
+                payload: RunnerResultRequest {
                     client_id: "shared-a".to_string(),
-                    agent_instance_id: "instance-a".to_string(),
+                    runner_instance_id: "instance-a".to_string(),
                     request_id: request_id.clone(),
                     exit_code: Some(0),
                     stdout: Some("spoofed".to_string()),
@@ -671,10 +671,10 @@ mod tests {
         );
 
         ws_a.send(TungsteniteMessage::Text(
-            AgentEnvelope::Result {
-                payload: ShellAgentResultRequest {
+            RunnerEnvelope::Result {
+                payload: RunnerResultRequest {
                     client_id: "shared-a".to_string(),
-                    agent_instance_id: "instance-a".to_string(),
+                    runner_instance_id: "instance-a".to_string(),
                     request_id,
                     exit_code: Some(0),
                     stdout: Some("authentic".to_string()),
@@ -699,7 +699,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_register_requires_explicit_protocol_generation() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
         let (mut ws, _resp) = connect_async(url).await.expect("ws connect");
@@ -713,49 +713,49 @@ mod tests {
             .unwrap();
 
         match recv_envelope(&mut ws).await {
-            AgentEnvelope::Error { code, message } => {
+            RunnerEnvelope::Error { code, message } => {
                 assert_eq!(code, "expected_register");
                 assert!(message.contains("agent_protocol_generation"), "{message}");
             }
             other => panic!("expected register_failed, got {:?}", other.kind()),
         }
         assert!(registry
-            .get_client_view("ws-missing-protocol")
+            .get_runner_view("ws-missing-protocol")
             .await
             .is_none());
     }
 
     #[tokio::test]
     async fn ws_register_rejects_unsupported_protocol_generation() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
         let (mut ws, _resp) = connect_async(url).await.expect("ws connect");
         let mut register = register_envelope("ws-unsupported-protocol");
-        let AgentEnvelope::Register { payload, .. } = &mut register else {
+        let RunnerEnvelope::Register { payload, .. } = &mut register else {
             unreachable!("register helper must return Register")
         };
-        payload.agent_protocol_generation = AgentProtocolGenerationNumber::new(3);
+        payload.runner_protocol_generation = RunnerProtocolGenerationNumber::new(3);
         ws.send(TungsteniteMessage::Text(register.to_json().unwrap().into()))
             .await
             .unwrap();
 
         match recv_envelope(&mut ws).await {
-            AgentEnvelope::Error { code, message } => {
+            RunnerEnvelope::Error { code, message } => {
                 assert_eq!(code, "register_failed");
                 assert_eq!(message, "agent_protocol_generation is unsupported");
             }
             other => panic!("expected register_failed, got {:?}", other.kind()),
         }
         assert!(registry
-            .get_client_view("ws-unsupported-protocol")
+            .get_runner_view("ws-unsupported-protocol")
             .await
             .is_none());
     }
 
     #[tokio::test]
     async fn ws_register_then_request_result_roundtrip() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
@@ -771,7 +771,7 @@ mod tests {
         // Expect Registered ack.
         let ack = recv_envelope(&mut ws).await;
         match ack {
-            AgentEnvelope::Registered {
+            RunnerEnvelope::Registered {
                 success, client, ..
             } => {
                 assert!(success);
@@ -802,7 +802,7 @@ mod tests {
         // Receive the pushed Request envelope.
         let req_env = recv_envelope(&mut ws).await;
         match req_env {
-            AgentEnvelope::Request { request } => {
+            RunnerEnvelope::Request { request } => {
                 assert_eq!(request.request_id, request_id);
                 assert_eq!(request.kind, "run_shell");
                 assert_eq!(request.command, "echo hi");
@@ -811,10 +811,10 @@ mod tests {
         }
 
         // Send back a Result envelope.
-        let result_env = AgentEnvelope::Result {
-            payload: ShellAgentResultRequest {
+        let result_env = RunnerEnvelope::Result {
+            payload: RunnerResultRequest {
                 client_id: "ws-roundtrip".to_string(),
-                agent_instance_id: "ws-inst".to_string(),
+                runner_instance_id: "ws-inst".to_string(),
                 request_id: request_id.clone(),
                 exit_code: Some(0),
                 stdout: Some("hi".to_string()),
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(response.exit_code, Some(0));
 
         ws.send(TungsteniteMessage::Text(
-            AgentEnvelope::RuntimeMetadata {
+            RunnerEnvelope::RuntimeMetadata {
                 tool_providers: provider_status(),
             }
             .to_json()
@@ -851,7 +851,7 @@ mod tests {
         .unwrap();
         let metadata_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let view = registry.get_client_view("ws-roundtrip").await.unwrap();
+            let view = registry.get_runner_view("ws-roundtrip").await.unwrap();
             if view
                 .policy
                 .as_ref()
@@ -867,7 +867,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let view = registry.get_client_view("ws-roundtrip").await.unwrap();
+        let view = registry.get_runner_view("ws-roundtrip").await.unwrap();
         let call = view
             .policy
             .unwrap()
@@ -882,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_ping_replies_with_pong() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
@@ -895,19 +895,19 @@ mod tests {
         .unwrap();
         let _ = recv_envelope(&mut ws).await; // Registered
 
-        let ping = AgentEnvelope::Ping { ts: 12345 };
+        let ping = RunnerEnvelope::Ping { ts: 12345 };
         ws.send(TungsteniteMessage::Text(ping.to_json().unwrap().into()))
             .await
             .unwrap();
 
         let pong = recv_envelope(&mut ws).await;
         match pong {
-            AgentEnvelope::Pong { ts } => assert_eq!(ts, 12345),
+            RunnerEnvelope::Pong { ts } => assert_eq!(ts, 12345),
             other => panic!("expected pong, got {:?}", other),
         }
 
         // A Ping must refresh liveness: the client stays online.
-        let view = registry.get_client_view("ws-ping").await.unwrap();
+        let view = registry.get_runner_view("ws-ping").await.unwrap();
         assert!(view.connected);
         assert_eq!(view.status, "online");
         assert_eq!(view.transport, "websocket");
@@ -917,9 +917,9 @@ mod tests {
     async fn ws_ping_refreshes_liveness_after_aging() {
         // Simulate the 60s online window elapsing with only keepalive traffic
         // by directly aging `last_seen`, then sending a Ping. The server must
-        // refresh liveness so the agent reads online again instead of decaying
+        // refresh liveness so the Runner reads online again instead of decaying
         // to stale. This avoids a real 60s sleep.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
@@ -935,30 +935,30 @@ mod tests {
         registry
             .set_last_seen_for_test("ws-age", aged_last_seen())
             .await;
-        let stale = registry.get_client_view("ws-age").await.unwrap();
+        let stale = registry.get_runner_view("ws-age").await.unwrap();
         assert!(!stale.connected, "client should be stale after aging");
 
         // A Ping must bring it back online.
         ws.send(TungsteniteMessage::Text(
-            AgentEnvelope::Ping { ts: 1 }.to_json().unwrap().into(),
+            RunnerEnvelope::Ping { ts: 1 }.to_json().unwrap().into(),
         ))
         .await
         .unwrap();
         let pong = recv_envelope(&mut ws).await;
-        assert!(matches!(pong, AgentEnvelope::Pong { .. }));
+        assert!(matches!(pong, RunnerEnvelope::Pong { .. }));
 
-        let fresh = registry.get_client_view("ws-age").await.unwrap();
+        let fresh = registry.get_runner_view("ws-age").await.unwrap();
         assert!(fresh.connected);
         assert_eq!(fresh.status, "online");
     }
 
     #[tokio::test]
     async fn ws_pong_treated_as_keepalive_not_unexpected() {
-        // A Pong from the agent (e.g. a future server-initiated ping reply,
+        // A Pong from the Runner (e.g. a future server-initiated ping reply,
         // or a stray frame) must be treated as live traffic, never as an
         // unexpected envelope, and must refresh liveness. The connection must
         // stay open.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
@@ -973,29 +973,29 @@ mod tests {
         registry
             .set_last_seen_for_test("ws-pong", aged_last_seen())
             .await;
-        assert!(!registry.get_client_view("ws-pong").await.unwrap().connected);
+        assert!(!registry.get_runner_view("ws-pong").await.unwrap().connected);
 
         // Send a Pong. The server must not close the socket and must not echo
         // anything back (Pong is terminal keepalive).
         ws.send(TungsteniteMessage::Text(
-            AgentEnvelope::Pong { ts: 99 }.to_json().unwrap().into(),
+            RunnerEnvelope::Pong { ts: 99 }.to_json().unwrap().into(),
         ))
         .await
         .unwrap();
 
         wait_for_ws_client_connected(&registry, "ws-pong", true).await;
-        let fresh = registry.get_client_view("ws-pong").await.unwrap();
+        let fresh = registry.get_runner_view("ws-pong").await.unwrap();
         assert!(fresh.connected, "pong must refresh liveness");
         assert_eq!(fresh.status, "online");
 
         // The connection is still usable: a subsequent Ping still gets a Pong.
         ws.send(TungsteniteMessage::Text(
-            AgentEnvelope::Ping { ts: 7 }.to_json().unwrap().into(),
+            RunnerEnvelope::Ping { ts: 7 }.to_json().unwrap().into(),
         ))
         .await
         .unwrap();
         let pong = recv_envelope(&mut ws).await;
-        assert!(matches!(pong, AgentEnvelope::Pong { ts: 7 }));
+        assert!(matches!(pong, RunnerEnvelope::Pong { ts: 7 }));
     }
 
     #[tokio::test]
@@ -1004,7 +1004,7 @@ mod tests {
         // removed). A fresh WebSocket register for the same client_id must
         // overwrite the old record, flip transport back to websocket, and read
         // connected=true/online.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1018,9 +1018,9 @@ mod tests {
         let ack1 = recv_envelope(&mut ws1).await;
         assert!(matches!(
             ack1,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
-        let view1 = registry.get_client_view("ws-recon").await.unwrap();
+        let view1 = registry.get_runner_view("ws-recon").await.unwrap();
         assert_eq!(view1.transport, "websocket");
         assert!(view1.connected);
 
@@ -1037,7 +1037,7 @@ mod tests {
         .unwrap();
         let ack2 = recv_envelope(&mut ws2).await;
         match ack2 {
-            AgentEnvelope::Registered {
+            RunnerEnvelope::Registered {
                 success, client, ..
             } => {
                 assert!(success);
@@ -1050,7 +1050,7 @@ mod tests {
             other => panic!("expected registered ack on reconnect, got {:?}", other),
         }
 
-        let view2 = registry.get_client_view("ws-recon").await.unwrap();
+        let view2 = registry.get_runner_view("ws-recon").await.unwrap();
         assert_eq!(view2.transport, "websocket");
         assert!(view2.connected);
         assert_eq!(view2.status, "online");
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_disconnect_marks_client_offline_and_retains_record() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
@@ -1072,25 +1072,25 @@ mod tests {
         let _ = recv_envelope(&mut ws).await; // Registered
 
         // While connected the transport is websocket.
-        let view = registry.get_client_view("ws-disc").await.unwrap();
+        let view = registry.get_runner_view("ws-disc").await.unwrap();
         assert_eq!(view.transport, "websocket");
 
         drop(ws);
         wait_for_ws_client_connected(&registry, "ws-disc", false).await;
-        let view = registry.get_client_view("ws-disc").await.unwrap();
+        let view = registry.get_runner_view("ws-disc").await.unwrap();
         assert_eq!(view.transport, "websocket");
     }
 
     #[tokio::test]
     async fn ws_non_register_first_message_is_rejected() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
 
         let url = format!("ws://{}/api/agents/ws", addr);
         let (mut ws, _resp) = connect_async(url).await.unwrap();
 
         // Send a Ping instead of Register.
-        let ping = AgentEnvelope::Ping { ts: 1 };
+        let ping = RunnerEnvelope::Ping { ts: 1 };
         ws.send(TungsteniteMessage::Text(ping.to_json().unwrap().into()))
             .await
             .unwrap();
@@ -1098,7 +1098,7 @@ mod tests {
         // Server should send an error and close.
         let env = recv_envelope(&mut ws).await;
         match env {
-            AgentEnvelope::Error { code, .. } => {
+            RunnerEnvelope::Error { code, .. } => {
                 assert_eq!(code, "expected_register");
             }
             other => panic!("expected error, got {:?}", other),
@@ -1107,14 +1107,14 @@ mod tests {
 
     #[tokio::test]
     async fn ws_slow_consumer_does_not_deadlock() {
-        // The agent connects but never reads during the enqueue burst. The
+        // The Runner connects but never reads during the enqueue burst. The
         // server's enqueue path must not deadlock: `enqueue_run` never blocks
         // on the transport (the pump holds the registry lock only briefly,
         // never during a blocking send), and the registry queue cap rejects
         // overflow rather than growing without limit. The hard memory bound is
         // enforced at the registry level regardless of transport; see
         // `registry_rejects_enqueue_when_queue_full`.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
         let (mut ws, _resp) = connect_async(url).await.unwrap();
@@ -1125,12 +1125,12 @@ mod tests {
         .unwrap();
         let _ = recv_envelope(&mut ws).await; // Registered
 
-        // Enqueue a burst while the agent reads nothing. The loop must
+        // Enqueue a burst while the Runner reads nothing. The loop must
         // complete whether the requests are absorbed by socket buffers or
         // rejected by the queue cap.
         let mut first_rx: Option<(
             String,
-            tokio::sync::oneshot::Receiver<crate::shell_protocol::ShellRunResponse>,
+            tokio::sync::oneshot::Receiver<crate::runner_protocol::ShellRunResponse>,
         )> = None;
         let processed = tokio::time::timeout(Duration::from_secs(10), async {
             for i in 0..400usize {
@@ -1161,14 +1161,14 @@ mod tests {
         let (request_id, rx) = first_rx.expect("first request kept");
         let req_env = recv_envelope(&mut ws).await;
         match req_env {
-            AgentEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
+            RunnerEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
             other => panic!("expected request, got {:?}", other),
         }
         ws.send(TungsteniteMessage::Text(
-            AgentEnvelope::Result {
-                payload: ShellAgentResultRequest {
+            RunnerEnvelope::Result {
+                payload: RunnerResultRequest {
                     client_id: "ws-slow".to_string(),
-                    agent_instance_id: "ws-inst".to_string(),
+                    runner_instance_id: "ws-inst".to_string(),
                     request_id: request_id.clone(),
                     exit_code: Some(0),
                     stdout: Some("hi".to_string()),
@@ -1192,12 +1192,12 @@ mod tests {
 
         // The server is still responsive.
         drop(ws);
-        let _ = registry.list_clients().await;
+        let _ = registry.list_runners().await;
     }
 
     #[tokio::test]
     async fn ws_disconnect_marks_running_job_lost() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
         let (mut ws, _resp) = connect_async(url).await.unwrap();
@@ -1240,11 +1240,11 @@ mod tests {
 
     #[tokio::test]
     async fn ws_duplicate_different_instance_is_rejected() {
-        // A WebSocket agent with client_id=oe, instance=A is online. A second
+        // A WebSocket Runner with client_id=oe, instance=A is online. A second
         // WebSocket registration with client_id=oe, instance=B must be rejected
         // (the server sends an error and closes the second socket). The first
         // connection stays online.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1261,10 +1261,10 @@ mod tests {
         let ack = recv_envelope(&mut ws_a).await;
         assert!(matches!(
             ack,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
-        let view = registry.get_client_view("ws-dup").await.unwrap();
-        assert_eq!(view.agent_instance_id, "inst-a");
+        let view = registry.get_runner_view("ws-dup").await.unwrap();
+        assert_eq!(view.runner_instance_id, "inst-a");
         assert!(view.connected);
 
         // Second session: instance B, same client_id, while A is online.
@@ -1279,14 +1279,14 @@ mod tests {
         .unwrap();
         let resp = recv_envelope(&mut ws_b).await;
         match resp {
-            AgentEnvelope::Error { message, .. } => {
+            RunnerEnvelope::Error { message, .. } => {
                 assert!(message.contains("already online"), "error was: {message}");
                 assert!(
                     message.contains("different instance"),
                     "error was: {message}"
                 );
             }
-            AgentEnvelope::Registered {
+            RunnerEnvelope::Registered {
                 success: false,
                 error,
                 ..
@@ -1298,17 +1298,17 @@ mod tests {
         }
 
         // The active instance is still A.
-        let view = registry.get_client_view("ws-dup").await.unwrap();
-        assert_eq!(view.agent_instance_id, "inst-a");
+        let view = registry.get_runner_view("ws-dup").await.unwrap();
+        assert_eq!(view.runner_instance_id, "inst-a");
         assert!(view.connected);
     }
 
     #[tokio::test]
     async fn ws_same_instance_reconnect_stays_accepted() {
-        // A reconnect from the same agent instance (same client_id + same
+        // A reconnect from the same Runner instance (same client_id + same
         // instance id) must be accepted as a refresh, not rejected as a
         // duplicate. This mirrors a WebSocket reconnect from the same process.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1324,7 +1324,7 @@ mod tests {
         let ack1 = recv_envelope(&mut ws1).await;
         assert!(matches!(
             ack1,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
         drop(ws1);
         wait_for_ws_client_connected(&registry, "ws-same", false).await;
@@ -1342,16 +1342,16 @@ mod tests {
         let ack2 = recv_envelope(&mut ws2).await;
         assert!(matches!(
             ack2,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
-        let view = registry.get_client_view("ws-same").await.unwrap();
-        assert_eq!(view.agent_instance_id, "inst-x");
+        let view = registry.get_runner_view("ws-same").await.unwrap();
+        assert_eq!(view.runner_instance_id, "inst-x");
         assert!(view.connected);
     }
 
     #[tokio::test]
     async fn ws_goodbye_releases_lease_for_new_instance() {
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1366,11 +1366,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             recv_envelope(&mut ws_a).await,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
 
         ws_a.send(TungsteniteMessage::Text(
-            AgentEnvelope::Goodbye {
+            RunnerEnvelope::Goodbye {
                 reason: Some("test shutdown".to_string()),
             }
             .to_json()
@@ -1380,7 +1380,7 @@ mod tests {
         .await
         .unwrap();
         wait_for_ws_client_connected(&registry, "ws-goodbye", false).await;
-        let offline = registry.get_client_view("ws-goodbye").await.unwrap();
+        let offline = registry.get_runner_view("ws-goodbye").await.unwrap();
         assert!(!offline.connected);
 
         let (mut ws_b, _resp) = connect_async(url).await.unwrap();
@@ -1394,10 +1394,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             recv_envelope(&mut ws_b).await,
-            AgentEnvelope::Registered { success: true, .. }
+            RunnerEnvelope::Registered { success: true, .. }
         ));
-        let view = registry.get_client_view("ws-goodbye").await.unwrap();
-        assert_eq!(view.agent_instance_id, "inst-b");
+        let view = registry.get_runner_view("ws-goodbye").await.unwrap();
+        assert_eq!(view.runner_instance_id, "inst-b");
         assert!(view.connected);
     }
 
@@ -1407,7 +1407,7 @@ mod tests {
         // (online). When A's socket finally tears down, its disconnect must NOT
         // remove B's notifier or mark B's jobs lost. B stays online and its
         // job is not marked lost.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1439,8 +1439,8 @@ mod tests {
         .await
         .unwrap();
         let _ = recv_envelope(&mut ws_b).await; // Registered
-        let view_b = registry.get_client_view("ws-stale-disc").await.unwrap();
-        assert_eq!(view_b.agent_instance_id, "inst-b");
+        let view_b = registry.get_runner_view("ws-stale-disc").await.unwrap();
+        assert_eq!(view_b.runner_instance_id, "inst-b");
         assert!(view_b.connected);
 
         // Start a job under B.
@@ -1470,12 +1470,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // B is still online and its job is NOT lost.
-        let view_b_after = registry.get_client_view("ws-stale-disc").await.unwrap();
+        let view_b_after = registry.get_runner_view("ws-stale-disc").await.unwrap();
         assert!(
             view_b_after.connected,
             "stale disconnect must not mark newer active instance offline"
         );
-        assert_eq!(view_b_after.agent_instance_id, "inst-b");
+        assert_eq!(view_b_after.runner_instance_id, "inst-b");
         let job_view = registry.get_job(&job.job_id).await.unwrap();
         assert_ne!(
             job_view.status, "lost",
@@ -1500,7 +1500,7 @@ mod tests {
         // second socket. We then age B out to the edge of the online window,
         // send a Ping from A's socket, and verify B's `last_seen` does not
         // advance (the touch is rejected). A Ping from B's socket does refresh.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1532,8 +1532,8 @@ mod tests {
         .await
         .unwrap();
         let _ = recv_envelope(&mut ws_b).await; // Registered
-        let view_b = registry.get_client_view("ws-stale-ping").await.unwrap();
-        assert_eq!(view_b.agent_instance_id, "inst-b");
+        let view_b = registry.get_runner_view("ws-stale-ping").await.unwrap();
+        assert_eq!(view_b.runner_instance_id, "inst-b");
         assert!(view_b.connected);
 
         // Snapshot B's last_seen right after registration.
@@ -1557,7 +1557,7 @@ mod tests {
         );
 
         let after_a = registry
-            .get_client_view("ws-stale-ping")
+            .get_runner_view("ws-stale-ping")
             .await
             .unwrap()
             .last_seen;
@@ -1568,14 +1568,14 @@ mod tests {
 
         // B sends a Ping and its liveness IS refreshed.
         ws_b.send(TungsteniteMessage::Text(
-            AgentEnvelope::Ping { ts: 2 }.to_json().unwrap().into(),
+            RunnerEnvelope::Ping { ts: 2 }.to_json().unwrap().into(),
         ))
         .await
         .unwrap();
         let _ = tokio::time::timeout(Duration::from_millis(500), recv_envelope(&mut ws_b)).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let after_b = registry
-            .get_client_view("ws-stale-ping")
+            .get_runner_view("ws-stale-ping")
             .await
             .unwrap()
             .last_seen;
@@ -1593,7 +1593,7 @@ mod tests {
         // only — A's pump is bound to the stale connection lease and the
         // connection-scoped poll rejects it, so A never receives the request
         // and the request is dispatched exactly once.
-        let registry = Arc::new(ShellClientRegistry::default());
+        let registry = Arc::new(RunnerRegistry::default());
         let addr = start_server(registry.clone()).await;
         let url = format!("ws://{}/api/agents/ws", addr);
 
@@ -1642,7 +1642,7 @@ mod tests {
             .await
             .unwrap();
         match req_env {
-            AgentEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
+            RunnerEnvelope::Request { request } => assert_eq!(request.request_id, request_id),
             other => panic!("expected request on B, got {:?}", other),
         }
 

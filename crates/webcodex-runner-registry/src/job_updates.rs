@@ -1,6 +1,5 @@
 use super::access_control::{
-    assert_runner_access as assert_shell_client_access,
-    job_visible_to_access as shell_job_visible_to_auth,
+    assert_runner_access, job_visible_to_access as shell_job_visible_to_auth,
 };
 use super::jobs::{
     append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
@@ -9,11 +8,11 @@ use super::jobs::{
 };
 use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
-    enqueue_pending_request_locked, next_request_id, notify_client_locked,
+    enqueue_pending_request_locked, next_request_id, notify_runner_locked,
     remove_pending_request_locked,
 };
 use super::state::{DetachedIdempotencyIntent, ShellJobRecord, ShellJobVisibility};
-use super::validation::{validate_agent_instance_id, validate_id, validate_run_request};
+use super::validation::{validate_id, validate_run_request, validate_runner_instance_id};
 use super::{
     now_ts, RunnerFeature, RunnerRegistry, DETACHED_IDEMPOTENCY_CONFLICT,
     DETACHED_IDEMPOTENCY_RECOVERY_PREFIX,
@@ -24,10 +23,10 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
 use uuid::Uuid;
-use webcodex_core::shell_protocol::{
+use webcodex_core::runner_protocol::{
     validate_process_argv, validate_script_request, validation_infrastructure_failure_code,
-    ShellAgentJobUpdateRequest, ShellAgentShellRequest, ShellCommandExecutionState,
-    ShellJobContext, ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
+    RunnerJobUpdateRequest, RunnerRequest, ShellCommandExecutionState, ShellJobContext,
+    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
     ShellJobValidationMetadata, ShellJobValidationStep, ShellProcessArgv, ShellRunRequest,
     ShellScriptPayload, DETACHED_IDEMPOTENCY_KEY_MAX_BYTES, PROCESS_CWD_MAX_BYTES,
     PROCESS_STDIN_MAX_BYTES, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
@@ -288,7 +287,7 @@ struct JobPublicMutationSignature {
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     command_execution_state: Option<ShellCommandExecutionState>,
-    validation_progress: Option<webcodex_core::shell_protocol::ShellJobValidationProgress>,
+    validation_progress: Option<webcodex_core::runner_protocol::ShellJobValidationProgress>,
     recovered_after_server_restart: bool,
     reconciled_at: Option<i64>,
 }
@@ -319,7 +318,7 @@ fn invalid_progress(code: &'static str) -> Result<(), ValidationProtocolError> {
 
 fn validate_validation_progress(
     job: &ShellJobRecord,
-    update: &ShellAgentJobUpdateRequest,
+    update: &RunnerJobUpdateRequest,
 ) -> Result<(), ValidationProtocolError> {
     if job.validation_steps.is_empty() {
         return if update.validation_progress.is_none() {
@@ -400,7 +399,7 @@ fn validate_validation_progress(
 
 fn validate_command_execution_state(
     job: &ShellJobRecord,
-    update: &ShellAgentJobUpdateRequest,
+    update: &RunnerJobUpdateRequest,
 ) -> Result<(), ValidationProtocolError> {
     let status = update.status.trim();
     let terminal = is_final_job_status(status);
@@ -819,7 +818,7 @@ impl RunnerRegistry {
             validation: validation.clone(),
             structured_execution: structured_metadata.clone(),
         };
-        let request = ShellAgentShellRequest {
+        let request = RunnerRequest {
             request_id: request_id.clone(),
             client_id: client_id.clone(),
             kind: request_kind.to_string(),
@@ -848,38 +847,38 @@ impl RunnerRegistry {
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
-        let Some(client) = inner.clients.get(&client_id) else {
+        let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
         if access.is_some() {
-            assert_shell_client_access(access, client)?;
+            assert_runner_access(access, runner)?;
         }
-        if !(client.runner_features.supports(RunnerFeature::AsyncJobs)
-            || client
+        if !(runner.runner_features.supports(RunnerFeature::AsyncJobs)
+            || runner
                 .runner_features
                 .supports(RunnerFeature::AsyncShellJobs))
         {
             return Err(format!(
-                "agent client {} does not support async shell jobs",
+                "runner {} does not support async shell jobs",
                 client_id
             ));
         }
         if structured_metadata.is_some()
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::StructuredExecutionJobs)
         {
             return Err(format!(
-                "capability_unavailable: agent client {client_id} does not support structured_execution_jobs"
+                "capability_unavailable: runner {client_id} does not support structured_execution_jobs"
             ));
         }
         if request.kind == "start_detached_process_job"
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::DetachedProcessJobs)
         {
             return Err(format!(
-                "capability_unavailable: agent client {client_id} does not support detached_process_jobs"
+                "capability_unavailable: runner {client_id} does not support detached_process_jobs"
             ));
         }
         if structured_metadata.is_some() && metadata.ssh_resource.is_some() {
@@ -889,20 +888,20 @@ impl RunnerRegistry {
             );
         }
         if metadata.ssh_resource.is_some()
-            && !client.runner_features.supports(RunnerFeature::SshShell)
+            && !runner.runner_features.supports(RunnerFeature::SshShell)
         {
             return Err(format!(
-                "agent_capability_unavailable: agent client {} does not support ssh_shell",
+                "agent_capability_unavailable: runner {} does not support ssh_shell",
                 client_id
             ));
         }
         if !validation_steps.is_empty()
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::StructuredValidationArgv)
         {
             return Err(format!(
-                "structured_validation_unavailable: agent client {} does not support structured argv validation jobs",
+                "structured_validation_unavailable: runner {} does not support structured argv validation jobs",
                 client_id
             ));
         }
@@ -910,47 +909,47 @@ impl RunnerRegistry {
             .as_ref()
             .and_then(|metadata| metadata.minimum_tests)
             .is_some()
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::StructuredCargoTestCountAssertion)
         {
             return Err(format!(
-                "structured_cargo_test_count_assertion_unavailable: agent client {} does not support durable Cargo test-count assertions",
+                "structured_cargo_test_count_assertion_unavailable: runner {} does not support durable Cargo test-count assertions",
                 client_id
             ));
         }
         if validation_steps
             .iter()
-            .any(webcodex_core::shell_protocol::ShellJobValidationStep::is_structured_go_test_json)
-            && !client
+            .any(webcodex_core::runner_protocol::ShellJobValidationStep::is_structured_go_test_json)
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::StructuredGoTestJson)
         {
             return Err(format!(
-                "structured_go_test_json_unavailable: agent client {} does not support machine-readable Go test validation",
+                "structured_go_test_json_unavailable: runner {} does not support machine-readable Go test validation",
                 client_id
             ));
         }
         if validation_steps.iter().any(|step| {
             step.is_structured_go_test_json() && step.args.as_slice() != ["test", "-json", "./..."]
-        }) && !client
+        }) && !runner
             .runner_features
             .supports(RunnerFeature::StructuredGoTestPackages)
         {
             return Err(format!(
-                "structured_go_test_packages_unavailable: agent client {} does not support focused Go package validation argv",
+                "structured_go_test_packages_unavailable: runner {} does not support focused Go package validation argv",
                 client_id
             ));
         }
         if validation
             .as_ref()
             .is_some_and(|metadata| metadata.tool == "go_test")
-            && !client
+            && !runner
                 .runner_features
                 .supports(RunnerFeature::StructuredGoTestTool)
         {
             return Err(format!(
-                "structured_go_test_tool_unavailable: agent client {} does not support the first-class go_test validation contract",
+                "structured_go_test_tool_unavailable: runner {} does not support the first-class go_test validation contract",
                 client_id
             ));
         }
@@ -961,8 +960,8 @@ impl RunnerRegistry {
         {
             return Err("project_unregister_in_progress".to_string());
         }
-        let agent_instance_id = client.agent_instance_id.clone();
-        let auth_group = client.auth_group.clone();
+        let runner_instance_id = runner.runner_instance_id.clone();
+        let auth_group = runner.auth_group.clone();
         if let Some(intent) = detached_intent.as_ref() {
             if let Some(existing) = inner.jobs_by_id.get(&job_id) {
                 if existing.kind != "run_detached_process" {
@@ -999,7 +998,7 @@ impl RunnerRegistry {
             request_id: Some(request_id.clone()),
             client_id: client_id.clone(),
             auth_group,
-            agent_instance_id,
+            runner_instance_id,
             kind: job_kind.to_string(),
             project_id: metadata.project_id,
             session_id: metadata.session_id,
@@ -1041,7 +1040,7 @@ impl RunnerRegistry {
         };
         inner.request_to_job.insert(request_id, job_id.clone());
         inner.jobs_by_id.insert(job_id.clone(), job);
-        notify_client_locked(&inner, &client_id);
+        notify_runner_locked(&inner, &client_id);
         Ok(job_view(
             inner.jobs_by_id.get(&job_id).expect("job just inserted"),
         ))
@@ -1219,7 +1218,7 @@ impl RunnerRegistry {
         ) && job.status != "stop_requested"
         {
             let stop_request_id = next_request_id();
-            let request = ShellAgentShellRequest {
+            let request = RunnerRequest {
                 request_id: stop_request_id.clone(),
                 client_id: job.client_id.clone(),
                 kind: "stop_job".to_string(),
@@ -1259,7 +1258,7 @@ impl RunnerRegistry {
             let record = inner.jobs_by_id.get_mut(job_id).expect("job exists");
             record.status = "stop_requested".to_string();
             record.error = Some("internal structured execution cleanup requested".to_string());
-            notify_client_locked(&inner, &job.client_id);
+            notify_runner_locked(&inner, &job.client_id);
         }
         Ok(false)
     }
@@ -1279,7 +1278,7 @@ impl RunnerRegistry {
         if let Some(request_id) = job.request_id {
             inner.request_to_job.remove(&request_id);
             inner.pending_by_id.remove(&request_id);
-            if let Some(queue) = inner.queues_by_client.get_mut(&job.client_id) {
+            if let Some(queue) = inner.queues_by_runner.get_mut(&job.client_id) {
                 queue.retain(|id| id != &request_id);
             }
         }
@@ -1309,7 +1308,7 @@ impl RunnerRegistry {
             return false;
         }
         let client_id = job.client_id.clone();
-        let agent_instance_id = job.agent_instance_id.clone();
+        let runner_instance_id = job.runner_instance_id.clone();
         // Preserve same-instance reconnect suppression whenever the exact
         // Runner lease is still current. If that lease disappeared or was
         // replaced after the terminal snapshot was already projected, do not
@@ -1317,15 +1316,15 @@ impl RunnerRegistry {
         // cannot consume the retired lease, while a later registration after
         // the Server forgot the lease is conservatively equivalent to fresh
         // recovery and may reconstruct retained Runner terminal evidence.
-        if let Some(client) = inner
-            .clients
+        if let Some(runner) = inner
+            .runners
             .get_mut(&client_id)
-            .filter(|client| client.agent_instance_id == agent_instance_id)
+            .filter(|runner| runner.runner_instance_id == runner_instance_id)
         {
             // The suppression store predates raw-shell/validation hidden
             // handoff, but its proof is only the exact
-            // client/instance/job/request tuple.
-            client.remember_projected_structured_terminal(
+            // runner/instance/job/request tuple.
+            runner.remember_projected_structured_terminal(
                 job_id.to_string(),
                 request_id.clone(),
                 now_ts(),
@@ -1338,7 +1337,7 @@ impl RunnerRegistry {
             .expect("projected hidden Job was checked under the registry lock");
         inner.request_to_job.remove(&request_id);
         inner.pending_by_id.remove(&request_id);
-        if let Some(queue) = inner.queues_by_client.get_mut(&removed.client_id) {
+        if let Some(queue) = inner.queues_by_runner.get_mut(&removed.client_id) {
             queue.retain(|id| id != &request_id);
         }
         true
@@ -1389,7 +1388,7 @@ impl RunnerRegistry {
             .collect()
     }
 
-    /// Complete caller-visible Agent Job set for aggregate observability.
+    /// Complete caller-visible Runner Job set for aggregate observability.
     /// Unlike the public list projection, this has no display pagination:
     /// runtime counts must not silently drop an older active Job behind newer
     /// records. Authorization and public-visibility filtering are identical
@@ -1426,8 +1425,8 @@ impl RunnerRegistry {
     }
 
     /// Count active jobs for one exact runtime project without applying the
-    /// display-list pagination limit. Local-only jobs do not carry an agent
-    /// runtime project id and are intentionally excluded.
+    /// display-list pagination limit. Jobs without a runtime project id are
+    /// intentionally excluded.
     pub async fn count_active_jobs_for_project(
         &self,
         auth: Option<&crate::RunnerAccess>,
@@ -1486,7 +1485,7 @@ impl RunnerRegistry {
         }
     }
 
-    pub async fn list_jobs_for_client(
+    pub async fn list_jobs_for_runner(
         &self,
         client_id: &str,
         status: Option<&str>,
@@ -1494,7 +1493,7 @@ impl RunnerRegistry {
     ) -> Result<Vec<ShellJobInfo>, String> {
         validate_id(client_id, "client_id")?;
         let mut inner = self.inner.lock().await;
-        if !inner.clients.contains_key(client_id) {
+        if !inner.runners.contains_key(client_id) {
             return Err(format!("unknown shell client: {}", client_id));
         }
         let job_ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
@@ -1742,7 +1741,7 @@ impl RunnerRegistry {
                 job.status = "stopped".to_string();
                 observe_job_terminal(job, terminal_now);
                 job.ended_at = Some(terminal_now);
-                job.error = Some("job stopped before agent picked it up".to_string());
+                job.error = Some("job stopped before Runner picked it up".to_string());
                 if job.structured_execution.is_some() {
                     job.command_execution_state = Some(ShellCommandExecutionState::NotStarted);
                 }
@@ -1752,7 +1751,7 @@ impl RunnerRegistry {
             "agent_queued" | "running" | "stop_requested" => {
                 let stop_request_id = next_request_id();
                 let client_id = job.client_id.clone();
-                let request = ShellAgentShellRequest {
+                let request = RunnerRequest {
                     request_id: stop_request_id.clone(),
                     client_id: client_id.clone(),
                     kind: "stop_job".to_string(),
@@ -1793,8 +1792,8 @@ impl RunnerRegistry {
                 job.status = "stop_requested".to_string();
                 job.error = Some("stop requested".to_string());
                 notify_job_update(job);
-                let notify_client_id = job.client_id.clone();
-                notify_client_locked(&inner, &notify_client_id);
+                let notify_runner_id = job.client_id.clone();
+                notify_runner_locked(&inner, &notify_runner_id);
                 Ok(job_view(inner.jobs_by_id.get(job_id).expect("job exists")))
             }
             "recovering" => Err(
@@ -1808,10 +1807,7 @@ impl RunnerRegistry {
     /// Polling-transport job update entry point. Job ownership and update
     /// sequence rules decide acceptance; this path refreshes `last_seen` for
     /// the active instance. Used by the HTTP `/job_update` handler.
-    pub async fn update_job(
-        &self,
-        body: ShellAgentJobUpdateRequest,
-    ) -> Result<ShellJobInfo, String> {
+    pub async fn update_job(&self, body: RunnerJobUpdateRequest) -> Result<ShellJobInfo, String> {
         self.update_job_checked(body, None).await
     }
 
@@ -1823,7 +1819,7 @@ impl RunnerRegistry {
     /// however, must not refresh the new connection's `last_seen` liveness.
     pub async fn update_job_for_connection(
         &self,
-        body: ShellAgentJobUpdateRequest,
+        body: RunnerJobUpdateRequest,
         connection_id: &str,
     ) -> Result<ShellJobInfo, String> {
         self.update_job_checked(body, Some(connection_id)).await
@@ -1831,12 +1827,12 @@ impl RunnerRegistry {
 
     async fn update_job_checked(
         &self,
-        body: ShellAgentJobUpdateRequest,
+        body: RunnerJobUpdateRequest,
         expected_connection_id: Option<&str>,
     ) -> Result<ShellJobInfo, String> {
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.job_id, "job_id")?;
-        validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_runner_instance_id(&body.runner_instance_id)?;
         if let Some(snapshot) = body.log_snapshot.as_ref() {
             validate_stream_snapshot(&snapshot.stdout, "job update stdout snapshot")?;
             validate_stream_snapshot(&snapshot.stderr, "job update stderr snapshot")?;
@@ -1854,9 +1850,9 @@ impl RunnerRegistry {
         let mut inner = self.inner.lock().await;
         // Reject job updates from a stale/replaced instance before refreshing
         // liveness or mutating job state.
-        assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
-        let sequenced = inner.clients.get(&body.client_id).is_some_and(|client| {
-            client
+        assert_active_instance_locked(&inner, &body.client_id, &body.runner_instance_id)?;
+        let sequenced = inner.runners.get(&body.client_id).is_some_and(|runner| {
+            runner
                 .runner_features
                 .supports(RunnerFeature::JobStateReconciliation)
         });
@@ -1923,12 +1919,12 @@ impl RunnerRegistry {
         // connection appear online.
         if expected_connection_id.is_none()
             || inner
-                .clients
+                .runners
                 .get(&body.client_id)
-                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+                .is_some_and(|runner| runner.connection_id.as_deref() == expected_connection_id)
         {
-            if let Some(client) = inner.clients.get_mut(&body.client_id) {
-                client.last_seen = now_ts();
+            if let Some(runner) = inner.runners.get_mut(&body.client_id) {
+                runner.last_seen = now_ts();
             }
         }
         let mut request_id_to_remove = None;
@@ -1940,7 +1936,7 @@ impl RunnerRegistry {
             if job.client_id != body.client_id {
                 return Err("job_id does not belong to client_id".to_string());
             }
-            if job.agent_instance_id != body.agent_instance_id {
+            if job.runner_instance_id != body.runner_instance_id {
                 return Err("job_id belongs to a replaced runner instance".to_string());
             }
             if body

@@ -3,7 +3,7 @@ use super::jobs::{
     truncate_output, truncate_output_to,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
-use super::validation::{validate_agent_instance_id, validate_id};
+use super::validation::{validate_id, validate_runner_instance_id};
 use super::{now_ts, RunnerFeature, RunnerRegistry};
 use webcodex_core::coding_agent::{
     validate_response_for_request as validate_coding_agent_response, CodingAgentDispatchState,
@@ -12,9 +12,9 @@ use webcodex_core::coding_agent::{
 use webcodex_core::mcp_gateway::{
     validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayResponse,
 };
-use webcodex_core::shell_protocol::{
-    ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
-    ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
+use webcodex_core::runner_protocol::{
+    RunnerPersistentShellResultRequest, RunnerPollRequest, RunnerRequest, RunnerResultPayload,
+    ShellCommandExecutionState, ShellRunResponse,
 };
 
 impl RunnerRegistry {
@@ -24,10 +24,7 @@ impl RunnerRegistry {
     /// this path; long-lived transports (WebSocket/QUIC) use
     /// [`RunnerRegistry::poll_for_connection`] instead so an older
     /// same-instance connection cannot steal requests from the current lease.
-    pub async fn poll(
-        &self,
-        body: ShellAgentPollRequest,
-    ) -> Result<Option<ShellAgentShellRequest>, String> {
+    pub async fn poll(&self, body: RunnerPollRequest) -> Result<Option<RunnerRequest>, String> {
         self.poll_checked(body, None).await
     }
 
@@ -38,9 +35,9 @@ impl RunnerRegistry {
     /// the new connection.
     pub async fn poll_for_connection(
         &self,
-        body: ShellAgentPollRequest,
+        body: RunnerPollRequest,
         connection_id: &str,
-    ) -> Result<Option<ShellAgentShellRequest>, String> {
+    ) -> Result<Option<RunnerRequest>, String> {
         self.poll_checked(body, Some(connection_id)).await
     }
 
@@ -53,35 +50,35 @@ impl RunnerRegistry {
     /// no `dispatched=true`, and no job-state change.
     async fn poll_checked(
         &self,
-        body: ShellAgentPollRequest,
+        body: RunnerPollRequest,
         expected_connection_id: Option<&str>,
-    ) -> Result<Option<ShellAgentShellRequest>, String> {
+    ) -> Result<Option<RunnerRequest>, String> {
         validate_id(&body.client_id, "client_id")?;
-        validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_runner_instance_id(&body.runner_instance_id)?;
         let mut inner = self.inner.lock().await;
         {
-            let Some(client) = inner.clients.get_mut(&body.client_id) else {
+            let Some(runner) = inner.runners.get_mut(&body.client_id) else {
                 return Err(format!("unknown shell client: {}", body.client_id));
             };
-            if client.agent_instance_id != body.agent_instance_id {
+            if runner.runner_instance_id != body.runner_instance_id {
                 return Err(format!(
-                    "agent client {} is no longer the active instance (stale or replaced)",
+                    "runner {} is no longer the active instance (stale or replaced)",
                     body.client_id
                 ));
             }
             if let Some(expected) = expected_connection_id {
-                if client.connection_id.as_deref() != Some(expected) {
+                if runner.connection_id.as_deref() != Some(expected) {
                     return Err(format!(
-                        "agent client {} transport connection is no longer active",
+                        "runner {} transport connection is no longer active",
                         body.client_id
                     ));
                 }
             }
-            client.last_seen = now_ts();
+            runner.last_seen = now_ts();
         }
         loop {
             let request_id = {
-                let Some(queue) = inner.queues_by_client.get_mut(&body.client_id) else {
+                let Some(queue) = inner.queues_by_runner.get_mut(&body.client_id) else {
                     return Ok(None);
                 };
                 queue.pop_front()
@@ -93,7 +90,7 @@ impl RunnerRegistry {
                 inner.pending_by_id.get(&request_id).and_then(|pending| {
                     match (
                         pending.request.mcp_gateway.as_ref(),
-                        pending.expected_mcp_gateway_agent_instance_id.as_deref(),
+                        pending.expected_mcp_gateway_runner_instance_id.as_deref(),
                         pending.expected_mcp_gateway_provider_id.as_deref(),
                         pending.expected_mcp_gateway_provider_instance_id.as_deref(),
                     ) {
@@ -112,21 +109,21 @@ impl RunnerRegistry {
                                     .to_string(),
                             ));
                             }
-                            let Some(client) = inner.clients.get(&body.client_id) else {
+                            let Some(runner) = inner.runners.get(&body.client_id) else {
                                 return Some((
                                     "stale_runner",
                                     "stale_mcp_gateway: target Runner disappeared before dispatch"
                                         .to_string(),
                                 ));
                             };
-                            if client.agent_instance_id != expected_runner {
+                            if runner.runner_instance_id != expected_runner {
                                 return Some((
                                     "stale_runner",
                                     "stale_mcp_gateway: target Runner changed before dispatch"
                                         .to_string(),
                                 ));
                             }
-                            let provider_is_current = client
+                            let provider_is_current = runner
                                 .policy
                                 .as_ref()
                                 .and_then(|policy| policy.mcp_gateway_providers.as_ref())
@@ -190,13 +187,13 @@ impl RunnerRegistry {
                 inner.pending_by_id.get(&request_id).and_then(|pending| {
                     match (pending.request.kind.as_str(), pending.skill_store_fence.as_ref()) {
                         ("skill_store", Some(fence)) => {
-                            let Some(client) = inner.clients.get(&body.client_id) else {
+                            let Some(runner) = inner.runners.get(&body.client_id) else {
                                 return Some(
                                     "stale_runner: Skill store target Runner disappeared before dispatch"
                                         .to_string(),
                                 );
                             };
-                            if client.agent_instance_id != fence.agent_instance_id {
+                            if runner.runner_instance_id != fence.runner_instance_id {
                                 return Some(
                                     "stale_runner: Skill store target Runner changed before dispatch"
                                         .to_string(),
@@ -207,7 +204,7 @@ impl RunnerRegistry {
                             } else {
                                 RunnerFeature::SkillStoreRead
                             };
-                            (!client.runner_features.supports(required)).then(|| {
+                            (!runner.runner_features.supports(required)).then(|| {
                                 format!(
                                     "skill_store_capability_unavailable: exact Runner no longer advertises {} before dispatch",
                                     required.as_wire_name()
@@ -259,19 +256,19 @@ impl RunnerRegistry {
                             "CodingAgentRun exact dispatch fence is missing".to_string(),
                         ));
                     };
-                    let Some(client) = inner.clients.get(&body.client_id) else {
+                    let Some(runner) = inner.runners.get(&body.client_id) else {
                         return Some((
                             "stale_runner",
                             "CodingAgentRun target Runner disappeared before dispatch".to_string(),
                         ));
                     };
-                    if client.agent_instance_id != fence.agent_instance_id {
+                    if runner.runner_instance_id != fence.runner_instance_id {
                         return Some((
                             "stale_runner",
                             "CodingAgentRun target Runner changed before dispatch".to_string(),
                         ));
                     }
-                    if !client.coding_agent_providers.iter().any(|provider| {
+                    if !runner.coding_agent_providers.iter().any(|provider| {
                         provider.provider_id == fence.provider_id
                             && provider.provider_instance_id == fence.provider_instance_id
                     }) {
@@ -304,20 +301,20 @@ impl RunnerRegistry {
                     pending.expected_project_id.as_deref(),
                     pending.expected_project_cwd.as_deref(),
                 ) {
-                    (Some(project_id), Some(project_cwd)) => match inner.clients.get(&body.client_id) {
-                        Some(client) if client.owner != pending.expected_client_owner => Some(
+                    (Some(project_id), Some(project_cwd)) => match inner.runners.get(&body.client_id) {
+                        Some(runner) if runner.owner != pending.expected_runner_owner => Some(
                             "stale_authority: target Runner owner changed before dispatch".to_string(),
                         ),
-                        Some(client)
-                            if !client.runner_features.supports(RunnerFeature::FileWrite) =>
+                        Some(runner)
+                            if !runner.runner_features.supports(RunnerFeature::FileWrite) =>
                         {
                             Some(
                             "stale_authority: target Runner no longer advertises file_write before dispatch"
                                 .to_string(),
                             )
                         }
-                        Some(client)
-                            if client.projects.iter().any(|project| {
+                        Some(runner)
+                            if runner.projects.iter().any(|project| {
                                 !project.disabled
                                     && project.id == project_id
                                     && project.path == project_cwd
@@ -388,10 +385,7 @@ impl RunnerRegistry {
     /// Polling-transport result entry point. Requires the public
     /// `client_id` / `agent_instance_id` lease and refreshes `last_seen` for
     /// the active instance. Used by the HTTP `/result` handler.
-    pub async fn complete(
-        &self,
-        payload: impl Into<ShellAgentResultPayload>,
-    ) -> Result<(), String> {
+    pub async fn complete(&self, payload: impl Into<RunnerResultPayload>) -> Result<(), String> {
         self.complete_checked(payload.into(), None).await
     }
 
@@ -399,12 +393,12 @@ impl RunnerRegistry {
     /// late, legitimately-dispatched result arriving on a stale
     /// same-instance connection (the request was polled before the
     /// transport reconnect) is still accepted — it belongs to the same
-    /// agent instance and is gated by request/job ownership — but it must
+    /// Runner instance and is gated by request/job ownership — but it must
     /// not refresh the new connection's `last_seen` liveness. Only the
     /// connection that currently holds the lease refreshes liveness.
     pub async fn complete_for_connection(
         &self,
-        payload: ShellAgentResultPayload,
+        payload: RunnerResultPayload,
         connection_id: &str,
     ) -> Result<(), String> {
         self.complete_checked(payload, Some(connection_id)).await
@@ -412,30 +406,30 @@ impl RunnerRegistry {
 
     async fn complete_checked(
         &self,
-        payload: ShellAgentResultPayload,
+        payload: RunnerResultPayload,
         expected_connection_id: Option<&str>,
     ) -> Result<(), String> {
         let body = &payload.result;
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.request_id, "request_id")?;
-        validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_runner_instance_id(&body.runner_instance_id)?;
         let mut inner = self.inner.lock().await;
         // Reject results from a stale/replaced instance before refreshing
         // liveness: a dead process must not update the active lease's
         // `last_seen` or resolve its waiters.
-        assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
+        assert_active_instance_locked(&inner, &body.client_id, &body.runner_instance_id)?;
         // Refresh liveness only for the connection that currently holds the
         // transport lease. A late result on a stale same-instance connection
         // is still processed below, but it must not make the new connection
         // appear online.
         if expected_connection_id.is_none()
             || inner
-                .clients
+                .runners
                 .get(&body.client_id)
-                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+                .is_some_and(|runner| runner.connection_id.as_deref() == expected_connection_id)
         {
-            if let Some(client) = inner.clients.get_mut(&body.client_id) {
-                client.last_seen = now_ts();
+            if let Some(runner) = inner.runners.get_mut(&body.client_id) {
+                runner.last_seen = now_ts();
             }
         }
         let Some(pending) = inner.pending_by_id.get(&body.request_id) else {
@@ -456,7 +450,7 @@ impl RunnerRegistry {
         self.telemetry
             .runner_result_accepted(&body.request_id, &payload);
         let trace_request_id = body.request_id.clone();
-        let ShellAgentResultPayload {
+        let RunnerResultPayload {
             result: body,
             command_execution_state,
             mcp_gateway,
@@ -614,14 +608,14 @@ impl RunnerRegistry {
 
     pub async fn complete_persistent_shell(
         &self,
-        body: ShellAgentPersistentShellResultRequest,
+        body: RunnerPersistentShellResultRequest,
     ) -> Result<(), String> {
         self.complete_persistent_shell_checked(body, None).await
     }
 
     pub async fn complete_persistent_shell_for_connection(
         &self,
-        body: ShellAgentPersistentShellResultRequest,
+        body: RunnerPersistentShellResultRequest,
         connection_id: &str,
     ) -> Result<(), String> {
         self.complete_persistent_shell_checked(body, Some(connection_id))
@@ -630,23 +624,23 @@ impl RunnerRegistry {
 
     async fn complete_persistent_shell_checked(
         &self,
-        mut body: ShellAgentPersistentShellResultRequest,
+        mut body: RunnerPersistentShellResultRequest,
         expected_connection_id: Option<&str>,
     ) -> Result<(), String> {
         validate_id(&body.client_id, "client_id")?;
         validate_id(&body.request_id, "request_id")?;
-        validate_agent_instance_id(&body.agent_instance_id)?;
+        validate_runner_instance_id(&body.runner_instance_id)?;
         normalize_persistent_shell_result(&mut body.result)?;
         let mut inner = self.inner.lock().await;
-        assert_active_instance_locked(&inner, &body.client_id, &body.agent_instance_id)?;
+        assert_active_instance_locked(&inner, &body.client_id, &body.runner_instance_id)?;
         if expected_connection_id.is_none()
             || inner
-                .clients
+                .runners
                 .get(&body.client_id)
-                .is_some_and(|client| client.connection_id.as_deref() == expected_connection_id)
+                .is_some_and(|runner| runner.connection_id.as_deref() == expected_connection_id)
         {
-            if let Some(client) = inner.clients.get_mut(&body.client_id) {
-                client.last_seen = now_ts();
+            if let Some(runner) = inner.runners.get_mut(&body.client_id) {
+                runner.last_seen = now_ts();
             }
         }
         let Some(pending) = inner.pending_by_id.get(&body.request_id) else {
@@ -680,7 +674,7 @@ impl RunnerRegistry {
 }
 
 fn normalize_persistent_shell_result(
-    result: &mut webcodex_core::shell_protocol::PersistentShellResult,
+    result: &mut webcodex_core::runner_protocol::PersistentShellResult,
 ) -> Result<(), String> {
     validate_id(&result.shell_id, "shell_id")?;
     validate_id(&result.workflow_session_id, "workflow_session_id")?;
@@ -734,7 +728,7 @@ fn truncate_persistent_shell_stream(value: &mut String) -> bool {
     true
 }
 
-fn is_large_native_image_request(request: &ShellAgentShellRequest) -> bool {
+fn is_large_native_image_request(request: &RunnerRequest) -> bool {
     if matches!(
         request.kind.as_str(),
         "computer_snapshot" | "computer_snapshot_display"

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn registration_retains_reported_job_concurrency_and_preserves_missing_limit() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     for limit in [1, 4, 8, 64] {
         let client_id = format!("current-limit-{limit}");
         let instance_id = format!("inst-current-{limit}");
@@ -12,7 +12,7 @@ async fn registration_retains_reported_job_concurrency_and_preserves_missing_lim
         assert_eq!(current_view.job_concurrency_limit, Some(limit));
         assert_eq!(
             registry
-                .get_client_view(&client_id)
+                .get_runner_view(&client_id)
                 .await
                 .unwrap()
                 .job_concurrency_limit,
@@ -42,9 +42,9 @@ async fn registration_retains_reported_job_concurrency_and_preserves_missing_lim
 
 #[tokio::test]
 async fn registry_registers_and_lists_client() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(ShellClientRegisterRequest {
+        .register(current_runner_registration(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -52,22 +52,22 @@ async fn registry_registers_and_lists_client() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "xrh".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: Some("XRH".to_string()),
             owner: Some("yyjeqhc".to_string()),
             hostname: Some("fineserver".to_string()),
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
             policy: None,
         }))
         .await
         .unwrap();
-    let clients = registry.list_clients().await;
-    assert_eq!(clients.len(), 1);
-    assert_eq!(clients[0].client_id, "xrh");
-    assert!(clients[0].connected);
-    assert_eq!(clients[0].pending_requests, 0);
+    let runners = registry.list_runners().await;
+    assert_eq!(runners.len(), 1);
+    assert_eq!(runners[0].client_id, "xrh");
+    assert!(runners[0].connected);
+    assert_eq!(runners[0].pending_requests, 0);
 }

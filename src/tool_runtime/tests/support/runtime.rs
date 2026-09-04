@@ -1,5 +1,5 @@
 use crate::projects::ProjectConfig;
-use crate::shell_client::ShellClientRegistry;
+use crate::runner_http::RunnerRegistry;
 use crate::tool_runtime::{RuntimeInfo, ToolRuntime, ToolSpec};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -140,6 +140,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "id" => json!("private-drop"),
         "base_commit" => json!("a".repeat(40)),
         "head_commit" => json!("b".repeat(40)),
+        "expected_head" => json!("a".repeat(40)),
         "expected_revision" => json!(format!("sha256:{}", "a".repeat(64))),
         "name" => json!("Private Drop"),
         "kind" => json!("note"),
@@ -302,11 +303,11 @@ pub(in crate::tool_runtime::tests) fn runtime_with_project(
 ) -> ToolRuntime {
     let _ = (root, project_id);
     ToolRuntime::new(
-        Arc::new(ShellClientRegistry::default()),
+        Arc::new(RunnerRegistry::default()),
         Arc::new(RuntimeInfo::default()),
     )
 }
 
 pub(in crate::tool_runtime::tests) fn runtime_with_info(info: RuntimeInfo) -> ToolRuntime {
-    ToolRuntime::new(Arc::new(ShellClientRegistry::default()), Arc::new(info))
+    ToolRuntime::new(Arc::new(RunnerRegistry::default()), Arc::new(info))
 }

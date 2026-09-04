@@ -12,7 +12,7 @@ pub struct Config {
     pub oauth2: OAuth2Config,
 }
 
-/// Server-side QUIC agent transport configuration. Sourced from
+/// Server-side QUIC Runner transport configuration. Sourced from
 /// `WEBCODEX_QUIC_*` env vars, mirroring the project's env-var config pattern.
 /// Kept as a standalone struct (not embedded in [`Config`]) so existing
 /// `Config { ... }` test literals and constructors are untouched. The listener
@@ -59,7 +59,7 @@ impl QuicServerConfig {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             alpn: std::env::var("WEBCODEX_QUIC_ALPN")
-                .unwrap_or_else(|_| crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string()),
+                .unwrap_or_else(|_| crate::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string()),
         }
     }
 
@@ -171,7 +171,7 @@ impl Default for QuicServerConfig {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
-            alpn: crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string(),
+            alpn: crate::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string(),
         }
     }
 }

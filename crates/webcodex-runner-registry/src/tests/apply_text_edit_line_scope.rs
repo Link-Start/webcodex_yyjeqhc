@@ -41,7 +41,7 @@ fn line_scope_request(client_id: &str, occurrence: Option<usize>) -> ShellFileOp
 }
 
 async fn register_line_scope_instance(
-    registry: &ShellClientRegistry,
+    registry: &RunnerRegistry,
     client_id: &str,
     line_scope: bool,
 ) {
@@ -49,7 +49,7 @@ async fn register_line_scope_instance(
         registry,
         client_id,
         "inst",
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             apply_text_edit_line_scope: line_scope,
             apply_text_edit_occurrence: true,
@@ -62,7 +62,7 @@ async fn register_line_scope_instance(
 
 #[tokio::test]
 async fn enqueue_scoped_apply_text_edits_requires_explicit_line_scope_capability() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "scope-off", false).await;
 
     let error = registry
@@ -76,9 +76,9 @@ async fn enqueue_scoped_apply_text_edits_requires_explicit_line_scope_capability
     assert!(error.contains("capability_unavailable"));
     assert!(error.contains("apply_text_edit_line_scope"));
     assert!(registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "scope-off".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -114,7 +114,7 @@ fn enqueue_scoped_occurrence_requires_both_capabilities_before_admission() {
 
 #[tokio::test]
 async fn generic_file_enqueue_rejects_scoped_edit_without_line_scope_capability() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "generic-scope-off", false).await;
 
     let error = registry
@@ -127,9 +127,9 @@ async fn generic_file_enqueue_rejects_scoped_edit_without_line_scope_capability(
     assert!(error.contains("capability_unavailable"));
     assert!(error.contains("apply_text_edit_line_scope"));
     assert!(registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "generic-scope-off".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -138,7 +138,7 @@ async fn generic_file_enqueue_rejects_scoped_edit_without_line_scope_capability(
 
 #[tokio::test]
 async fn generic_file_enqueue_preserves_unscoped_edit_without_line_scope_capability() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "generic-unscoped", false).await;
 
     let mut request = line_scope_request("generic-unscoped", None);
@@ -155,9 +155,9 @@ async fn generic_file_enqueue_preserves_unscoped_edit_without_line_scope_capabil
         .await
         .unwrap();
     let queued = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "generic-unscoped".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -168,7 +168,7 @@ async fn generic_file_enqueue_preserves_unscoped_edit_without_line_scope_capabil
 
 #[tokio::test]
 async fn generic_file_enqueue_treats_null_optional_fences_as_absent() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "generic-null-fences", false).await;
 
     let mut request = line_scope_request("generic-null-fences", None);
@@ -184,9 +184,9 @@ async fn generic_file_enqueue_treats_null_optional_fences_as_absent() {
         .await
         .unwrap();
     let queued = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "generic-null-fences".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -197,7 +197,7 @@ async fn generic_file_enqueue_treats_null_optional_fences_as_absent() {
 
 #[tokio::test]
 async fn generic_file_enqueue_scoped_edit_uses_capability_fenced_path() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "generic-scope-on", true).await;
 
     let (request_id, _rx) = registry
@@ -208,9 +208,9 @@ async fn generic_file_enqueue_scoped_edit_uses_capability_fenced_path() {
         .await
         .unwrap();
     let request = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "generic-scope-on".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -228,7 +228,7 @@ async fn generic_file_enqueue_scoped_edit_uses_capability_fenced_path() {
 
 #[tokio::test]
 async fn enqueue_scoped_apply_text_edits_preserves_scope_and_global_occurrence_payload() {
-    let registry = ShellClientRegistry::default();
+    let registry = RunnerRegistry::default();
     register_line_scope_instance(&registry, "scope-on", true).await;
     let (request_id, _rx) = registry
         .enqueue_apply_text_edits_with_line_scope(
@@ -239,9 +239,9 @@ async fn enqueue_scoped_apply_text_edits_preserves_scope_and_global_occurrence_p
         .await
         .unwrap();
     let request = registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "scope-on".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -257,11 +257,11 @@ async fn enqueue_scoped_apply_text_edits_preserves_scope_and_global_occurrence_p
 
 #[test]
 fn apply_text_edit_line_scope_missing_capability_defaults_false_and_is_omitted() {
-    let legacy: ShellClientCapabilities = serde_json::from_str(
+    let legacy: RunnerCapabilities = serde_json::from_str(
         r#"{"shell":true,"file_read":true,"file_write":true,"apply_text_edit_occurrence":true}"#,
     )
     .unwrap();
     assert!(!legacy.apply_text_edit_line_scope);
-    let serialized = serde_json::to_value(ShellClientCapabilities::default()).unwrap();
+    let serialized = serde_json::to_value(RunnerCapabilities::default()).unwrap();
     assert!(serialized.get("apply_text_edit_line_scope").is_none());
 }
