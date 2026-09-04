@@ -1,8 +1,15 @@
 //! Protocol-neutral Workflow Session domain model, ledger/store, collaboration, and deterministic projections.
 
 mod assignment;
+mod closeout;
 mod console;
+mod continuation;
+#[cfg(test)]
+mod continuation_tests;
 mod events;
+mod handoff_brief;
+#[cfg(test)]
+mod handoff_brief_tests;
 mod messages;
 mod model;
 mod persistence;
@@ -16,11 +23,23 @@ mod assignment_tests;
 mod collaboration_tests;
 #[cfg(test)]
 mod message_mutation_tests;
+#[cfg(test)]
+mod session_context_tests;
+#[cfg(test)]
+mod session_lifecycle_tests;
+#[cfg(test)]
+mod session_store_tests;
 
+pub use closeout::closeout_work_projection;
 pub use console::{
     aggregate_console_list, ConsoleValidationHooks, WorkflowSessionConsoleAggregate,
     WorkflowSessionConsoleAttentionOverview, WorkflowSessionConsoleDetail,
     WorkflowSessionConsoleList, WorkflowSessionConsoleListItem,
+};
+pub use continuation::{
+    continuation_feedback_value, not_applicable_continuation_feedback_value,
+    validation_delta_value, ContinuationFeedbackInput, ContinuationProjectionHooks,
+    ContinuationValidationSnapshot, EXPLORATION_CONTINUITY_ACTION,
 };
 pub use events::{
     canonical_tool_call_finished_events, current_attempt_event_view, exploration_tool_kind,
@@ -31,6 +50,11 @@ pub use events::{
     validate_model_facing_result_expectation,
     validation_output_summary_for_tool_result as execution_output_summary_for_tool_result,
     ExplorationToolKind, SessionPathHint, SessionToolContract, EXPLORATION_TOOL_NAMES,
+};
+pub use handoff_brief::{
+    build_handoff_brief, handoff_brief_size, HandoffBriefInput, HANDOFF_BRIEF_HARD_MAX_BYTES,
+    HANDOFF_CHANGED_PATHS_MAX_ITEMS, HANDOFF_INSTRUCTION_MAX_CHARS, HANDOFF_NEXT_ACTIONS_MAX_ITEMS,
+    HANDOFF_OPEN_FAILURES_MAX_ITEMS, HANDOFF_RECENT_FILES_MAX_ITEMS,
 };
 pub use model::{
     CodingSessionError, CodingSessionRequest, CompleteSessionMessageInput,
