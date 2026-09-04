@@ -1469,6 +1469,19 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
         (ModelSurface::AdaptiveRuntime, "run_process", "direct", None),
         (
             ModelSurface::AdaptiveRuntime,
+            "session_discussion_summary",
+            "direct",
+            None,
+        ),
+        (ModelSurface::AdaptiveRuntime, "list_jobs", "direct", None),
+        (
+            ModelSurface::AdaptiveRuntime,
+            "git_diff_hunks",
+            "direct",
+            None,
+        ),
+        (
+            ModelSurface::AdaptiveRuntime,
             "run_script",
             "gateway",
             Some("call_runtime_tool"),
