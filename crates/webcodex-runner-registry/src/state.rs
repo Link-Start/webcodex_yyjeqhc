@@ -11,7 +11,7 @@ use webcodex_core::coding_agent::{
 use webcodex_core::mcp_gateway::McpGatewayResponse;
 use webcodex_core::runner_protocol::{
     PersistentShellResult, RunnerBuildInfo, RunnerHostContext, RunnerPolicySummary,
-    RunnerProjectSummary, RunnerRequest, RunnerView, ShellCommandExecutionState,
+    RunnerProjectSummary, RunnerRequest, RunnerView, ShellCommandExecutionState, ShellJobActivity,
     ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobValidationProgress,
     ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
     JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
@@ -307,6 +307,9 @@ pub(super) struct ShellJobRecord {
     pub(super) validation_steps: Vec<String>,
     pub(super) validation: Option<webcodex_core::runner_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
+    /// Last Runner-authoritative bounded activity for an active Job. Cleared on
+    /// terminal/recovery transitions; never used as execution authority.
+    pub(super) activity: Option<ShellJobActivity>,
     pub(super) visibility: ShellJobVisibility,
     pub(super) last_update_seq: u64,
     pub(super) recovery_state: Option<String>,

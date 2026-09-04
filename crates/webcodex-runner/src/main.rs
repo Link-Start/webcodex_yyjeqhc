@@ -27,7 +27,8 @@ use runner_protocol::{
     validation_infrastructure_failure_code, RunnerCapabilities, RunnerJobUpdateRequest,
     RunnerPolicySummary, RunnerPollPayload, RunnerPollRequest, RunnerPollResponse,
     RunnerProjectSummary, RunnerRegisterRequest, RunnerRegisterResponse, RunnerRequest,
-    ShellCommandExecutionState, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
+    ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
+    ShellJobActivityState, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
     ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress, ShellJobValidationStep,
     ShellProfileSummaryEntry, ShellProfilesSummary, ShellProjectInventoryPage,
     ShellProjectInventoryStatus, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
@@ -90,8 +91,9 @@ const RUNNER_POLL_PATH: &str = "/api/shell/agent/poll";
 /// finite bound.
 const RUNNER_HTTP_RESPONSE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// At most the validated Job state machine's semantic transitions are retained
-/// for live delivery. Output-only updates are coalesced separately below.
+/// At most the validated Job state machine's required semantic transitions are
+/// retained for live delivery. Output and advisory current-activity-only
+/// updates are coalesced separately below.
 const JOB_UPDATE_REQUIRED_PENDING_MAX: usize = 8;
 const JOB_UPDATE_DELIVERY_RETRY: Duration = Duration::from_millis(JOB_UPDATE_INTERVAL_MS);
 
@@ -315,6 +317,7 @@ struct PendingJobUpdateDelivery {
     error: Option<String>,
     command_execution_state: Option<ShellCommandExecutionState>,
     validation_progress: Option<ShellJobValidationProgress>,
+    activity: Option<ShellJobActivity>,
     finished: bool,
 }
 
@@ -328,6 +331,7 @@ impl PendingJobUpdateDelivery {
             error: update.error.clone(),
             command_execution_state: update.command_execution_state.clone(),
             validation_progress: update.validation_progress.clone(),
+            activity: update.activity,
             finished: update.finished,
         }
     }
@@ -424,6 +428,7 @@ fn job_update_from_delivery(
     update.error = pending.error.clone();
     update.command_execution_state = pending.command_execution_state.clone();
     update.validation_progress = pending.validation_progress.clone();
+    update.activity = pending.activity;
     update.finished = pending.finished;
     update
 }
@@ -544,6 +549,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        activity: None,
     }
 }
 
@@ -2673,7 +2679,80 @@ struct RunnerJobDelta {
     command_execution_state: Option<ShellCommandExecutionState>,
     stream_limit_bytes: Option<usize>,
     validation_progress: Option<ShellJobValidationProgress>,
+    activity: Option<ShellJobActivity>,
     finished: bool,
+}
+
+fn process_running_activity() -> ShellJobActivity {
+    ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::ProcessRunning,
+        source: ShellJobActivitySource::RunnerExecution,
+    }
+}
+
+fn validation_step_activity(step: &ShellJobValidationStep) -> ShellJobActivity {
+    let phase = match step.name.as_str() {
+        "format" => ShellJobActivityPhase::ValidationFormat,
+        "check" => ShellJobActivityPhase::ValidationCheck,
+        "test" => ShellJobActivityPhase::ValidationTest,
+        _ => unreachable!("canonical validation step name"),
+    };
+    ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase,
+        source: ShellJobActivitySource::ValidationPlan,
+    }
+}
+
+/// Recognize only a tiny bounded subset of Cargo's own stderr progress while a
+/// canonical structured Cargo validation step is running. Clear phase-boundary
+/// lines return to the step's canonical validation-plan activity so transient
+/// Cargo detail cannot remain sticky after that detail has ended. This is
+/// advisory activity provenance, not validation/completion evidence.
+fn cargo_activity_from_stderr(
+    step: &ShellJobValidationStep,
+    stderr: &str,
+) -> Option<ShellJobActivity> {
+    if step.program != "cargo" || !step.is_canonical() {
+        return None;
+    }
+    let validation_activity = validation_step_activity(step);
+    let mut observed = None;
+    for line in stderr.lines() {
+        let line = line.trim_start();
+        let activity = if line.contains("Blocking waiting for file lock on build directory") {
+            ShellJobActivity {
+                state: ShellJobActivityState::Waiting,
+                phase: ShellJobActivityPhase::CargoWaitingForBuildLock,
+                source: ShellJobActivitySource::CargoOutput,
+            }
+        } else if line.starts_with("Compiling ") {
+            ShellJobActivity {
+                state: ShellJobActivityState::Working,
+                phase: ShellJobActivityPhase::CargoCompiling,
+                source: ShellJobActivitySource::CargoOutput,
+            }
+        } else if line.starts_with("Checking ") {
+            ShellJobActivity {
+                state: ShellJobActivityState::Working,
+                phase: ShellJobActivityPhase::CargoChecking,
+                source: ShellJobActivitySource::CargoOutput,
+            }
+        } else if line.starts_with("Finished ")
+            || (step.name == "test"
+                && (line.starts_with("Running unittests ")
+                    || line.starts_with("Running tests/")
+                    || line.starts_with("Running benches/")
+                    || line.starts_with("Doc-tests ")))
+        {
+            validation_activity
+        } else {
+            continue;
+        };
+        observed = Some(activity);
+    }
+    observed
 }
 
 fn runner_job_is_terminal(status: &str) -> bool {
@@ -2768,6 +2847,7 @@ fn job_update_from_snapshot(
         error: snapshot.error.clone(),
         command_execution_state: snapshot.command_execution_state,
         validation_progress: snapshot.validation_progress.clone(),
+        activity: snapshot.activity,
         finished: runner_job_is_terminal(&snapshot.status),
     }
 }
@@ -3328,7 +3408,12 @@ impl JobManager {
             if delta.validation_progress.is_some() {
                 job.snapshot.validation_progress = delta.validation_progress.clone();
             }
+            if let Some(activity) = delta.activity {
+                debug_assert!(activity.is_canonical());
+                job.snapshot.activity = Some(activity);
+            }
             if runner_job_is_terminal(&job.snapshot.status) || delta.finished {
+                job.snapshot.activity = None;
                 job.snapshot.ended_at.get_or_insert(now);
                 job.snapshot.exit_code = delta.exit_code;
                 job.snapshot.duration_ms = delta.duration_ms;
@@ -3342,9 +3427,10 @@ impl JobManager {
                 || job.snapshot.status != previous_status
                 || job.snapshot.validation_progress != previous_progress;
             // Each sequenced update carries the current authoritative bounded
-            // tails. Delivery may coalesce output-only attempts, but semantic
-            // markers preserve their sequence while using the latest retained
-            // authoritative log snapshot at send time.
+            // tails and activity. Delivery may coalesce output/activity-only
+            // attempts, but required semantic markers preserve their sequence
+            // while using the latest retained authoritative snapshot at send
+            // time.
             (
                 job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot),
                 semantic,
@@ -3410,6 +3496,7 @@ impl JobManager {
                         error: snapshot.error.clone(),
                         command_execution_state: snapshot.command_execution_state.clone(),
                         validation_progress: snapshot.validation_progress.clone(),
+                        activity: snapshot.activity,
                         finished: runner_job_is_terminal(&snapshot.status),
                     };
                     let _ = queue.enqueue(marker, true);
@@ -3932,6 +4019,7 @@ impl JobManager {
                 error: Some("job start request is missing recovery context".to_string()),
                 command_execution_state,
                 validation_progress: None,
+                activity: None,
                 finished: true,
             });
             return;
@@ -3956,6 +4044,7 @@ impl JobManager {
                 error: Some(error),
                 command_execution_state,
                 validation_progress: None,
+                activity: None,
                 finished: true,
             });
             return;
@@ -4024,6 +4113,7 @@ impl JobManager {
                         stdout: ShellJobStreamSnapshot::default(),
                         stderr: ShellJobStreamSnapshot::default(),
                         validation_progress: None,
+                        activity: None,
                     },
                     child: None,
                     stop_requested: Arc::new(AtomicBool::new(false)),
@@ -4358,6 +4448,7 @@ impl JobManager {
                     &started_job_id,
                     RunnerJobDelta {
                         status: "running".to_string(),
+                        activity: Some(process_running_activity()),
                         ..Default::default()
                     },
                 );
@@ -4697,6 +4788,11 @@ impl JobManager {
                     current_step: Some(steps[0].name.clone()),
                     failed_step: None,
                 }),
+                activity: Some(if validation {
+                    validation_step_activity(&steps[0])
+                } else {
+                    process_running_activity()
+                }),
                 ..Default::default()
             },
         );
@@ -4740,6 +4836,9 @@ impl JobManager {
                         }
                     }
                     if !out.is_empty() || !err.is_empty() {
+                        let activity = validation
+                            .then(|| cargo_activity_from_stderr(&steps[step_index], &err))
+                            .flatten();
                         manager.update_and_send(
                             &job_id,
                             RunnerJobDelta {
@@ -4753,6 +4852,7 @@ impl JobManager {
                                         failed_step: None,
                                     }
                                 }),
+                                activity,
                                 ..Default::default()
                             },
                         );
@@ -4938,6 +5038,8 @@ impl JobManager {
                                 current_step: Some(steps[step_index].name.clone()),
                                 failed_step: None,
                             }),
+                            activity: validation
+                                .then(|| validation_step_activity(&steps[step_index])),
                             ..Default::default()
                         },
                     );
@@ -4977,6 +5079,7 @@ impl JobManager {
                     command_execution_state,
                     stream_limit_bytes: None,
                     validation_progress: final_progress,
+                    activity: None,
                     finished: true,
                 },
             );
