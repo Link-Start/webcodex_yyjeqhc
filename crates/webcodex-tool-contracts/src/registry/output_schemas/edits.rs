@@ -86,6 +86,50 @@ fn apply_patch_match_diagnostic_schema() -> Value {
     })
 }
 
+fn apply_patch_recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Server-derived, body-free reread hint for a validated deterministic apply_patch context mismatch. Copy `items` into the direct `read_files` tool for the same project. It is emitted only when the failed target and structural diagnostic prove a no-write reread is safe; the Runner cannot choose the tool, path, or arguments.",
+        "properties": {
+            "action": {"type": "string", "enum": ["read_files"]},
+            "reason": {"type": "string", "enum": ["context_mismatch"]},
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_RECOVERY_READ_LINES
+                        }
+                    },
+                    "required": ["path", "start_line", "limit"]
+                }
+            },
+            "change_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_FILE_CHANGES - 1
+            },
+            "chunk_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": webcodex_core::apply_patch_shared::MAX_CODEX_PATCH_CHUNKS_PER_FILE - 1
+            }
+        },
+        "required": [
+            "action", "reason", "items", "change_index", "chunk_index"
+        ]
+    })
+}
+
 fn apply_patch_file_summary_schema() -> Value {
     json!({
         "type": "array",
@@ -281,6 +325,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("patch_line", nullable_schema("integer", "One-based patch line for a syntax error when known.")),
             ("expected_format", nullable_schema("string", "codex_patch for parse-format recovery; null otherwise.")),
             ("match_diagnostic", apply_patch_match_diagnostic_schema()),
+            ("recovery", apply_patch_recovery_schema()),
             ("retry_guidance", schema_type("string", "Bounded recovery guidance for deterministic no-mutation rejection.")),
         ])),
         "apply_text_edits" => Some(wrapped_output_schema(vec![

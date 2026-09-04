@@ -31,7 +31,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 ),
-                "Primary model edit path for contextual/multi-file Codex patches. Transactional with SHA rechecks, rollback, dry_run, recovery. Inspect strict_match on success and body-free match_diagnostic on context mismatch; set strict_matching=true to require exact-unique positioning. Use apply_text_edits for small exact edits; unified diff for external diffs.",
+                "Primary model edit path for contextual/multi-file Codex patches. Transactional with SHA rechecks, rollback, dry_run, recovery. A zero-write context_mismatch may include body-free match_diagnostic plus Server-derived recovery; when recovery.action=read_files, pass recovery.items to read_files for the same project before regenerating the whole patch. outcome_unknown requires workspace inspection first. Set strict_matching=true for exact-unique positioning. Use apply_text_edits for small exact edits; unified diff for external diffs.",
                 apply_patch_input_schema,
             ),
             PERMISSION_RISK_PATCH,
