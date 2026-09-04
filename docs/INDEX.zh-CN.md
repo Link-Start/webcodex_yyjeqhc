@@ -38,15 +38,22 @@
 
 - [架构](ARCHITECTURE.md) —— 主要组件如何协同
 - [Coding 工作流](CODING_WORKFLOW.zh-CN.md) —— 任务启动、指导、验证和收尾
+- [Computer Use roadmap](COMPUTER_USE.md) —— semantic-first desktop automation 方向与验证优先级
 
 ## 我想参与开发或发布
+
+下面 `docs/agent/` 中的页面属于 maintainer/internal contract。它们会有意保留
+protocol field、兼容名称和实现 invariant；普通用户不需要为了使用 WebCodex 而学习
+这些内容。
 
 - [AGENTS.md](../AGENTS.md) —— 面向 coding/AI agent 的仓库开发指引
 - [仓库维护](MAINTENANCE.md) —— 维护队列、依赖更新节奏、PR/CI 约定和双语文档规则
 - [测试策略](TESTING.md)
 - [发布清单](RELEASE_CHECKLIST.md)
 - [架构决策](agent/architecture-decisions.md)
+- [Runtime host context](agent/runtime-host-context.md) —— Runner 配置的 planning context 与 runtime diagnostics
 - [Job 可靠性与 Runner 并发](agent/job-reliability-and-concurrency.md)
+- [Tool request tracing](agent/tool-request-tracing.md) —— maintainer forensic payload/correlation contract
 - [权限模型](agent/permission-model.md)
 - [会话模型](agent/session-model.md)
 - [手动多窗口协作](agent/manual-window-collaboration.md)
