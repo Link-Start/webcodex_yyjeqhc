@@ -193,7 +193,7 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             host_arch: arm64
             rust_host: aarch64-apple-darwin
           - platform: darwin-x64
@@ -201,13 +201,20 @@ jobs:
             host_arch: x86_64
             rust_host: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-ci-${{ matrix.platform }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
       - name: Verify native macOS host
         env:
           EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
@@ -220,6 +227,90 @@ jobs:
         run: cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner -p webcodex-computer
       - name: Run native macOS Runner and Computer tests
         run: cargo test --locked -p webcodex-runner -p webcodex-computer
+      - name: Install Desktop dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Check Desktop frontend
+        run: |
+          npm --prefix apps/desktop run typecheck
+          npm --prefix apps/desktop test
+          npm --prefix apps/desktop run build
+      - name: Check Desktop Rust
+        run: |
+          cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+          cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Build exact native WebCodex runtime for Desktop
+        id: desktop_runtime
+        env:
+          EXPECTED_FILE_ARCH: ${{ matrix.host_arch }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          short_source="$(git rev-parse --short=12 HEAD)"
+          version="$(node -p "require('./npm/webcodex/package.json').version")"
+          built_at="$(git show -s --format=%ct HEAD)"
+          export WEBCODEX_BUILT_AT="$built_at"
+          cargo build --locked --release -p webcodex -p webcodex-cli -p webcodex-runner
+          for name in webcodex webcodex-server webcodex-runner; do
+            binary="target/release/$name"
+            actual="$($binary --version)"
+            expected="$name $version (commit $short_source, dirty=false, built_at=$built_at)"
+            test "$actual" = "$expected"
+            test "$(/usr/bin/lipo -archs "$binary")" = "$EXPECTED_FILE_ARCH"
+          done
+          {
+            echo "source=$source_sha"
+            echo "short=$short_source"
+            echo "version=$version"
+            echo "built_at=$built_at"
+          } >> "$GITHUB_OUTPUT"
+      - name: Stage exact runtime for native macOS Desktop
+        id: desktop_bundle
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/webcodex-desktop-${{ matrix.platform }}-bundle"
+          python3 scripts/prepare_desktop_bundle_macos.py \
+            --bin-dir target/release \
+            --version "${{ steps.desktop_runtime.outputs.version }}" \
+            --source-sha "${{ steps.desktop_runtime.outputs.source }}" \
+            --built-at "${{ steps.desktop_runtime.outputs.built_at }}" \
+            --platform "${{ matrix.platform }}" \
+            --signing-mode adhoc \
+            --output-dir "$stage"
+          {
+            echo "config=$stage/tauri.bundle.conf.json"
+            echo "metadata=$stage/desktop-bundle.json"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build native ad-hoc macOS Desktop DMG
+        id: desktop_dmg
+        working-directory: apps/desktop
+        env:
+          CI: "true"
+          APPLE_SIGNING_IDENTITY: "-"
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/webcodex-desktop-${{ matrix.platform }}-tauri"
+          npm exec tauri -- build \
+            --bundles dmg \
+            --config "${{ steps.desktop_bundle.outputs.config }}" \
+            --ci -- --locked
+          bundle_dir="$CARGO_TARGET_DIR/release/bundle/dmg"
+          shopt -s nullglob
+          candidates=("$bundle_dir"/*.dmg)
+          test "${#candidates[@]}" -eq 1
+          dmg="$RUNNER_TEMP/webcodex-desktop-ci-${{ steps.desktop_runtime.outputs.short }}-v${{ steps.desktop_runtime.outputs.version }}-${{ matrix.platform }}.dmg"
+          cp "${candidates[0]}" "$dmg"
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+      - name: Smoke native macOS Desktop DMG
+        run: |
+          set -euo pipefail
+          bash scripts/desktop_install_macos_smoke.sh \
+            --dmg "${{ steps.desktop_dmg.outputs.path }}" \
+            --version "${{ steps.desktop_runtime.outputs.version }}" \
+            --source-sha "${{ steps.desktop_runtime.outputs.source }}" \
+            --built-at "${{ steps.desktop_runtime.outputs.built_at }}" \
+            --platform "${{ matrix.platform }}" \
+            --stage-metadata "${{ steps.desktop_bundle.outputs.metadata }}" \
+            --signing-mode adhoc
 
   # Keep Windows process-heavy suites isolated on separate hosted VMs. The
   # webcodex-runner lane caps libtest at two concurrent test functions: default
@@ -348,7 +439,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "WebCodex runtime build failed" }
           foreach ($name in @("webcodex", "webcodex-server", "webcodex-runner")) {
             $binary = Join-Path "target\release" "$name.exe"
-            $actual = @(& $binary --version | Select-Object -First 1)[0].TrimEnd()
+            $output = @(& $binary --version)
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -or $output.Count -eq 0 -or -not $output[0]) {
+              throw "$name --version failed with exit code $exitCode"
+            }
+            $actual = $output[0].TrimEnd()
             $expected = "$name $version (commit $short, dirty=false, built_at=$builtAt)"
             if ($actual -ne $expected) { throw "Unexpected $name identity: $actual" }
           }
@@ -368,14 +464,14 @@ jobs:
             -SourceSha "${{ steps.runtime.outputs.source }}" `
             -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
             -OutputDir $stage
-          if ($LASTEXITCODE -ne 0) { throw "Desktop bundle staging failed" }
           "config=$(Join-Path $stage 'tauri.bundle.conf.json')" >> $env:GITHUB_OUTPUT
       - name: Build unsigned NSIS installer
+        working-directory: apps/desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $env:CARGO_TARGET_DIR = Join-Path $env:GITHUB_WORKSPACE "target\desktop-ci-tauri"
-          npm --prefix apps/desktop exec tauri -- build --bundles nsis --config "${{ steps.desktop_bundle.outputs.config }}" --ci --no-sign
+          npm exec tauri -- build --bundles nsis --config "${{ steps.desktop_bundle.outputs.config }}" --ci --no-sign
           if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS build failed" }
           $bundleDir = Join-Path $env:CARGO_TARGET_DIR "release\bundle\nsis"
           $built = @(Get-ChildItem -LiteralPath $bundleDir -Filter "*-setup.exe" -File)
@@ -387,12 +483,12 @@ jobs:
       - name: Smoke newly-built Desktop installer
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           & .\scripts\desktop_install_windows_smoke.ps1 `
             -Installer $env:DESKTOP_CI_INSTALLER `
             -Version "${{ steps.runtime.outputs.version }}" `
             -SourceSha "${{ steps.runtime.outputs.source }}" `
             -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}")
-          if ($LASTEXITCODE -ne 0) { throw "Desktop installer smoke failed" }
 
   # The x64 Windows lanes above exercise full process/package behavior. Keep one
   # native ARM64 compile gate on exact main so the release workflow is not the

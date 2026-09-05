@@ -142,11 +142,13 @@ jobs:
             exit 1
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "built_at=$built_at" >> "$GITHUB_OUTPUT"
-          echo "build_kind=$build_kind" >> "$GITHUB_OUTPUT"
-          echo "archive_stem=$archive_stem" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "source_sha=$source_sha"
+            echo "built_at=$built_at"
+            echo "build_kind=$build_kind"
+            echo "archive_stem=$archive_stem"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "### Release build source"
             echo "- kind: \`$build_kind\`"
@@ -337,7 +339,7 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             host_arch: arm64
             rust_host: aarch64-apple-darwin
             file_arch: arm64
@@ -347,7 +349,7 @@ jobs:
             rust_host: x86_64-apple-darwin
             file_arch: x86_64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
@@ -370,6 +372,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.platform }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Build and verify native macOS candidate
         shell: bash
@@ -422,6 +429,80 @@ jobs:
           digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
           printf '%s  %s\n' "$digest" "$(basename "$archive")" > "$archive.sha256"
 
+      - name: Install macOS Desktop dependencies
+        run: npm ci --prefix apps/desktop
+
+      - name: Stage exact native runtime for macOS Desktop
+        id: desktop_bundle
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/webcodex-desktop-$WEBCODEX_RELEASE_PLATFORM-bundle"
+          signing_mode=adhoc
+          if [ "$BUILD_KIND" = release ]; then
+            desktop_name="webcodex-desktop-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg"
+          else
+            desktop_name="webcodex-desktop-$INPUT_TAG-${SOURCE_SHA:0:12}-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg"
+          fi
+          python3 scripts/prepare_desktop_bundle_macos.py \
+            --bin-dir target/release \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --built-at "$WEBCODEX_BUILT_AT" \
+            --platform "$WEBCODEX_RELEASE_PLATFORM" \
+            --signing-mode "$signing_mode" \
+            --output-dir "$stage"
+          {
+            echo "config=$stage/tauri.bundle.conf.json"
+            echo "metadata=$stage/desktop-bundle.json"
+            echo "signing_mode=$signing_mode"
+            echo "desktop_name=$desktop_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build ad-hoc signed native macOS Desktop DMG
+        id: desktop_dmg
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          export APPLE_SIGNING_IDENTITY="-"
+
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/webcodex-desktop-$WEBCODEX_RELEASE_PLATFORM-tauri"
+          npm exec tauri -- build \
+            --bundles dmg \
+            --config "${{ steps.desktop_bundle.outputs.config }}" \
+            --ci -- --locked
+          bundle_dir="$CARGO_TARGET_DIR/release/bundle/dmg"
+          shopt -s nullglob
+          candidates=("$bundle_dir"/*.dmg)
+          if [ "${#candidates[@]}" -ne 1 ]; then
+            echo "Expected exactly one native macOS DMG, found ${#candidates[@]}." >&2
+            exit 1
+          fi
+          desktop="dist/${{ steps.desktop_bundle.outputs.desktop_name }}"
+          cp "${candidates[0]}" "$desktop"
+          digest="$(shasum -a 256 "$desktop" | awk '{print $1}')"
+          printf '%s  %s\n' "$digest" "$(basename "$desktop")" > "$desktop.sha256"
+          echo "path=$desktop" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke native macOS Desktop DMG and signing evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/desktop_install_macos_smoke.sh \
+            --dmg "${{ steps.desktop_dmg.outputs.path }}" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --built-at "$WEBCODEX_BUILT_AT" \
+            --platform "$WEBCODEX_RELEASE_PLATFORM" \
+            --stage-metadata "${{ steps.desktop_bundle.outputs.metadata }}" \
+            --signing-mode "${{ steps.desktop_bundle.outputs.signing_mode }}" \
+            --evidence "dist/${{ steps.desktop_bundle.outputs.desktop_name }}.evidence.json"
+
       - name: Upload macOS candidate
         uses: actions/upload-artifact@v4
         with:
@@ -429,6 +510,9 @@ jobs:
           path: |
             dist/${{ needs.prepare.outputs.archive_stem }}-${{ matrix.platform }}.tar.gz
             dist/${{ needs.prepare.outputs.archive_stem }}-${{ matrix.platform }}.tar.gz.sha256
+            dist/webcodex-desktop-*.dmg
+            dist/webcodex-desktop-*.dmg.sha256
+            dist/webcodex-desktop-*.dmg.evidence.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -509,7 +593,12 @@ jobs:
           $expectedMachine = [Convert]::ToUInt16($env:EXPECTED_PE_MACHINE, 16)
           foreach ($name in @("webcodex", "webcodex-server", "webcodex-runner")) {
             $binary = Join-Path $binDir "$name.exe"
-            $output = @(& $binary --version | Select-Object -First 1)[0].TrimEnd()
+            $outputLines = @(& $binary --version)
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0 -or $outputLines.Count -eq 0 -or -not $outputLines[0]) {
+              throw "$name --version failed with exit code $exitCode"
+            }
+            $output = $outputLines[0].TrimEnd()
             $expected = "$name $env:VERSION (commit $shortCommit, dirty=false, built_at=$env:WEBCODEX_BUILT_AT)"
             if ($output -ne $expected) {
               throw "Unexpected $name release identity: $output (expected $expected)"
@@ -576,7 +665,6 @@ jobs:
             -SourceSha $env:SOURCE_SHA `
             -BuiltAt ([Int64]$env:WEBCODEX_BUILT_AT) `
             -OutputDir $stage
-          if ($LASTEXITCODE -ne 0) { throw "Desktop runtime staging failed" }
 
           $shortSource = $env:SOURCE_SHA.Substring(0, 12)
           if ($env:BUILD_KIND -eq "release") {
@@ -590,11 +678,12 @@ jobs:
 
       - name: Build unsigned Windows x64 Desktop NSIS candidate
         if: matrix.platform == 'win32-x64'
+        working-directory: apps/desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $env:CARGO_TARGET_DIR = $env:DESKTOP_TAURI_TARGET
-          npm --prefix apps/desktop exec tauri -- build --bundles nsis --config $env:DESKTOP_TAURI_CONFIG --ci --no-sign -- --locked
+          npm exec tauri -- build --bundles nsis --config $env:DESKTOP_TAURI_CONFIG --ci --no-sign -- --locked
           if ($LASTEXITCODE -ne 0) { throw "Tauri NSIS build failed" }
           $bundleDir = Join-Path $env:CARGO_TARGET_DIR "release\bundle\nsis"
           $built = @(Get-ChildItem -LiteralPath $bundleDir -Filter "*-setup.exe" -File)
@@ -612,12 +701,12 @@ jobs:
         if: matrix.platform == 'win32-x64'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           & .\scripts\desktop_install_windows_smoke.ps1 `
             -Installer (Join-Path "dist" $env:DESKTOP_INSTALLER_NAME) `
             -Version $env:VERSION `
             -SourceSha $env:SOURCE_SHA `
             -BuiltAt ([Int64]$env:WEBCODEX_BUILT_AT)
-          if ($LASTEXITCODE -ne 0) { throw "Desktop installer smoke failed" }
 
       - name: Upload Windows candidate
         uses: actions/upload-artifact@v4
@@ -674,11 +763,17 @@ jobs:
           set -euo pipefail
           short_source="${SOURCE_SHA:0:12}"
           if [ "$BUILD_KIND" = release ]; then
-            desktop_filename="webcodex-desktop-v$VERSION-win32-x64-setup.exe"
+            desktop_darwin_x64="webcodex-desktop-v$VERSION-darwin-x64.dmg"
+            desktop_darwin_arm64="webcodex-desktop-v$VERSION-darwin-arm64.dmg"
+            desktop_win32_x64="webcodex-desktop-v$VERSION-win32-x64-setup.exe"
           else
-            desktop_filename="webcodex-desktop-$INPUT_TAG-$short_source-v$VERSION-win32-x64-setup.exe"
+            desktop_darwin_x64="webcodex-desktop-$INPUT_TAG-$short_source-v$VERSION-darwin-x64.dmg"
+            desktop_darwin_arm64="webcodex-desktop-$INPUT_TAG-$short_source-v$VERSION-darwin-arm64.dmg"
+            desktop_win32_x64="webcodex-desktop-$INPUT_TAG-$short_source-v$VERSION-win32-x64-setup.exe"
           fi
-          export DESKTOP_FILENAME="$desktop_filename"
+          export DESKTOP_DARWIN_X64_FILENAME="$desktop_darwin_x64"
+          export DESKTOP_DARWIN_ARM64_FILENAME="$desktop_darwin_arm64"
+          export DESKTOP_WIN32_X64_FILENAME="$desktop_win32_x64"
           expected=(
             "$ARCHIVE_STEM-linux-x64.tar.gz"
             "$ARCHIVE_STEM-linux-x64.tar.gz.sha256"
@@ -694,8 +789,14 @@ jobs:
             "$ARCHIVE_STEM-win32-x64.tar.gz.sha256"
             "$ARCHIVE_STEM-win32-arm64.tar.gz"
             "$ARCHIVE_STEM-win32-arm64.tar.gz.sha256"
-            "$desktop_filename"
-            "$desktop_filename.sha256"
+            "$desktop_darwin_x64"
+            "$desktop_darwin_x64.sha256"
+            "$desktop_darwin_x64.evidence.json"
+            "$desktop_darwin_arm64"
+            "$desktop_darwin_arm64.sha256"
+            "$desktop_darwin_arm64.evidence.json"
+            "$desktop_win32_x64"
+            "$desktop_win32_x64.sha256"
           )
           mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
           if find candidate-input -mindepth 1 ! -type f -print -quit | grep -q .; then
@@ -713,13 +814,53 @@ jobs:
           for platform in "${platforms[@]}"; do
             (cd candidate-input && sha256sum -c "$ARCHIVE_STEM-$platform.tar.gz.sha256")
           done
-          (cd candidate-input && sha256sum -c "$desktop_filename.sha256")
+          for desktop_filename in "$desktop_darwin_x64" "$desktop_darwin_arm64" "$desktop_win32_x64"; do
+            (cd candidate-input && sha256sum -c "$desktop_filename.sha256")
+          done
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path("candidate-input")
+          expected_signing = "adhoc"
+          expected_notarized = False
+          pairs = (
+              ("darwin-x64", os.environ["DESKTOP_DARWIN_X64_FILENAME"]),
+              ("darwin-arm64", os.environ["DESKTOP_DARWIN_ARM64_FILENAME"]),
+          )
+          for platform, filename in pairs:
+              evidence_path = root / f"{filename}.evidence.json"
+              evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+              if set(evidence) != {"schema_version", "platform", "signing_mode", "notarized", "dmg_sha256", "runtime"}:
+                  raise SystemExit(f"unexpected native macOS Desktop evidence schema: {platform}")
+              if evidence["schema_version"] != 1 or evidence["platform"] != platform:
+                  raise SystemExit(f"native macOS Desktop evidence platform mismatch: {platform}")
+              if evidence["signing_mode"] != expected_signing or evidence["notarized"] is not expected_notarized:
+                  raise SystemExit(f"native macOS Desktop signing evidence mismatch: {platform}")
+              actual = hashlib.sha256((root / filename).read_bytes()).hexdigest()
+              if evidence["dmg_sha256"] != actual:
+                  raise SystemExit(f"native macOS Desktop DMG evidence digest mismatch: {platform}")
+              runtime = evidence.get("runtime")
+              if not isinstance(runtime, dict) or set(runtime) != {"webcodex", "webcodex-server", "webcodex-runner"}:
+                  raise SystemExit(f"native macOS Desktop runtime evidence set mismatch: {platform}")
+              for name, item in runtime.items():
+                  if not isinstance(item, dict) or set(item) != {"unsigned_input_sha256", "bundled_signed_sha256"}:
+                      raise SystemExit(f"malformed native macOS runtime evidence: {platform}/{name}")
+                  if not all(isinstance(item[key], str) and re.fullmatch(r"[0-9a-f]{64}", item[key]) for key in item):
+                      raise SystemExit(f"invalid native macOS runtime evidence digest: {platform}/{name}")
+          PY
 
           mkdir release-bundle
           for platform in "${platforms[@]}"; do
             cp "candidate-input/$ARCHIVE_STEM-$platform.tar.gz" release-bundle/
           done
-          cp "candidate-input/$desktop_filename" release-bundle/
+          cp "candidate-input/$desktop_darwin_x64" release-bundle/
+          cp "candidate-input/$desktop_darwin_arm64" release-bundle/
+          cp "candidate-input/$desktop_win32_x64" release-bundle/
           cp candidate-input/linux-x64-elf.txt candidate-input/linux-arm64-elf.txt release-bundle/
 
           if [ "$BUILD_KIND" = release ]; then
@@ -728,11 +869,14 @@ jobs:
               --artifact-dir candidate-input \
               --output-dir release-bundle
           else
-            : > release-bundle/SHA256SUMS
-            for platform in "${platforms[@]}"; do
-              cat "candidate-input/$ARCHIVE_STEM-$platform.tar.gz.sha256" >> release-bundle/SHA256SUMS
-            done
-            cat "candidate-input/$desktop_filename.sha256" >> release-bundle/SHA256SUMS
+            {
+              for platform in "${platforms[@]}"; do
+                cat "candidate-input/$ARCHIVE_STEM-$platform.tar.gz.sha256"
+              done
+              cat "candidate-input/$desktop_darwin_x64.sha256"
+              cat "candidate-input/$desktop_darwin_arm64.sha256"
+              cat "candidate-input/$desktop_win32_x64.sha256"
+            } > release-bundle/SHA256SUMS
           fi
 
           python3 - <<'PY'
@@ -749,8 +893,17 @@ jobs:
               filename = f"{stem}-{platform}.tar.gz"
               digest = hashlib.sha256((source / filename).read_bytes()).hexdigest()
               artifacts[platform] = {"filename": filename, "sha256": digest}
-          desktop_filename = os.environ["DESKTOP_FILENAME"]
-          desktop_digest = hashlib.sha256((source / desktop_filename).read_bytes()).hexdigest()
+          desktop_files = {
+              "darwin-x64": os.environ["DESKTOP_DARWIN_X64_FILENAME"],
+              "darwin-arm64": os.environ["DESKTOP_DARWIN_ARM64_FILENAME"],
+              "win32-x64": os.environ["DESKTOP_WIN32_X64_FILENAME"],
+          }
+          desktop_artifacts = {}
+          for platform, filename in desktop_files.items():
+              desktop_artifacts[platform] = {
+                  "filename": filename,
+                  "sha256": hashlib.sha256((source / filename).read_bytes()).hexdigest(),
+              }
           payload = {
               "tag": os.environ["INPUT_TAG"],
               "version": os.environ["VERSION"],
@@ -760,9 +913,7 @@ jobs:
               "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
               "archive_stem": stem,
               "artifacts": artifacts,
-              "desktop_artifacts": {
-                  "win32-x64": {"filename": desktop_filename, "sha256": desktop_digest},
-              },
+              "desktop_artifacts": desktop_artifacts,
           }
           Path("release-bundle/release-build.json").write_text(
               json.dumps(payload, indent=2) + "\n", encoding="utf-8"
