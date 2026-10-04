@@ -440,6 +440,10 @@ jobs:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
         run: bash scripts/macos_ci_signing_setup.sh
 
+      - name: Probe native DMG services before compiling release binaries
+        if: matrix.platform == 'darwin-arm64' || needs.prepare.outputs.desktop_darwin_x64_supplemental != 'true'
+        run: bash scripts/macos_finalize_dmg.sh --preflight
+
       - name: Build and verify native macOS candidate
         shell: bash
         run: |
@@ -568,6 +572,15 @@ jobs:
           digest="$(shasum -a 256 "$desktop" | awk '{print $1}')"
           printf '%s  %s\n' "$digest" "$(basename "$desktop")" > "$desktop.sha256"
           echo "path=$desktop" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve native DMG stage diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dmg-diagnostics-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: target/dmg-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Smoke native macOS Desktop DMG and signing evidence
         if: matrix.platform == 'darwin-arm64' || needs.prepare.outputs.desktop_darwin_x64_supplemental != 'true'

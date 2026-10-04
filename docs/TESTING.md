@@ -13,6 +13,37 @@ replacing removed assertions with source-text checks that freeze another
 implementation detail. Also review layering, global state leakage, bounded
 waits, and the cost of each test lane.
 
+## Production binaries and release diagnostics
+
+Run `python3 scripts/check_production_warnings.py` (`python` on Windows) separately
+from `cargo test` or `cargo check --all-targets`. It checks every workspace binary
+with the dogfood profile and default production features, without test/dev feature
+unification. Workspace warnings fail the gate; dependency lint policy is unchanged.
+Compiler diagnostics stream to the console and a bounded result is saved under
+`target/ci-build-reports/`. Each invocation runs once: it never retries a failure.
+Linux tooling and the native Windows/macOS core lanes own this check. To validate
+actual linkable binaries too, use `cargo build --locked --workspace --bins --profile dogfood`.
+
+For a flaky failure, retain the original run/job log and distinguish an invalid
+fixture assumption from a product race. Synchronize on observable acknowledgements
+rather than sleeps; never accept generic `lost`/timeout outcomes merely to turn CI
+green. The ACP prompt/cancel race has three fenced outcomes: pre-handoff cancellation,
+acknowledged prompt plus terminal cancellation, and unacknowledged handoff with the
+specific `coding_agent_prompt_write_uncertain` outcome. An external provider log is
+not a writer acknowledgement. Both writer orderings have deterministic tests.
+Executable-format probes use a checked-in executable fixture so unrelated concurrent
+forks cannot inherit a test-created writable handle to that executable.
+
+On macOS, `bash scripts/macos_finalize_dmg.sh --preflight` exercises native image
+create/attach/read/detach before expensive builds in ordinary Desktop CI, extended
+native readiness, and release jobs. It does not sign, install, publish, or use keys.
+Finalization leaves native command diagnostics visible (no `-quiet`), reports the
+failing stage and exit status, and preserves the original DMG until its verified
+replacement is ready. Small stage/disk-space reports live in `target/dmg-diagnostics/`
+and release jobs upload them even on failure. They never contain signing argv or
+environment dumps. Successful preflight does not guarantee later disk space,
+notarization, or signing availability; final checks remain authoritative.
+
 ## Test Lanes
 
 | Lane | Purpose | Default resources | Typical command |

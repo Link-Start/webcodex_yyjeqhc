@@ -120,6 +120,13 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 3: cargo check --workspace --all-targets
 # ----------------------------------------------------------------------------
+stage_start "production-only workspace warning gate"
+if python3 scripts/check_production_warnings.py; then
+    ok "production-only workspace warning gate"
+else
+    die "production-only workspace warning gate"
+fi
+
 stage_start "cargo check --workspace --all-targets"
 if cargo check --workspace --all-targets; then
     ok "cargo check --workspace --all-targets"

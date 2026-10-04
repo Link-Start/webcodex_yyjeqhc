@@ -101,6 +101,8 @@ jobs:
           test "$(uname -m)" = x86_64
           rust_host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$rust_host" = x86_64-apple-darwin
+      - name: Probe native DMG services before compiling
+        run: bash scripts/macos_finalize_dmg.sh --preflight
       - name: Check macOS Intel runtime surfaces
         run: |
           cargo check --locked --workspace

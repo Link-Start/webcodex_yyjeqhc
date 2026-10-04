@@ -258,6 +258,9 @@ jobs:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
         run: bash scripts/macos_ci_signing_setup.sh
 
+      - name: Probe native DMG services before compiling Desktop
+        run: bash scripts/macos_finalize_dmg.sh --preflight
+
       - name: Install Desktop dependencies
         run: |
           npm ci --prefix frontend
@@ -322,6 +325,15 @@ jobs:
             echo "path=$desktop"
             echo "checksum=$desktop.sha256"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Preserve native DMG stage diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: intel-dmg-diagnostics-${{ github.run_attempt }}
+          path: target/dmg-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Smoke macOS Intel Desktop DMG and signing evidence
         shell: bash

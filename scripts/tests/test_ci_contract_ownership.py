@@ -28,6 +28,16 @@ class ContractOwnershipTests(unittest.TestCase):
         self.assertIn("test-linux-rust", gate)
         self.assertIn('"$RUST_RESULT" != success', gate)
 
+    def test_production_warning_gate_is_separate_from_test_feature_unification(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        for lane in ("test-linux-tooling", "test-windows-core", "test-macos-core"):
+            body = job(ci, lane)
+            self.assertIn("scripts/check_production_warnings.py", body)
+            self.assertIn("target/ci-build-reports/*.json", body)
+        windows = job(ci, "test-windows-core")
+        self.assertIn('throw "Windows upgrade tests failed"', windows)
+        self.assertIn('throw "Windows service tests failed"', windows)
+
     def test_native_upgrade_and_protocol_evidence_are_not_model_name_compatibility(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         for required in ["mcp-conformance", "test-windows-core", "test-windows-runner", "test-macos-core"]:
