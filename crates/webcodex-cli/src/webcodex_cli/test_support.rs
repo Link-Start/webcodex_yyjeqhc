@@ -94,6 +94,7 @@ pub(crate) fn canonical_test_tempdir() -> tempfile::TempDir {
 /// executed. Keep this separate from `canonical_test_tempdir`: canonical-path
 /// policy tests intentionally exercise `/tmp`, while executable fixtures must
 /// also work on hardened hosts where `/tmp` is mounted `noexec`.
+#[cfg(unix)]
 pub(crate) fn executable_test_tempdir() -> tempfile::TempDir {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

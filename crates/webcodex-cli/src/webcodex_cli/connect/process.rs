@@ -1168,7 +1168,9 @@ fn read_local_runner_log_tail(state_dir: &Path, lines: u32) -> Result<LogTail, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webcodex_cli::test_support::{canonical_test_tempdir, executable_test_tempdir};
+    use crate::webcodex_cli::test_support::canonical_test_tempdir;
+    #[cfg(unix)]
+    use crate::webcodex_cli::test_support::executable_test_tempdir;
 
     fn write_lines(path: &Path, start: usize, end: usize, trailing_newline: bool) {
         let mut content = (start..end)

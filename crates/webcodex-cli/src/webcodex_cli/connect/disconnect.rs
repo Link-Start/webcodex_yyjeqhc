@@ -552,7 +552,9 @@ fn remove_exact_registration(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webcodex_cli::test_support::{canonical_test_tempdir, executable_test_tempdir};
+    use crate::webcodex_cli::test_support::canonical_test_tempdir;
+    #[cfg(unix)]
+    use crate::webcodex_cli::test_support::executable_test_tempdir;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;

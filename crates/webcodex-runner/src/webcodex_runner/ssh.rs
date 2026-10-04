@@ -3688,9 +3688,7 @@ fn main() {
     }
 
     fn stdin_frame(delivery: &PreparedSshProgramDelivery) -> &str {
-        let PreparedSshProgramDelivery::StdinFramed { program } = delivery else {
-            panic!("Windows Direct SSH must use framed stdin program delivery");
-        };
+        let PreparedSshProgramDelivery::StdinFramed { program } = delivery;
         std::str::from_utf8(program).expect("prepared transport frame is UTF-8")
     }
 

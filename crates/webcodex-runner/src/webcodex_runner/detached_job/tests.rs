@@ -546,7 +546,7 @@ fn process_alive(pid: u32) -> bool {
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "runner-real-process-tests")))]
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -558,7 +558,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     predicate()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "runner-real-process-tests")))]
 fn wait_for_terminal(store: &DetachedJobStore, job_id: &str) -> DetachedJobRecord {
     assert!(wait_until(Duration::from_secs(15), || {
         store

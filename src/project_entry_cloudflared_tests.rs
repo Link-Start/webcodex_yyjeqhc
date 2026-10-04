@@ -4,16 +4,19 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(bytes);
     format!("{:x}", hash.finalize())
 }
 
+#[cfg(unix)]
 fn leaked(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
 
+#[cfg(unix)]
 fn test_asset(bytes: &[u8], gzip_archive: bool) -> CloudflaredAsset {
     let binary_sha256 = if gzip_archive {
         unreachable!("archive tests construct their asset explicitly")
