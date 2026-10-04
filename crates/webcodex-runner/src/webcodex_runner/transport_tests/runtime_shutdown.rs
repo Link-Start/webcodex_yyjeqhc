@@ -497,7 +497,7 @@ struct PollingRunnerHandle {
 }
 
 impl PollingRunnerHandle {
-    #[cfg(feature = "runner-real-process-tests")]
+    #[cfg(all(unix, feature = "runner-real-process-tests"))]
     fn assert_pending(&self, context: &str) {
         match self.result_rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}

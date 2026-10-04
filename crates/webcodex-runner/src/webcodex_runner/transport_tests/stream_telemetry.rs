@@ -466,7 +466,7 @@ async fn windows_parent_pipe_lease_allows_registration_until_writer_closes() {
     .unwrap();
 }
 
-#[cfg(feature = "runner-real-process-tests")]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn wait_for_path(path: &Path, deadline: Instant, context: &str) {
     while !path.exists() {
         assert!(
