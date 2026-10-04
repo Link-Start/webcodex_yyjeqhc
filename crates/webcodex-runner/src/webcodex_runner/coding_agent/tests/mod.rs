@@ -497,6 +497,7 @@ fn wait_for_proc_exit(pid: u64) {
     );
 }
 
+#[cfg(unix)]
 fn successful_start_run_id(response: &CodingAgentResponse) -> Option<String> {
     match response.payload.as_ref() {
         Some(CodingAgentResponsePayload::Start { run }) => Some(run.run_id.clone()),

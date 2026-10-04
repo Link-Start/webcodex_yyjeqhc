@@ -2,9 +2,12 @@
 import contextlib
 import io
 import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
-from scripts.check_production_warnings import BuildFacts
+from scripts.check_production_warnings import BuildFacts, run
 
 
 class ProductionWarningTests(unittest.TestCase):
@@ -61,6 +64,37 @@ class ProductionWarningTests(unittest.TestCase):
         self.assertEqual(len(report["warnings"]), 100)
         self.assertTrue(report["truncated"])
         self.assertEqual(report["attempts_executed"], 1)
+
+
+class ProductionInvocationTests(unittest.TestCase):
+    def test_actual_gate_invokes_production_check_once_and_preserves_exit_status(self):
+        for code in (0, 101):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temp:
+                report = Path(temp) / "report.json"
+                child = MagicMock()
+                child.stdout = io.StringIO(json.dumps({"reason": "build-finished", "success": code == 0}) + "\n")
+                child.wait.return_value = code
+                with patch("scripts.check_production_warnings.subprocess.run") as metadata, \
+                        patch("scripts.check_production_warnings.subprocess.Popen") as process, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    metadata.return_value.stdout = '{"workspace_members":["workspace"]}'
+                    process.return_value.__enter__.return_value = child
+                    self.assertEqual(run(report, "dogfood"), code)
+                    metadata.assert_called_once()
+                    process.assert_called_once()
+                    self.assertEqual(process.call_args.args[0], [
+                        "cargo", "check", "--locked", "--workspace", "--bins",
+                        "--profile", "dogfood", "--message-format=json"])
+                self.assertEqual(json.loads(report.read_text())["cargo_exit_code"], code)
+
+    def test_metadata_failure_removes_stale_success_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = Path(temp) / "report.json"
+            report.write_text('{"exit_code":0}')
+            with patch("scripts.check_production_warnings.subprocess.run", side_effect=OSError("no cargo")):
+                with self.assertRaises(OSError):
+                    run(report, "dogfood")
+            self.assertFalse(report.exists())
 
 
 if __name__ == "__main__":

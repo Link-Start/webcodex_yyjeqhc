@@ -507,7 +507,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("platform: darwin-arm64", macos_core)
         self.assertNotIn("darwin-x64", macos_core)
         self.assertNotIn("macos-15-intel", macos_core)
-        self.assertIn("cargo check --locked --workspace", macos_core)
+        self.assertIn("python3 scripts/check_production_warnings.py", macos_core)
         self.assertIn("platform: darwin-arm64", macos_desktop)
         self.assertNotIn("darwin-x64", macos_desktop)
         self.assertIn("--bundles dmg", macos_desktop)

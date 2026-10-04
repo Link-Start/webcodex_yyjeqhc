@@ -2,10 +2,13 @@ use super::*;
 use std::fs::OpenOptions;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(unix)]
 static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[cfg(unix)]
 fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -543,7 +546,7 @@ fn process_alive(pid: u32) -> bool {
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -555,7 +558,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     predicate()
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn wait_for_terminal(store: &DetachedJobStore, job_id: &str) -> DetachedJobRecord {
     assert!(wait_until(Duration::from_secs(15), || {
         store

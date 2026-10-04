@@ -1774,6 +1774,7 @@ fn structured_process_context(
     context
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detached_process_context(cwd: &Path, arg_count: usize, stdin_present: bool) -> ShellJobContext {
     let mut context = structured_process_context(cwd, arg_count, stdin_present);
     context.command_preview = format!("detached process ({arg_count} args)");
@@ -1900,6 +1901,7 @@ fn enqueue_structured_process_job_with_policy(
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn enqueue_detached_process_job(
     manager: &JobManager,
     sink: RunnerSink,
@@ -4970,6 +4972,7 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
     condition()
 }
 
+#[cfg(unix)]
 fn wait_for_pid_marker(path: &Path, deadline: Instant, tag: &str) -> u32 {
     loop {
         let observed = std::fs::read_to_string(path)
@@ -5894,6 +5897,7 @@ fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn wait_for_job_envelope(
     rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
     message: &str,

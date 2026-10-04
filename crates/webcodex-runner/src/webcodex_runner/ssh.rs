@@ -91,7 +91,7 @@ pub(crate) struct SshConnectionPool {
 /// reusable transport to invalidate.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedSshTransport {
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     Mux(SshConnectionKey),
     // Constructed only by the Windows direct-OpenSSH path.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -106,7 +106,7 @@ pub(crate) enum PreparedSshTransport {
 /// The frame unwraps to the exact remote program in the same remote shell.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedSshProgramDelivery {
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     Argv,
     // Constructed only by the Windows direct-OpenSSH path.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -134,7 +134,7 @@ impl PreparedSshProgramDelivery {
         let handle = std::thread::spawn(move || {
             let result = (|| {
                 match self {
-                    #[cfg(any(unix, test))]
+                    #[cfg(unix)]
                     Self::Argv => {}
                     Self::StdinFramed { program } => {
                         child_stdin.write_all(&program).map_err(|error| {
@@ -444,7 +444,7 @@ impl SshConnectionPool {
     /// have no reusable transport state to invalidate.
     pub(crate) fn invalidate_after_transport_failure(&self, transport: &PreparedSshTransport) {
         match transport {
-            #[cfg(any(unix, test))]
+            #[cfg(unix)]
             PreparedSshTransport::Mux(key) => {
                 let mut state = lock_unpoison(&self.state);
                 if let Some(connection) = state.entries.remove(key) {
@@ -693,7 +693,7 @@ impl Drop for SshConnectionPool {
 }
 
 /// Execute a short remote shell command through a Session-bound SSH resource.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_ssh_shell(
     pool: &SshConnectionPool,
     generation: u64,

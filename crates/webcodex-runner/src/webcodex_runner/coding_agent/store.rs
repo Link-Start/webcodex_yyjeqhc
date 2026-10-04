@@ -78,6 +78,7 @@ impl TerminalWriteGate {
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn wait_until_reached(&self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut state = self.state.lock().unwrap();
@@ -92,6 +93,7 @@ impl TerminalWriteGate {
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn release(&self) {
         let mut state = self.state.lock().unwrap();
         state.released = true;
@@ -307,7 +309,7 @@ impl DurableRunStore {
             .store(count, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn set_terminal_write_gate(&self, gate: Option<Arc<TerminalWriteGate>>) {
         *self.test_control.terminal_write_gate.lock().unwrap() = gate;
     }
