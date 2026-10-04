@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use webcodex_process::ManagedChild;
 
+#[cfg(unix)]
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
+#[cfg(unix)]
 const SSH_CONTROL_PERSIST_SECS: u64 = 300;
 const SSH_PIPE_DRAIN_TIMEOUT_SECS: u64 = 2;
 const SSH_REMOTE_CWD_MAX_BYTES: usize = 4096;
@@ -49,9 +51,11 @@ pub(crate) struct SshConnectionKey {
 
 #[derive(Debug, Clone)]
 struct SshConnection {
+    #[cfg(unix)]
     key: SshConnectionKey,
     control_path: PathBuf,
     host: String,
+    #[cfg(unix)]
     default_cwd: Option<String>,
     /// Test-only callers can point the OpenSSH client at an isolated config;
     /// production leaves this `None` and uses the Runner user's normal SSH
@@ -63,7 +67,9 @@ struct SshConnection {
 struct SshPoolState {
     control_root: Option<PathBuf>,
     entries: HashMap<SshConnectionKey, SshConnection>,
+    #[cfg(unix)]
     next_control_id: u64,
+    #[cfg(unix)]
     test_config_path: Option<PathBuf>,
     #[cfg(all(test, windows))]
     test_executable: Option<PathBuf>,
@@ -85,6 +91,7 @@ pub(crate) struct SshConnectionPool {
 /// reusable transport to invalidate.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedSshTransport {
+    #[cfg(any(unix, test))]
     Mux(SshConnectionKey),
     // Constructed only by the Windows direct-OpenSSH path.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -99,12 +106,11 @@ pub(crate) enum PreparedSshTransport {
 /// The frame unwraps to the exact remote program in the same remote shell.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedSshProgramDelivery {
+    #[cfg(any(unix, test))]
     Argv,
     // Constructed only by the Windows direct-OpenSSH path.
     #[cfg_attr(not(windows), allow(dead_code))]
-    StdinFramed {
-        program: Vec<u8>,
-    },
+    StdinFramed { program: Vec<u8> },
 }
 
 impl PreparedSshProgramDelivery {
@@ -127,12 +133,16 @@ impl PreparedSshProgramDelivery {
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             let result = (|| {
-                if let Self::StdinFramed { program } = self {
-                    child_stdin.write_all(&program).map_err(|error| {
-                        format!(
-                            "ssh_program_write_failed: remote program delivery failed after SSH start; remote command outcome is unknown; do not blindly retry: {error}"
-                        )
-                    })?;
+                match self {
+                    #[cfg(any(unix, test))]
+                    Self::Argv => {}
+                    Self::StdinFramed { program } => {
+                        child_stdin.write_all(&program).map_err(|error| {
+                            format!(
+                                "ssh_program_write_failed: remote program delivery failed after SSH start; remote command outcome is unknown; do not blindly retry: {error}"
+                            )
+                        })?;
+                    }
                 }
                 if let Some(caller_stdin) = caller_stdin {
                     child_stdin.write_all(&caller_stdin).map_err(|error| {
@@ -433,12 +443,15 @@ impl SshConnectionPool {
     /// retry the just-submitted command automatically. Direct Windows commands
     /// have no reusable transport state to invalidate.
     pub(crate) fn invalidate_after_transport_failure(&self, transport: &PreparedSshTransport) {
-        let PreparedSshTransport::Mux(key) = transport else {
-            return;
-        };
-        let mut state = lock_unpoison(&self.state);
-        if let Some(connection) = state.entries.remove(key) {
-            close_control_socket(&connection);
+        match transport {
+            #[cfg(any(unix, test))]
+            PreparedSshTransport::Mux(key) => {
+                let mut state = lock_unpoison(&self.state);
+                if let Some(connection) = state.entries.remove(key) {
+                    close_control_socket(&connection);
+                }
+            }
+            PreparedSshTransport::Direct => {}
         }
     }
 
@@ -593,6 +606,7 @@ impl SshConnectionPool {
         Command::new(ssh_executable())
     }
 
+    #[cfg(unix)]
     fn connection_for(
         &self,
         generation: u64,
@@ -810,6 +824,7 @@ pub(crate) fn is_transport_failure(
     .any(|marker| stderr.contains(marker))
 }
 
+#[cfg(unix)]
 fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
     if let Some(root) = &state.control_root {
         return Ok(root.clone());
@@ -859,6 +874,7 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
 #[path = "ssh_macos_control_path_tests.rs"]
 mod macos_control_path_tests;
 
+#[cfg(unix)]
 fn establish_control_socket(connection: &SshConnection) -> Result<(), String> {
     let mut ssh = ssh_command(connection);
     ssh.arg("-o")
@@ -890,6 +906,7 @@ fn establish_control_socket(connection: &SshConnection) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn control_socket_healthy(connection: &SshConnection) -> bool {
     ssh_command(connection)
         .arg("-o")
@@ -1112,8 +1129,7 @@ fn is_safe_session_id(value: &str) -> bool {
     webcodex_core::workflow_session_contract::is_valid_session_id(value)
 }
 
-// On non-Unix the body is a no-op, so the `command` parameter is unused there.
-#[cfg_attr(not(unix), allow(unused_variables))]
+#[cfg(unix)]
 fn configure_private_process_group(command: &mut Command) {
     #[cfg(unix)]
     {

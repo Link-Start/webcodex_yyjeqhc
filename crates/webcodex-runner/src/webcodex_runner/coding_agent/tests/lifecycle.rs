@@ -527,25 +527,50 @@ fn cancel_and_prompt_gate_race_has_only_linearized_outcomes() {
         prompts <= 1,
         "prompt dispatched more than once: {methods:?}"
     );
-    match prompts {
-        0 => {
-            assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
-            assert_eq!(
-                final_snapshot.execution_state,
-                CodingAgentExecutionState::NotStarted
-            );
+    // Provider log lines are not writer acknowledgements. Cancellation can win
+    // before handoff, after acknowledgement, or between those two boundaries.
+    // The last case MUST remain outcome_unknown, even if the provider managed
+    // to read/log the prompt before teardown. It never authorizes a replay.
+    match (&final_snapshot.state, &final_snapshot.execution_state) {
+        (CodingAgentRunState::Cancelled, CodingAgentExecutionState::NotStarted) => {
+            assert_eq!(prompts, 0);
             assert_eq!(cancels, 0);
         }
-        1 => {
-            assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
-            assert_eq!(
-                final_snapshot.execution_state,
-                CodingAgentExecutionState::Completed
-            );
+        (CodingAgentRunState::Cancelled, CodingAgentExecutionState::Completed) => {
+            assert_eq!(prompts, 1);
             assert_eq!(cancels, 1);
+            assert_eq!(
+                final_snapshot
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.stop_reason.as_deref()),
+                Some("cancelled")
+            );
         }
-        _ => unreachable!(),
+        (CodingAgentRunState::Lost, CodingAgentExecutionState::OutcomeUnknown) => {
+            assert_eq!(cancels, 0);
+            assert_eq!(
+                final_snapshot
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.error_code.as_deref()),
+                Some("coding_agent_prompt_write_uncertain")
+            );
+            assert_eq!(
+                final_snapshot
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.stop_reason.as_deref()),
+                None
+            );
+        }
+        _ => panic!("invalid prompt/cancel boundary: {final_snapshot:?}; wire={methods:?}"),
     }
+    assert_eq!(drain.panicked, 0);
+    let recovered = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+    let saved = recovered.runs.lock().unwrap().get(run).unwrap().snapshot();
+    assert_eq!(saved.state, final_snapshot.state);
+    assert_eq!(saved.execution_state, final_snapshot.execution_state);
 }
 
 #[test]

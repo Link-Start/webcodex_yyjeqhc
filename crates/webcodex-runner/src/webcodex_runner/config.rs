@@ -22,6 +22,7 @@ use webcodex_runner_config::{
     TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
 };
 
+#[cfg(unix)]
 const DEFAULT_SYSTEM_CONFIG_DIR: &str = "/etc/webcodex";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
     "--profile must be a safe path component using only ASCII letters, digits, '.', '_' or '-'";
@@ -728,6 +729,7 @@ impl ReloadableRunnerConfig {
 
     /// Authoritative reload primitive used by Unix SIGHUP. Formal first-class
     /// reload goes through the same implementation with an optimistic fence.
+    #[cfg(any(unix, test))]
     pub(crate) fn reload(&self) -> RunnerConfigReloadStatus {
         self.reload_internal(None).0
     }

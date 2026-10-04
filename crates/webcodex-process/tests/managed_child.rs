@@ -670,14 +670,19 @@ fn confirmed_generation_never_reuses_numeric_pgid_as_kill_authority() {
 #[cfg(unix)]
 #[test]
 fn spawn_preserves_platform_enoexec_behavior() {
+    // Never open this executable for writing in the test process. A concurrent
+    // fork can inherit a freshly written fixture's fd before close-on-exec,
+    // making only one of the two probes fail with ETXTBSY instead of ENOEXEC.
+    // The checked-in executable has no shebang and is read-only to both probes.
+    let executable =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/no-shebang");
     use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempfile::tempdir().unwrap();
-    let executable = temp.path().join("not-an-executable-format");
-    std::fs::write(&executable, "exit 0\n").unwrap();
-    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&executable, permissions).unwrap();
+    assert_ne!(
+        std::fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+        0,
+        "the fixture must be executable; comparing two EACCES errors would be a false pass"
+    );
+    assert_eq!(std::fs::read(&executable).unwrap(), b"exit 0\n");
 
     let baseline = Command::new(&executable).spawn();
     let mut managed_command = Command::new(&executable);

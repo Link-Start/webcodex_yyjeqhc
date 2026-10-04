@@ -1,7 +1,9 @@
 //! Private recovery file for the Server admission fence. It lives in the data
 //! snapshot so a restarted Server remains closed until the original owner ends
 //! the lease. File contents are never included in diagnostics or ordinary logs.
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use webcodex_runner_registry::{MaintenanceStore, SavedMaintenanceLease};

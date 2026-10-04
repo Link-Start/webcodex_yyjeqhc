@@ -182,6 +182,7 @@ pub(super) fn ensure_trace_owner_marker(trace_dir: &Path) -> io::Result<()> {
     let file = options.open(marker)?;
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    drop(file);
     Ok(())
 }
 

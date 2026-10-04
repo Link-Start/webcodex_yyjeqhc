@@ -578,9 +578,9 @@ fn signal_cloudflare_process_group(process_group_id: Option<u32>) {
 /// Tear down the tunnel process tree: on Unix signal the whole group (covering
 /// any background descendants a direct kill would miss), then reap the child.
 /// On non-Unix targets fall back to a direct child kill.
-async fn terminate_cloudflare_process_tree(child: &mut Child, process_group_id: Option<u32>) {
+async fn terminate_cloudflare_process_tree(child: &mut Child, _process_group_id: Option<u32>) {
     #[cfg(unix)]
-    signal_cloudflare_process_group(process_group_id);
+    signal_cloudflare_process_group(_process_group_id);
     #[cfg(not(unix))]
     {
         let _ = child.start_kill();

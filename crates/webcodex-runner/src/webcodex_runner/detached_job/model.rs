@@ -47,6 +47,7 @@ pub(super) const HANDSHAKE_ACCEPT: u8 = b'C';
 
 pub(super) const HANDSHAKE_ACCEPTED: u8 = b'A';
 
+#[cfg(unix)]
 pub(super) const WATCHDOG_ARMED: &str = "WATCHDOG_ARMED";
 
 pub(super) const SUPERVISOR_LOCK_FILE: &str = "supervisor.lock";

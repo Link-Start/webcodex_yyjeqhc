@@ -1,12 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(unix)]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+#[cfg(any(unix, test))]
+use tokio::process::Command;
+#[cfg(unix)]
+use tokio::process::{Child, ChildStdin};
+#[cfg(unix)]
 use tokio::sync::watch;
 
 #[path = "controller_projects.rs"]
@@ -15,7 +24,9 @@ mod projects;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const LOG_LIMIT: usize = 500;
 const CONTROLLER_SERVICE_UNIT: &str = "webcodex-controller.service";
 
@@ -99,6 +110,7 @@ impl Component {
             _ => Err("component must be one of: server, runner, tunnel".to_string()),
         }
     }
+    #[cfg(unix)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Server => "server",
@@ -206,6 +218,7 @@ impl Default for TunnelSettings {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Serialize)]
 struct ComponentSnapshot {
     enabled: bool,
@@ -213,6 +226,7 @@ struct ComponentSnapshot {
     pid: Option<u32>,
     restart_count: u32,
 }
+#[cfg(unix)]
 #[derive(Debug, Clone, Serialize)]
 struct ControllerSnapshot {
     controller: &'static str,
@@ -222,16 +236,19 @@ struct ControllerSnapshot {
     tunnel: ComponentSnapshot,
 }
 
+#[cfg(unix)]
 struct ManagedProcess {
     child: Child,
     stdin: Option<ChildStdin>,
 }
+#[cfg(unix)]
 struct RuntimeComponent {
     enabled: bool,
     phase: &'static str,
     process: Option<ManagedProcess>,
     restart_count: u32,
 }
+#[cfg(unix)]
 impl RuntimeComponent {
     fn new(enabled: bool) -> Self {
         Self {
@@ -251,6 +268,7 @@ impl RuntimeComponent {
     }
 }
 
+#[cfg(unix)]
 struct ControllerRuntime {
     config: ControllerConfig,
     server: RuntimeComponent,
@@ -357,6 +375,7 @@ fn parse_controller_project_command(args: &[String]) -> Result<ControllerCommand
         json,
     })
 }
+#[cfg(unix)]
 #[derive(Debug, Deserialize)]
 struct IpcRequest {
     method: String,
@@ -641,6 +660,7 @@ fn configured_server_url(config: &ControllerConfig) -> Result<String, String> {
     }
 }
 
+#[cfg(unix)]
 fn server_token(env_file: &Path) -> Result<Option<String>, String> {
     if let Ok(value) = std::env::var("WEBCODEX_TOKEN") {
         if !value.trim().is_empty() {
@@ -667,6 +687,7 @@ fn same_server_origin(left: &str, right: &str) -> bool {
     }
 }
 
+#[cfg(any(unix, test))]
 fn validate_runner_target(
     view: &RunnerConfigView,
     controller_server_url: &str,
@@ -680,6 +701,7 @@ fn validate_runner_target(
     ))
 }
 
+#[cfg(any(unix, test))]
 fn runtime_has_online_runner(output: &Value, client_id: &str) -> bool {
     output
         .pointer("/runners/clients")
@@ -692,6 +714,7 @@ fn runtime_has_online_runner(output: &Value, client_id: &str) -> bool {
         })
 }
 
+#[cfg(any(unix, test))]
 fn runner_phase_after_start(online_verified: bool) -> &'static str {
     if online_verified {
         "ready"
@@ -719,11 +742,13 @@ fn tunnel_credentials_present(environment_file: &Path) -> Result<bool, String> {
         && api_key.is_some_and(|value| !value.trim().is_empty()))
 }
 
+#[cfg(any(unix, test))]
 fn remove_controller_tunnel_credentials(command: &mut Command) {
     command
         .env_remove("CONTROL_PLANE_TUNNEL_ID")
         .env_remove("CONTROL_PLANE_API_KEY");
 }
+#[cfg(unix)]
 fn log_line(log: &Arc<Mutex<VecDeque<String>>>, source: &str, line: impl AsRef<str>) {
     let mut guard = log.lock().unwrap_or_else(|p| p.into_inner());
     guard.push_back(format!("[{source}] {}", line.as_ref()));
@@ -731,6 +756,7 @@ fn log_line(log: &Arc<Mutex<VecDeque<String>>>, source: &str, line: impl AsRef<s
         guard.pop_front();
     }
 }
+#[cfg(unix)]
 fn spawn_log_reader<R>(
     reader: R,
     source: &'static str,
@@ -757,6 +783,7 @@ fn spawn_log_reader<R>(
         }
     });
 }
+#[cfg(unix)]
 fn spawn_process(
     mut command: Command,
     source: &'static str,
@@ -775,6 +802,7 @@ fn spawn_process(
     }
     Ok(ManagedProcess { child, stdin })
 }
+#[cfg(unix)]
 async fn wait_runtime_status(
     base: &str,
     token: Option<&str>,
@@ -808,6 +836,7 @@ async fn wait_runtime_status(
     Err("runtime did not become ready within 30 seconds".to_string())
 }
 
+#[cfg(unix)]
 async fn wait_remote_server_reachable(base: &str) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -833,6 +862,7 @@ async fn wait_remote_server_reachable(base: &str) -> Result<(), String> {
     ))
 }
 
+#[cfg(unix)]
 impl ControllerRuntime {
     fn new(config: ControllerConfig) -> Self {
         let mut server = RuntimeComponent::new(config.server.is_local());
@@ -1702,6 +1732,8 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
             config,
             service_file,
         } => {
+            #[cfg(not(unix))]
+            let _ = config;
             #[cfg(unix)]
             {
                 if let Ok(cfg) = read_config(&config) {
@@ -1742,6 +1774,7 @@ pub(crate) async fn run_controller_command(command: ControllerCommand) -> Result
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = socket;
                     return Err(
                         "Controller restart requires an installed systemd service on this platform"
                             .to_string(),
@@ -2036,6 +2069,7 @@ mod tests {
         assert_eq!(env.get("CONTROL_PLANE_API_KEY"), Some(&None));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn component_restart_rejects_disabled_component() {
         let cfg = ControllerConfig {

@@ -40,6 +40,24 @@ fn outbound_writer_blocking_sink_does_not_block_lifecycle_owner() {
 }
 
 #[test]
+fn acknowledged_outbound_write_wins_over_later_cancellation() {
+    let threads = BackgroundThreads::default();
+    let mut writer = AcpOutboundWriter::spawn(Vec::<u8>::new(), &threads).unwrap();
+    let pending = writer.start_frame(b"prompt\n".to_vec()).unwrap();
+    writer.close();
+    // Join the writer, not a sleep: its completion acknowledgement is now
+    // definitely queued. The blocking-sink test covers the opposite ordering.
+    let joined = threads.join_until(Instant::now() + Duration::from_secs(1));
+    assert_eq!(joined.timed_out, 0);
+    assert_eq!(joined.panicked, 0);
+    let cancelled = AtomicBool::new(true);
+    assert!(matches!(
+        wait_outbound_write(pending, Instant::now(), Some(&cancelled), None),
+        OutboundWriteOutcome::Written
+    ));
+}
+
+#[test]
 #[cfg(unix)]
 fn acp_v1_sequence_cwd_config_and_normalized_updates_are_exact() {
     let temp = crate::tests::executable_tempdir();
